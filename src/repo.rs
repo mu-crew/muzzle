@@ -1,7 +1,8 @@
 //! D27a: which repo a run belongs to, so run data can be split per repo.
 //!
 //! `repo` is the canonical path of the repo's main checkout: every git
-//! worktree and jj workspace of one repo maps to the same path. Found by
+//! worktree and jj workspace of one repo maps to the same path. A git repo
+//! with no shared checkout (bare, separate-git-dir) is its common dir. Found by
 //! reading files only, never by spawning git or jj: this runs on every
 //! `muzzle run`, before queueing.
 
@@ -39,22 +40,26 @@ fn jj_main(root: &Path) -> Option<PathBuf> {
     if repo.is_dir() {
         return Some(root.to_path_buf());
     }
-    let target = jj.join(fs::read_to_string(&repo).ok()?.trim_end());
+    let pointer = fs::read_to_string(&repo).ok()?;
+    let target = jj.join(pointer.trim()).canonicalize().ok()?;
+    // Only a real `<root>/.jj/repo` directory is followable. An empty
+    // pointer joins to `.jj` itself, whose grandparent is the directory
+    // *holding* the workspace: a wrong repo, so it must fall back.
+    let jj_dir = target.parent()?;
+    if !target.is_dir() || target.file_name()? != "repo" || jj_dir.file_name()? != ".jj" {
+        return None;
+    }
     // `.jj/repo` → `.jj` → workspace root.
-    Some(
-        target
-            .canonicalize()
-            .ok()?
-            .parent()?
-            .parent()?
-            .to_path_buf(),
-    )
+    Some(jj_dir.parent()?.to_path_buf())
 }
 
-/// `.git` is a directory in the main checkout. A worktree has a file
-/// `gitdir: X` instead, and `X/commondir` (relative to X) names the main
-/// `.git`. A submodule's `X` has no `commondir`: it is its own main
-/// checkout.
+/// `.git` is a directory in the main checkout. Otherwise it is a file
+/// `gitdir: X`. The common dir is `X/commondir` (relative to X) when that
+/// exists (a worktree), else X itself (a separate-git-dir checkout or a
+/// submodule). A common dir named `.git` stands for its parent, the main
+/// checkout. Any other (`bare.git`, `sep.git`, `.git/modules/sm`) has no
+/// checkout every worktree shares, so it is the repo itself: one value per
+/// repo, and two bare repos in one directory stay apart (D27a step 3).
 fn git_main(root: &Path) -> Option<PathBuf> {
     let git = root.join(".git");
     if git.is_dir() {
@@ -62,11 +67,19 @@ fn git_main(root: &Path) -> Option<PathBuf> {
     }
     let text = fs::read_to_string(&git).ok()?;
     let gitdir = root.join(text.trim_end().strip_prefix("gitdir:")?.trim());
-    let Ok(common) = fs::read_to_string(gitdir.join("commondir")) else {
-        return Some(root.to_path_buf());
+    let common = match fs::read_to_string(gitdir.join("commondir")) {
+        Ok(c) => gitdir.join(c.trim_end()),
+        Err(_) => gitdir,
     };
-    let common = gitdir.join(common.trim_end()).canonicalize().ok()?;
-    Some(common.parent()?.to_path_buf())
+    let common = common.canonicalize().ok()?;
+    if !common.is_dir() {
+        return None;
+    }
+    if common.file_name()? == ".git" {
+        Some(common.parent()?.to_path_buf())
+    } else {
+        Some(common)
+    }
 }
 
 #[cfg(test)]
@@ -143,16 +156,94 @@ mod tests {
         assert_eq!(repo_of(&sub(&wt, "src")), Some(main));
     }
 
+    /// A submodule's gitdir has no `commondir`; it is its own common dir,
+    /// shared with the submodule's worktrees (next test).
     #[test]
-    fn git_submodule_style_gitdir_without_commondir_is_its_own_repo() {
+    fn git_submodule_style_gitdir_is_the_modules_dir() {
         let (_t, p) = tmp();
         let main = sub(&p, "main");
         git(&main, &["init", "-q"]);
         let modules = sub(&main, ".git/modules/m");
         let m = sub(&main, "m");
         fs::write(m.join(".git"), "gitdir: ../.git/modules/m\n").unwrap();
-        assert!(modules.is_dir());
-        assert_eq!(repo_of(&m), Some(m));
+        assert_eq!(repo_of(&m), Some(modules));
+    }
+
+    #[test]
+    fn git_submodule_worktree_maps_with_its_submodule() {
+        let (_t, p) = tmp();
+        let sm = sub(&p, "sm");
+        git(&sm, &["init", "-q"]);
+        git(&sm, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        let g = sub(&p, "g");
+        git(&g, &["init", "-q"]);
+        git(
+            &g,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                "../sm",
+                "sm",
+            ],
+        );
+        git(&g.join("sm"), &["worktree", "add", "-q", "../../smwt"]);
+        let modules = g.join(".git/modules/sm");
+        assert_eq!(repo_of(&g.join("sm")), Some(modules.clone()));
+        assert_eq!(repo_of(&sub(&p, "smwt/x")), Some(modules));
+        assert_eq!(repo_of(&g), Some(g));
+    }
+
+    #[test]
+    fn bare_repo_worktree_is_the_bare_dir_and_bare_repos_differ() {
+        let (_t, p) = tmp();
+        let src = sub(&p, "src");
+        git(&src, &["init", "-q"]);
+        git(&src, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        for name in ["a.git", "b.git"] {
+            git(&p, &["clone", "-q", "--bare", "src", name]);
+        }
+        git(&p.join("a.git"), &["worktree", "add", "-q", "../awt"]);
+        git(&p.join("b.git"), &["worktree", "add", "-q", "../bwt"]);
+        assert_eq!(repo_of(&sub(&p, "awt/s")), Some(p.join("a.git")));
+        assert_eq!(repo_of(&p.join("bwt")), Some(p.join("b.git")));
+    }
+
+    #[test]
+    fn separate_git_dir_main_and_worktree_agree() {
+        let (_t, p) = tmp();
+        let sep = p.join("sep.git");
+        git(
+            &p,
+            &[
+                "init",
+                "-q",
+                &format!("--separate-git-dir={}", sep.display()),
+                "main",
+            ],
+        );
+        let main = p.join("main");
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        git(&main, &["worktree", "add", "-q", "../wt"]);
+        assert_eq!(repo_of(&main), Some(sep.clone()));
+        assert_eq!(repo_of(&sub(&p, "wt/s")), Some(sep));
+    }
+
+    /// The `.bare` layout: `.git` is a file `gitdir: ./.bare`.
+    #[test]
+    fn dot_bare_layout_is_the_bare_dir() {
+        let (_t, p) = tmp();
+        let src = sub(&p, "src");
+        git(&src, &["init", "-q"]);
+        git(&src, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        let proj = sub(&p, "proj");
+        git(&proj, &["clone", "-q", "--bare", "../src", ".bare"]);
+        fs::write(proj.join(".git"), "gitdir: ./.bare\n").unwrap();
+        git(&proj, &["worktree", "add", "-q", "wt"]);
+        assert_eq!(repo_of(&proj), Some(proj.join(".bare")));
+        assert_eq!(repo_of(&proj.join("wt")), Some(proj.join(".bare")));
     }
 
     #[test]
@@ -244,5 +335,25 @@ mod tests {
         let j = sub(&p, "j/.jj");
         fs::write(j.join("repo"), "../../gone/.jj/repo").unwrap();
         assert_eq!(repo_of(&p.join("j")), Some(p.join("j")));
+    }
+
+    #[test]
+    fn an_empty_or_odd_jj_pointer_falls_back_to_the_workspace() {
+        let (_t, p) = tmp();
+        let ws = sub(&p, "outer/ws");
+        let jj = sub(&ws, ".jj");
+        for pointer in ["", "  \n", "."] {
+            fs::write(jj.join("repo"), pointer).unwrap();
+            assert_eq!(repo_of(&ws), Some(ws.clone()), "pointer {pointer:?}");
+        }
+        // A real directory that isn't a `.jj/repo`.
+        sub(&p, "other/notjj/repo");
+        fs::write(jj.join("repo"), "../../../other/notjj/repo").unwrap();
+        assert_eq!(repo_of(&ws), Some(ws.clone()));
+        // A `.jj/repo` that is a file, not a directory.
+        let f = sub(&p, "f/.jj");
+        fs::write(f.join("repo"), "x").unwrap();
+        fs::write(jj.join("repo"), "../../../f/.jj/repo").unwrap();
+        assert_eq!(repo_of(&ws), Some(ws));
     }
 }
