@@ -52,6 +52,7 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
 }
 
 /// The payload's timeout in seconds. Claude's Bash `timeout` is in ms.
+/// Zero, negative and non-finite values pass through: `wrap` drops them.
 /// Codex's Bash `tool_input` carries only `command` (checked against
 /// openai/codex `exec_command.rs` at 3535c22), so it has none.
 fn timeout_s(harness: Harness, input: &serde_json::Map<String, Value>) -> Option<f64> {
@@ -59,7 +60,6 @@ fn timeout_s(harness: Harness, input: &serde_json::Map<String, Value>) -> Option
         Harness::Claude => input
             .get("timeout")
             .and_then(Value::as_f64)
-            .filter(|ms| *ms > 0.0)
             .map(|ms| ms / 1000.0),
         Harness::Codex => None,
     }
@@ -100,7 +100,7 @@ mod tests {
         let u = updated(&r);
         assert_eq!(
             u["command"],
-            "muzzle run --rule gate --slots 6 --run-timeout 600 -- bash -c 'contrib/fast-gate'"
+            "muzzle run --rule=gate --slots 6 --run-timeout 600 -- bash -c 'contrib/fast-gate'"
         );
         assert_eq!(u["timeout"], 600000);
         assert_eq!(u["description"], "Run the gate");
@@ -116,8 +116,23 @@ mod tests {
         );
         assert_eq!(
             updated(&r)["command"],
-            "muzzle run --rule cargo-test --slots 2 -- bash -c 'cargo test --workspace'"
+            "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'"
         );
+    }
+
+    #[test]
+    fn claude_zero_or_negative_timeout_has_no_run_timeout() {
+        for t in [json!(0), json!(-5000)] {
+            let mut payload = fixture("claude-bash-match.json");
+            payload["tool_input"]["timeout"] = t.clone();
+            let r = reply(Harness::Claude, &payload, &config());
+            let u = updated(&r);
+            assert_eq!(
+                u["command"], "muzzle run --rule=gate --slots 6 -- bash -c 'contrib/fast-gate'",
+                "timeout {t}"
+            );
+            assert_eq!(u["timeout"], t, "the harness timeout is carried over");
+        }
     }
 
     #[test]
@@ -126,7 +141,7 @@ mod tests {
         let u = updated(&r);
         assert_eq!(
             u["command"],
-            "muzzle run --rule js-test --slots 2 -- bash -c 'npm run test -- --run'"
+            "muzzle run --rule=js-test --slots 2 -- bash -c 'npm run test -- --run'"
         );
         assert_eq!(u.len(), 1, "codex Bash input is only `command`");
     }
@@ -162,7 +177,7 @@ mod tests {
             updated(&r)["command"]
                 .as_str()
                 .unwrap()
-                .contains("--rule p --slots 3")
+                .contains("--rule=p --slots 3")
         );
     }
 }

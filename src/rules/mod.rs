@@ -36,7 +36,7 @@ pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) 
     }
     let m = config.matches(command, cwd)?;
     let mut out = format!(
-        "muzzle run --rule {} --slots {}",
+        "muzzle run --rule={} --slots {}",
         quote_word(&m.rule.name),
         m.rule.slots
     );
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(
             w,
             Wrapped {
-                command: "muzzle run --rule gate --slots 6 -- bash -c 'contrib/fast-gate --all'"
+                command: "muzzle run --rule=gate --slots 6 -- bash -c 'contrib/fast-gate --all'"
                     .into(),
                 rule: "gate".into(),
                 slots: 6,
@@ -310,7 +310,7 @@ mod tests {
         .unwrap();
         let cmd = "printf '%s|' \"it's\" '$HOME' \"a\nb\"";
         let w = wrap(&c, cmd, Path::new("/"), None).unwrap();
-        let prefix = "muzzle run --rule 'odd label' --slots 1 -- ";
+        let prefix = "muzzle run --rule='odd label' --slots 1 -- ";
         let inner = w.command.strip_prefix(prefix).expect(&w.command);
         let run = |s: &str| {
             let out = Command::new("bash").arg("-c").arg(s).output().unwrap();
@@ -318,6 +318,36 @@ mod tests {
         };
         assert_eq!(run(inner), run(cmd));
         assert_eq!(run(inner), "it's|$HOME|a\nb|");
+    }
+
+    /// `wrap`'s output split by bash and parsed by clap: the rule name
+    /// arrives intact even when it looks like a flag. `Config::parse`
+    /// rejects such names; this guards configs built any other way.
+    #[test]
+    fn wrapped_rule_name_survives_clap() {
+        use clap::Parser;
+        for name in ["-x", "--slots", "odd label", "it's"] {
+            let mut c = config();
+            c.rules[0].name = name.into();
+            let w = wrap(&c, "contrib/gate", Path::new("/"), None).unwrap();
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(format!("printf '%s\\0' {}", w.command))
+                .output()
+                .unwrap();
+            let words: Vec<String> = String::from_utf8(out.stdout)
+                .unwrap()
+                .split_terminator('\0')
+                .map(String::from)
+                .collect();
+            let cli = crate::cli::Cli::try_parse_from(&words)
+                .unwrap_or_else(|e| panic!("{name:?}: {}: {e}", w.command));
+            let crate::cli::Command::Run(run) = cli.command else {
+                panic!("{name:?}: not a run: {}", w.command);
+            };
+            assert_eq!(run.rule.as_deref(), Some(name), "{}", w.command);
+            assert_eq!(run.slots, Some(6));
+        }
     }
 
     #[test]

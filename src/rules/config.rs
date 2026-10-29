@@ -3,7 +3,7 @@
 //! Spec §Interface/Config, D21 (rules per host, project overrides), D8
 //! (slots default 1, capping is admit's job), D28 (config hash).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobMatcher};
@@ -75,11 +75,37 @@ struct RawConfig {
     slots: Option<u32>,
     #[serde(default)]
     rule: Vec<RawRule>,
-    // BTreeMap: toml's default table type doesn't keep file order, so
-    // overlapping project globs are tried in key order. The hash uses the
-    // same order, so it changes exactly when matching can.
-    #[serde(default)]
-    project: BTreeMap<String, RawProject>,
+    // File order, not key order: overlapping project globs are tried as
+    // written, since the first match wins (spec §Config). A map type would
+    // sort them (BTreeMap) or need toml's preserve_order feature; toml
+    // deserialises through toml_edit, whose tables keep document order, so
+    // reading the entries into a Vec is enough. The hash covers this order.
+    #[serde(default, deserialize_with = "in_file_order")]
+    project: Vec<(String, RawProject)>,
+}
+
+fn in_file_order<'de, D>(d: D) -> Result<Vec<(String, RawProject)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<(String, RawProject)>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a table of project globs")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut m: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(entry) = m.next_entry()? {
+                out.push(entry);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(V)
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,10 +201,14 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(&text, path),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Err(e) = write_template(path) {
-                    eprintln!("muzzle: could not write {}: {e}", path.display());
-                } else {
-                    eprintln!("muzzle: wrote a config template to {}", path.display());
+                match write_template(path) {
+                    Ok(()) => {
+                        eprintln!("muzzle: wrote a config template to {}", path.display())
+                    }
+                    // Another muzzle's first run won the race: it wrote the
+                    // template and said so.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => eprintln!("muzzle: could not write {}: {e}", path.display()),
                 }
                 Self::parse(TEMPLATE, path)
             }
@@ -209,6 +239,14 @@ impl Config {
                 .map(|r| {
                     if r.name.trim().is_empty() {
                         return Err(invalid(format!("{scope}: a rule has an empty name")));
+                    }
+                    // A leading `-` reads as a flag wherever the name is
+                    // passed as an argument (`run --rule -x` exits 2).
+                    if r.name.starts_with('-') {
+                        return Err(invalid(format!(
+                            "rule {:?}: a name can't start with '-'",
+                            r.name
+                        )));
                     }
                     // Unique across global and project rules: the name is
                     // the label history is kept under, and `run --rule`
@@ -341,16 +379,34 @@ impl Config {
 }
 
 fn write_template(path: &Path) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    // Write a private temp file, then hard-link it into place: link(2)
+    // fails with AlreadyExists rather than clobber a config another muzzle
+    // (or the user) wrote meanwhile, and a concurrent reader never sees a
+    // half-written file, which would parse as a config with no rules.
+    let tmp = tempfile_in(dir)?;
+    std::fs::write(&tmp, TEMPLATE)?;
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    linked
+}
+
+/// A fresh, exclusively created path next to the config.
+fn tempfile_in(dir: &Path) -> std::io::Result<PathBuf> {
+    for n in 0u32.. {
+        let p = dir.join(format!(".config.toml.{}.{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(_) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    // create_new: never clobber a file another muzzle wrote meanwhile.
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    f.write_all(TEMPLATE.as_bytes())
+    unreachable!("u32 exhausted")
 }
 
 /// Expand `~` and canonicalise the literal (glob-free) prefix of a project
@@ -438,6 +494,41 @@ mod tests {
         let dup =
             parse("[[rule]]\nname='a'\nmatch='x'\n[[project.\"/p\".rule]]\nname='a'\nmatch='y'");
         assert!(matches!(dup, Err(ConfigError::Invalid { .. })));
+    }
+
+    #[test]
+    fn rule_names_cannot_look_like_flags() {
+        for text in [
+            "[[rule]]\nname='-x'\nmatch='a'",
+            "[[project.\"/p\".rule]]\nname='--slots'\nmatch='a'",
+        ] {
+            let err = parse(text).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{text}: {err}");
+            assert!(err.to_string().contains("-x") || err.to_string().contains("--slots"));
+        }
+        // A dash later in the name is fine.
+        assert!(parse("[[rule]]\nname='x-y'\nmatch='a'").is_ok());
+    }
+
+    #[test]
+    fn overlapping_projects_are_tried_in_file_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        let specific = format!(
+            "[[project.\"{}\".rule]]\nname='b'\nmatch='x'\n",
+            b.display()
+        );
+        let broad = format!(
+            "[[project.\"{}/*\".rule]]\nname='a'\nmatch='x'\n",
+            dir.path().display()
+        );
+        let specific_first = parse(&format!("{specific}{broad}")).unwrap();
+        let broad_first = parse(&format!("{broad}{specific}")).unwrap();
+        // "*" sorts before "b": key order would pick `a` both times.
+        assert_eq!(specific_first.matches("x", &b).unwrap().rule.name, "b");
+        assert_eq!(broad_first.matches("x", &b).unwrap().rule.name, "a");
+        assert_ne!(specific_first.hash(), broad_first.hash());
     }
 
     #[test]
@@ -639,6 +730,17 @@ slots = 999
         let c = Config::load_from(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), TEMPLATE);
         assert_eq!(c.hash(), parse(TEMPLATE).unwrap().hash());
+    }
+
+    #[test]
+    fn template_never_overwrites_an_existing_file() {
+        // The file can appear between load's read and this write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "reserve = 4\n").unwrap();
+        let err = write_template(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "reserve = 4\n");
     }
 
     #[test]

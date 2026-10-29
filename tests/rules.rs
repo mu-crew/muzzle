@@ -72,6 +72,60 @@ fn first_run_writes_the_template_and_matches_with_it() {
 }
 
 #[test]
+fn first_run_never_overwrites_an_existing_config() {
+    let home = tempfile::tempdir().unwrap();
+    let mine = "[[rule]]\nname='mine'\nmatch='gate'\n";
+    write_config(home.path(), mine);
+    let out = muzzle(
+        home.path(),
+        &["match", "--json", "--", "contrib/gate"],
+        None,
+    );
+    assert_eq!(json_out(&out)["rule"], "mine");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let path = home.path().join("muzzle/config.toml");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), mine);
+}
+
+#[test]
+fn concurrent_first_runs_leave_one_valid_template() {
+    let home = tempfile::tempdir().unwrap();
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_muzzle"))
+                .args(["match", "--json", "--", "contrib/gate"])
+                .env("XDG_CONFIG_HOME", home.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outs: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    let mut wrote = 0;
+    for out in &outs {
+        assert_eq!(json_out(out)["rule"], "gate");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains("could not write"), "{err}");
+        wrote += err.matches("wrote a config template").count();
+    }
+    // create_new: exactly one process creates the file.
+    assert_eq!(wrote, 1);
+    let dir = home.path().join("muzzle");
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let v = json_out(&muzzle(
+        home.path(),
+        &["match", "--json", "--", "contrib/gate"],
+        None,
+    ));
+    assert_eq!(v["cfg"], json_out(&outs[0])["cfg"]);
+}
+
+#[test]
 fn match_without_a_rule() {
     let home = tempfile::tempdir().unwrap();
     let out = muzzle(home.path(), &["match", "--json", "--", "ls -la"], None);
@@ -109,6 +163,49 @@ fn match_uses_project_rules_for_cwd() {
 }
 
 #[test]
+fn overlapping_projects_match_in_file_order() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let b = root.path().join("b");
+    std::fs::create_dir_all(&b).unwrap();
+    let specific = format!(
+        "[[project.\"{}\".rule]]\nname='b'\nmatch='x'\n",
+        b.display()
+    );
+    let broad = format!(
+        "[[project.\"{}/*\".rule]]\nname='a'\nmatch='x'\n",
+        root.path().display()
+    );
+    let mut seen = Vec::new();
+    for (text, rule) in [
+        (format!("{specific}{broad}"), "b"),
+        (format!("{broad}{specific}"), "a"),
+    ] {
+        write_config(home.path(), &text);
+        let v = json_out(&muzzle(
+            home.path(),
+            &["match", "--json", "--cwd", b.to_str().unwrap(), "--", "x"],
+            None,
+        ));
+        assert_eq!(v["rule"], rule, "{text}");
+        seen.push(v["cfg"].clone());
+    }
+    assert_ne!(seen[0], seen[1]);
+}
+
+#[test]
+fn rule_name_starting_with_dash_exits_2_naming_it() {
+    let home = tempfile::tempdir().unwrap();
+    write_config(home.path(), "[[rule]]\nname='-x'\nmatch='dash'\n");
+    let out = muzzle(home.path(), &["wrap", "--json", "--", "dash"], None);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("\"-x\""),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn bad_config_exits_2_naming_the_key() {
     let home = tempfile::tempdir().unwrap();
     write_config(home.path(), "reserve = 2\nbugdet = 12\n");
@@ -143,7 +240,7 @@ fn wrap_json() {
     assert_eq!(
         v,
         json!({
-            "command": "muzzle run --rule cargo-test --slots 2 --run-timeout 300 -- bash -c 'cargo test '\\''it'\\'''\\''s'\\'''",
+            "command": "muzzle run --rule=cargo-test --slots 2 --run-timeout 300 -- bash -c 'cargo test '\\''it'\\'''\\''s'\\'''",
             "rule": "cargo-test",
             "slots": 2,
         })
@@ -172,7 +269,7 @@ fn hook_replies_to_stored_payloads() {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "updatedInput": {
-                "command": "muzzle run --rule gate --slots 6 --run-timeout 600 -- bash -c 'contrib/fast-gate'",
+                "command": "muzzle run --rule=gate --slots 6 --run-timeout 600 -- bash -c 'contrib/fast-gate'",
                 "description": "Run the gate",
                 "timeout": 600000,
                 "run_in_background": false,
@@ -190,7 +287,7 @@ fn hook_replies_to_stored_payloads() {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "updatedInput": {
-                "command": "muzzle run --rule js-test --slots 2 -- bash -c 'npm run test -- --run'",
+                "command": "muzzle run --rule=js-test --slots 2 -- bash -c 'npm run test -- --run'",
             },
         }})
     );
