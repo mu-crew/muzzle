@@ -58,6 +58,8 @@ pub struct Facts {
     pub state_readable: Result<(), String>,
     pub systemd: bool,
     pub runs: Option<RunsLog>,
+    /// Rules that `runs.jsonl` shows entering a container (D16a).
+    pub container_runs: Vec<String>,
     pub harnesses: Harnesses,
 }
 
@@ -101,6 +103,9 @@ pub struct Report {
     pub rules: Option<usize>,
     pub config_hash: Option<String>,
     pub runs: Option<RunsLog>,
+    /// Added field (D16a): rules whose jobs enter a container, so muzzle
+    /// admits them but can't cap or measure them. Empty when none.
+    pub container_rules: Vec<String>,
     pub pi_extension: &'static str,
     pub claude_hook: &'static str,
     pub codex_hook: &'static str,
@@ -138,6 +143,38 @@ fn enforcement(os: &str, systemd: bool) -> String {
         ("linux", false) => "advisory (no systemd user manager reachable)".into(),
         (os, _) => format!("advisory ({os} has no systemd scope)"),
     }
+}
+
+/// D16a: what a rule's pattern is probed with. A command in a container
+/// is the whole string, so a rule that matches one of these, or names a
+/// container tool in its pattern, is taken to wrap container entries.
+const CONTAINER_PROBES: [&str; 4] = [
+    "distrobox enter box -- true",
+    "podman exec box true",
+    "toolbox run true",
+    "docker exec box true",
+];
+const CONTAINER_TOOLS: [&str; 4] = ["distrobox", "podman", "toolbox", "docker"];
+
+/// Rules that enter a container: by pattern (above) or because
+/// `runs.jsonl` recorded such a run for them. Sorted, no duplicates.
+fn container_rules(config: Option<&Config>, seen: &[String]) -> Vec<String> {
+    let mut out: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+    if let Some(c) = config {
+        let rules = c
+            .rules
+            .iter()
+            .chain(c.projects.iter().flat_map(|p| &p.rules));
+        for r in rules {
+            let src = r.pattern.as_str();
+            if CONTAINER_TOOLS.iter().any(|t| src.contains(t))
+                || CONTAINER_PROBES.iter().any(|p| r.pattern.is_match(p))
+            {
+                out.insert(r.name.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 pub fn check(f: &Facts) -> Report {
@@ -241,6 +278,7 @@ pub fn check(f: &Facts) -> Report {
         rules,
         config_hash: hash,
         runs: f.runs.clone(),
+        container_rules: container_rules(f.config.as_ref().ok(), &f.container_runs),
         pi_extension: found(&f.harnesses.pi_extension, "loaded", "not installed"),
         claude_hook: found(&f.harnesses.claude_hook, "installed", "not found"),
         codex_hook: found(&f.harnesses.codex_hook, "installed", "not found"),
@@ -301,6 +339,16 @@ pub fn render_text(r: &Report) -> String {
             ),
         },
     );
+    if !r.container_rules.is_empty() {
+        line(
+            "containers",
+            format!(
+                "admission only for {} (D16a): the job runs in the container's cgroup, \
+                 so MemoryMax, CPUWeight and the cpu/mem figures don't reach it",
+                r.container_rules.join(", ")
+            ),
+        );
+    }
     line("pi extension", r.pi_extension.into());
     line("claude hook", r.claude_hook.into());
     line("codex hook", r.codex_hook.into());
@@ -329,6 +377,16 @@ fn runs_log(path: &Path) -> Option<RunsLog> {
         oldest: ends.iter().min().cloned(),
         newest: ends.iter().max().cloned(),
     })
+}
+
+/// Rules with a `runs.jsonl` line marked `enforced_reason: "container"`.
+fn container_runs(path: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let (runs, _) = crate::report::parse(&text);
+    runs.into_iter()
+        .filter(|r| r.rec.enforced_reason.is_some())
+        .filter_map(|r| r.rec.rule)
+        .collect()
 }
 
 /// A file can be created in `dir`. The probe file is removed again.
@@ -492,6 +550,7 @@ fn gather() -> Facts {
         config: config.map_err(|e| e.to_string()),
         stored,
         runs: runs_log(&state_dir.join("runs.jsonl")),
+        container_runs: container_runs(&state_dir.join("runs.jsonl")),
         state_dir,
         state_writable,
         state_readable,
@@ -535,6 +594,7 @@ mod tests {
             state_readable: Ok(()),
             systemd: true,
             runs: None,
+            container_runs: Vec::new(),
             harnesses: Harnesses::default(),
         }
     }
@@ -659,6 +719,47 @@ mod tests {
         ] {
             assert!(t.contains(want), "missing {want:?} in\n{t}");
         }
+    }
+
+    #[test]
+    fn container_rules_are_named_with_the_limit() {
+        let mut f = facts();
+        let r = check(&f);
+        assert!(r.container_rules.is_empty());
+        assert!(!render_text(&r).contains("containers"));
+
+        f.config = cfg(concat!(
+            "[[rule]]\nname='box'\nmatch='distrobox enter'\n",
+            "[[rule]]\nname='any'\nmatch='.'\n",
+            "[[rule]]\nname='gate'\nmatch='^contrib/gate'\n",
+            "[[rule]]\nname='plain'\nmatch='^make'\n",
+        ));
+        f.container_runs = vec!["gate".into(), "gate".into()];
+        let r = check(&f);
+        assert_eq!(r.container_rules, ["any", "box", "gate"]);
+        let t = render_text(&r);
+        assert!(
+            t.contains("containers     admission only for any, box, gate (D16a)"),
+            "{t}"
+        );
+        assert!(t.contains("MemoryMax, CPUWeight"), "{t}");
+    }
+
+    #[test]
+    fn container_runs_come_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("runs.jsonl");
+        let line = |rule: &str, reason: &str| {
+            format!(
+                "{{\"v\":1,\"end\":\"2026-10-29T00:00:00Z\",\"rule\":\"{rule}\",\"slots\":1,\
+                 \"class\":\"normal\",\"cfg\":null,\"agent\":null,\"cwd\":\"/\",\"waited_s\":0,\
+                 \"ran_s\":1,\"exit\":0,\"killed\":null,\"cpu_s\":null,\"mem_peak_mb\":null,\
+                 \"enforced\":false,\"nested\":false,\"kept\":false,\"budget\":4{reason}}}\n"
+            )
+        };
+        let text = line("box", ",\"enforced_reason\":\"container\"") + &line("host", "");
+        std::fs::write(&p, text).unwrap();
+        assert_eq!(container_runs(&p), ["box"]);
     }
 
     #[test]

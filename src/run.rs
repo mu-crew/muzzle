@@ -18,7 +18,7 @@ use crate::cli::{self, RunArgs};
 use crate::exit;
 use crate::proc::{self, CgroupFigures, Pid, StartTime};
 use crate::rules::config::{Config, ConfigError};
-use crate::state::{Budget, Claim, Holder, Killed, RunRecord, State, Store};
+use crate::state::{Budget, Claim, EnforcedReason, Holder, Killed, RunRecord, State, Store};
 
 /// Spec §Architecture 4.2: each waiter polls `admit` every 250 ms.
 const POLL: Duration = Duration::from_millis(250);
@@ -79,10 +79,36 @@ impl Liveness for ProcLive {
         // job still uses is the worse error.
         proc::group_members(pgid as Pid).map_or(true, |m| !m.is_empty())
     }
+    fn scope_alive(&self, unit: &str) -> bool {
+        scope_populated(unit)
+    }
 }
 
-fn holder_live(h: &Holder, live: &impl Liveness) -> bool {
-    live.alive(h.pid, h.start) || h.pgid.is_some_and(|g| live.group_alive(g))
+/// D16a: the scope unit still has processes. Asks systemd for its cgroup
+/// and reads `cgroup.events`, which counts descendants too. Only consulted
+/// for a container run whose muzzle and group are gone, so the systemctl
+/// call is rare. As for groups, an unanswerable question keeps the claim.
+pub(crate) fn scope_populated(unit: &str) -> bool {
+    let Ok(out) = Command::new("systemctl")
+        .args(["--user", "show", "-p", "ControlGroup", "--value"])
+        .arg(unit)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    let cgroup = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cgroup.is_empty() {
+        // Not loaded: systemd removes a scope once it empties.
+        return false;
+    }
+    fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(cgroup.trim_start_matches('/'))
+            .join("cgroup.events"),
+    )
+    .is_ok_and(|t| t.lines().any(|l| l == "populated 1"))
 }
 
 fn now_ms() -> u64 {
@@ -157,7 +183,7 @@ fn is_nested(
             || ancestors.iter().any(|a| {
                 (a.pid as u32 == h.pid && a.start == h.start) || h.pgid == Some(a.pgid as u32)
             });
-        named && holder_live(h, live)
+        named && admit::holds(h, live)
     })
 }
 
@@ -766,7 +792,7 @@ fn run_nested(args: &RunArgs, run_timeout: Option<Duration>) -> anyhow::Result<E
             admitted_ms: None,
             released_ms: None,
         };
-        write_report(path, &t, None, None, None, code, false, false)?;
+        write_report(path, &t, None, None, None, code, false, None, false)?;
     }
     Ok(ExitCode::from(code))
 }
@@ -834,9 +860,10 @@ fn write_report(
     rule: Option<&str>,
     exit: u8,
     enforced: bool,
+    reason: Option<EnforcedReason>,
     kept: bool,
 ) -> anyhow::Result<()> {
-    let v = json!({
+    let mut v = json!({
         "waited_s": round3(t.waited_s),
         "ran_s": round3(t.ran_s),
         "admitted_ms": t.admitted_ms,
@@ -848,6 +875,10 @@ fn write_report(
         "enforced": enforced,
         "kept": kept,
     });
+    // Added only when set (D16a), as status and runs.jsonl do.
+    if let Some(r) = reason {
+        v["enforced_reason"] = json!(r);
+    }
     fs::write(path, format!("{v}\n")).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -877,9 +908,17 @@ struct Ending {
 impl Job<'_> {
     fn run(&mut self, args: &RunArgs, run_timeout: Option<Duration>) -> anyhow::Result<u8> {
         let slots = self.holder.claim.slots;
-        let enforced = proc::systemd_user_reachable();
+        let scoped = proc::systemd_user_reachable();
+        // D16a: a container job runs in the container's cgroup, which the
+        // scope's MemoryMax and CPUWeight don't reach. Still run it under the
+        // scope: it holds podman exec and conmon, and is how a pruner sees
+        // the job outlive a group kill.
+        let container = crate::rules::enters_container(&crate::rules::command_text(&args.command));
+        let enforced = scoped && !container;
+        let reason = container.then_some(EnforcedReason::Container);
         let unit = unit_name(self.me, self.my_start, self.ticket);
-        let mut cmd = if enforced {
+        let scope = (scoped && container).then(|| format!("{unit}.scope"));
+        let mut cmd = if scoped {
             let mut c = Command::new("systemd-run");
             c.args(["--user", "--scope", "--quiet"]);
             if systemd_run_expands_env() {
@@ -942,13 +981,17 @@ impl Job<'_> {
             if let Some(h) = s.holder_mut(self.ticket) {
                 h.pgid = Some(pgid);
                 h.enforced = enforced;
+                h.enforced_reason = reason;
+                h.scope = scope.clone();
             }
             Ok(())
         })?;
         self.holder.pgid = Some(pgid);
         self.holder.enforced = enforced;
+        self.holder.enforced_reason = reason;
+        self.holder.scope = scope;
 
-        let mut sampler = enforced.then(|| Sampler {
+        let mut sampler = scoped.then(|| Sampler {
             unit: unit.clone(),
             dir: None,
             last: None,
@@ -1018,6 +1061,13 @@ impl Job<'_> {
         budget: Option<u32>,
     ) -> RunRecord {
         let h = &self.holder;
+        // D16a: the scope saw only podman exec and conmon, so its figures
+        // say nothing about the job (3 s of in-container CPU read 0.21 s on
+        // linuxpc). Null, as for a run nobody measured.
+        let (cpu_s, mem_peak_mb) = match h.enforced_reason {
+            Some(EnforcedReason::Container) => (None, None),
+            None => (cpu_s, mem_peak_mb),
+        };
         RunRecord {
             v: 1,
             end: admit::rfc3339(now_ms()),
@@ -1037,6 +1087,7 @@ impl Job<'_> {
             nested: false,
             kept,
             budget,
+            enforced_reason: h.enforced_reason,
         }
     }
 
@@ -1088,6 +1139,7 @@ impl Job<'_> {
                 h.claim.rule.as_deref(),
                 ending.code,
                 enforced,
+                h.enforced_reason,
                 kept,
             ),
             None => {
@@ -1302,6 +1354,9 @@ mod tests {
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
         }
+        fn scope_alive(&self, _unit: &str) -> bool {
+            false
+        }
     }
 
     fn holder(ticket: u64, pid: u32, start: u64, pgid: Option<u32>) -> Holder {
@@ -1314,6 +1369,8 @@ mod tests {
             waited_s: 0.0,
             enforced: false,
             kept: false,
+            enforced_reason: None,
+            scope: None,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,

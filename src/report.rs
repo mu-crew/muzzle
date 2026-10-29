@@ -347,15 +347,29 @@ pub fn row(rule: Option<String>, runs: &[&Run], host: Host) -> Row {
         .filter_map(|r| r.rec.mem_peak_mb.map(|m| m as f64))
         .collect();
     let mem_p90 = percentile(&mems, 90.0);
-    let suggest = suggest(SuggestIn {
-        clean: &clean,
-        ooms: &ooms,
-        slots,
-        budget,
-        cores_p90: percentile(&cores, 90.0),
-        mem_p90,
-        mem_per_slot_mb: host.mem_per_slot_mb,
-    });
+    // D16a: a container run's scope saw only podman exec and conmon, so its
+    // figures say nothing about the job; suggesting from them would shrink
+    // the rule to nothing. In a mixed rule only the host runs count, so
+    // container runs don't make up D30's minimum of clean runs.
+    let suggest = if runs.iter().all(|r| r.rec.enforced_reason.is_some()) {
+        Suggest::None(NOT_MEASURED_CONTAINER.into())
+    } else {
+        let (clean, ooms) = (measured(&clean), measured(&ooms));
+        let cores: Vec<f64> = clean.iter().filter_map(|r| r.cores()).collect();
+        let mems: Vec<f64> = clean
+            .iter()
+            .filter_map(|r| r.rec.mem_peak_mb.map(|m| m as f64))
+            .collect();
+        suggest(SuggestIn {
+            clean: &clean,
+            ooms: &ooms,
+            slots,
+            budget,
+            cores_p90: percentile(&cores, 90.0),
+            mem_p90: percentile(&mems, 90.0),
+            mem_per_slot_mb: host.mem_per_slot_mb,
+        })
+    };
     Row {
         rule,
         cfg: None,
@@ -370,6 +384,17 @@ pub fn row(rule: Option<String>, runs: &[&Run], host: Host) -> Row {
         suggest,
     }
 }
+
+/// D16a: the runs whose figures describe the job: not container runs.
+fn measured<'a>(rs: &[&'a Run]) -> Vec<&'a Run> {
+    rs.iter()
+        .copied()
+        .filter(|r| r.rec.enforced_reason.is_none())
+        .collect()
+}
+
+/// D16a: the reason given for a rule whose runs all entered a container.
+pub const NOT_MEASURED_CONTAINER: &str = "not measured (container)";
 
 struct SuggestIn<'a> {
     clean: &'a [&'a Run],
@@ -902,6 +927,7 @@ mod tests {
                 nested: false,
                 kept: false,
                 budget: Some(8),
+                enforced_reason: None,
             },
         }
     }
@@ -1047,6 +1073,38 @@ mod tests {
         // Below the threshold there is no experiment either.
         let runs = with_cores(T0, 6, &[5.5; 4]);
         assert!(matches!(one_row(&runs).suggest, Suggest::None(_)));
+    }
+
+    #[test]
+    fn container_rules_are_not_measured_and_get_no_suggestion() {
+        use crate::state::EnforcedReason;
+        // Saturated and OOMing: every signal would suggest something.
+        let mut runs = with_cores(T0, 6, &[5.9; 6]);
+        let mut oom = run(T0 + 99_999.0, 10.0);
+        oom.rec.killed = Some(Killed::Oom);
+        oom.rec.mem_peak_mb = Some(9_000);
+        runs.push(oom);
+        assert!(matches!(one_row(&runs).suggest, Suggest::Slots { .. }));
+        runs.iter_mut()
+            .for_each(|r| r.rec.enforced_reason = Some(EnforcedReason::Container));
+        let r = one_row(&runs);
+        assert_eq!(r.suggest, Suggest::None(NOT_MEASURED_CONTAINER.into()));
+        assert!(row_text(&r).contains("not measured (container)"));
+        assert_eq!(
+            row_json(&r)["suggest"]["reason"],
+            "not measured (container)"
+        );
+        // Host runs in a mixed rule suggest again, counted alone: four
+        // host runs are short of the five D30 needs.
+        for r in &mut runs[..4] {
+            r.rec.enforced_reason = None;
+        }
+        assert_eq!(
+            one_row(&runs).suggest,
+            Suggest::None("insufficient data (4 runs)".into())
+        );
+        runs[4].rec.enforced_reason = None;
+        assert!(matches!(one_row(&runs).suggest, Suggest::Slots { .. }));
     }
 
     #[test]

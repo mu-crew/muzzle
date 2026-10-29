@@ -109,6 +109,15 @@ pub struct Holder {
     /// A keeper took over the entry (D16).
     #[serde(default)]
     pub kept: bool,
+    /// Why `enforced` is false despite a scope (D16a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforced_reason: Option<EnforcedReason>,
+    /// The job's scope unit (`muzzle-….scope`), set only for a container
+    /// run (D16a): its job lives outside the group, so the claim stays
+    /// held while the scope still has processes (conmon), muzzle alive or
+    /// not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,
@@ -138,6 +147,18 @@ pub struct RunRecord {
     pub nested: bool,
     pub kept: bool,
     pub budget: Option<u32>,
+    /// Added field (D16a); absent on older lines.
+    #[serde(default)]
+    pub enforced_reason: Option<EnforcedReason>,
+}
+
+/// D16a: why a run that had a scope was not enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnforcedReason {
+    /// The job entered a container (`distrobox enter`, `podman exec`, …)
+    /// and runs in the container's cgroup, out of reach of muzzle's scope.
+    Container,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +591,7 @@ mod tests {
             nested: false,
             kept: false,
             budget: Some(14),
+            enforced_reason: None,
         };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["killed"], "holder");

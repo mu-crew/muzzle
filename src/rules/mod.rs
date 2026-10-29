@@ -7,7 +7,9 @@ pub mod hook;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::cli::{Class, HookArgs, MatchArgs, WrapArgs};
@@ -50,6 +52,37 @@ pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) 
         rule: m.rule.name.clone(),
         slots: m.rule.slots,
     })
+}
+
+/// D16a: a container entry in command position. The anchor is the one
+/// bench/linuxpc-config.toml uses (start of the string, after `; & | (` or a
+/// newline, right inside a `-c '…'` quote, after ` -- `, with env
+/// assignments and time/timeout/env/nice before it), so a poll such as
+/// `pgrep -f 'distrobox enter'` or `echo podman exec` doesn't count.
+static CONTAINER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|sudo)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+)*(\S*/)?(distrobox\s+enter|distrobox-enter|podman\s+exec|toolbox\s+run|docker\s+exec)(\s|['"]|$)"#,
+    )
+    .expect("container pattern compiles")
+});
+
+/// D16a: `command` enters a container (`distrobox enter`, `podman exec`,
+/// `toolbox run`, `docker exec`). The job then runs in the container's own
+/// cgroup, so muzzle's scope admits it but neither caps nor measures it.
+pub fn enters_container(command: &str) -> bool {
+    CONTAINER.is_match(command)
+}
+
+/// The shell text of a `muzzle run` argv, for [`enters_container`]: the
+/// script of `bash -c '<text>'` (what [`wrap`] produces), else the words
+/// joined by spaces.
+pub fn command_text(argv: &[String]) -> String {
+    let shell = |w: &str| matches!(w.rsplit('/').next(), Some("bash" | "sh" | "dash" | "zsh"));
+    let c_flag = |w: &str| w.len() > 1 && w.starts_with('-') && w.ends_with('c');
+    match argv {
+        [sh, flag, script, ..] if shell(sh) && c_flag(flag) => script.clone(),
+        _ => argv.join(" "),
+    }
 }
 
 /// POSIX single-quoting: everything inside '…' is literal, including `$`,
@@ -348,6 +381,56 @@ mod tests {
             assert_eq!(run.rule.as_deref(), Some(name), "{}", w.command);
             assert_eq!(run.slots, Some(6));
         }
+    }
+
+    #[test]
+    fn container_entries_in_command_position() {
+        for cmd in [
+            "distrobox enter swayward-dev -- contrib/fast-gate",
+            "cd /w && distrobox enter box -- cargo test",
+            "FOO=1 podman exec -it c make",
+            "timeout 600 toolbox run cargo build",
+            "bash -lc 'docker exec c make'",
+            "/usr/bin/distrobox enter x -- true",
+            "distrobox-enter x -- true",
+            "env A=1 distrobox enter x",
+            "true; podman exec c sh",
+        ] {
+            assert!(enters_container(cmd), "{cmd}");
+        }
+        for cmd in [
+            "grep 'podman exec' log",
+            "echo distrobox enter",
+            "pgrep -f 'distrobox enter'",
+            "podman ps",
+            "cat docker-exec.md",
+            "distrobox list",
+            "contrib/fast-gate",
+            "toolbox runner",
+        ] {
+            assert!(!enters_container(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn command_text_unwraps_bash_c() {
+        let v = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_text(&v(&["bash", "-c", "distrobox enter x -- make"])),
+            "distrobox enter x -- make"
+        );
+        assert_eq!(command_text(&v(&["/bin/sh", "-lc", "a b"])), "a b");
+        assert_eq!(
+            command_text(&v(&["distrobox", "enter", "x", "--", "make"])),
+            "distrobox enter x -- make"
+        );
+        assert!(enters_container(&command_text(&v(&[
+            "podman", "exec", "c", "make"
+        ]))));
+        assert!(!enters_container(&command_text(&v(&[
+            "echo",
+            "podman exec"
+        ]))));
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::admit::{self, Class, Liveness};
 use crate::cli::StatusArgs;
 use crate::proc::{self, Pid};
 use crate::rules::config::DEFAULT_RESERVE;
-use crate::state::{Budget, State, Store};
+use crate::state::{Budget, EnforcedReason, State, Store};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Status {
@@ -42,6 +42,11 @@ pub struct HolderView {
     pub run_s: u64,
     pub pid: u32,
     pub pgid: Option<u32>,
+    /// Added fields (D16a): false with reason `container` when the job
+    /// entered a container and the scope neither caps nor measures it.
+    pub enforced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enforced_reason: Option<EnforcedReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -64,6 +69,9 @@ impl Liveness for ProcLive {
     }
     fn group_alive(&self, pgid: u32) -> bool {
         proc::group_members(pgid as Pid).map_or(true, |m| !m.is_empty())
+    }
+    fn scope_alive(&self, unit: &str) -> bool {
+        crate::run::scope_populated(unit)
     }
 }
 
@@ -88,9 +96,7 @@ pub fn view(
     // Same floor as `admit`: a 0 budget still runs one job alone (D8).
     let budget = b.budget.max(1);
     state.waiters.retain(|w| live.alive(w.pid, w.start));
-    state
-        .holders
-        .retain(|h| live.alive(h.pid, h.start) || h.pgid.is_some_and(|g| live.group_alive(g)));
+    state.holders.retain(|h| admit::holds(h, live));
     let held = state.held();
     let secs = |since_ms: u64| now_ms.saturating_sub(since_ms) / 1000;
     Status {
@@ -113,6 +119,8 @@ pub fn view(
                 run_s: secs(h.run_start_ms),
                 pid: h.pid,
                 pgid: h.pgid,
+                enforced: h.enforced,
+                enforced_reason: h.enforced_reason,
             })
             .collect(),
         waiting: admit::queue(&state)
@@ -153,8 +161,13 @@ pub fn render_text(s: &Status) -> String {
     } else {
         out.push_str("holders:\n");
         for h in &s.holders {
+            let container = if h.enforced_reason.is_some() {
+                "  (container: not enforced)"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "  {:>3} slots  {:<6}  {}  {}  {}s  pid {}  {}\n",
+                "  {:>3} slots  {:<6}  {}  {}  {}s  pid {}  {}{container}\n",
                 h.slots,
                 class_str(h.class),
                 or(&h.agent, "?"),
@@ -249,6 +262,9 @@ mod tests {
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
         }
+        fn scope_alive(&self, unit: &str) -> bool {
+            unit == "live.scope"
+        }
     }
 
     const READING: Budget = Budget {
@@ -278,6 +294,8 @@ mod tests {
             waited_s: 0.0,
             enforced: true,
             kept: false,
+            enforced_reason: None,
+            scope: None,
             claim: claim(slots, Class::High, agent),
         }
     }
@@ -376,6 +394,30 @@ mod tests {
         };
         let s = view(&State::default(), 0, &live(), zero, None, 8, false);
         assert_eq!((s.budget, s.free), (1, 1));
+    }
+
+    #[test]
+    fn container_holders_show_why_and_stay_while_their_scope_lives() {
+        let mut st = state();
+        // Muzzle and group gone (as for 11), but its scope still has conmon.
+        let mut h = holder(3, 12, Some(12), 2, "box");
+        h.enforced = false;
+        h.enforced_reason = Some(EnforcedReason::Container);
+        h.scope = Some("live.scope".into());
+        st.holders.push(h);
+        let s = view(&st, 63_000, &live(), READING, None, 2, true);
+        let agents: Vec<_> = s.holders.iter().map(|h| h.agent.clone().unwrap()).collect();
+        assert_eq!(agents, ["orch", "box"]);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["holders"][0]["enforced"], true);
+        assert!(v["holders"][0].get("enforced_reason").is_none());
+        assert_eq!(v["holders"][1]["enforced"], false);
+        assert_eq!(v["holders"][1]["enforced_reason"], "container");
+        assert!(render_text(&s).contains("(container: not enforced)"));
+        // Once the scope is gone, so is the holder.
+        st.holders[2].scope = Some("gone.scope".into());
+        let s = view(&st, 63_000, &live(), READING, None, 2, true);
+        assert_eq!(s.holders.len(), 1);
     }
 
     #[test]

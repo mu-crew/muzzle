@@ -872,3 +872,132 @@ fn report_times_hand_slots_over_without_overlap() {
     // B queued behind A's whole second of sleep.
     assert!(b["waited_s"].as_f64().unwrap() >= 0.5, "{b}");
 }
+
+/// D16a: a fake `podman` on `PATH`. `podman exec <box> CMD…` runs CMD the
+/// way conmon does: in a session of its own, so a group kill misses it,
+/// but still a descendant, so it stays inside muzzle's scope.
+fn fake_podman(env: &Env) -> String {
+    let bin = env.scratch.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("podman");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = exec ] || exit 2\nshift 2\ntouch {}\nsetsid \"$@\" &\nwait\n",
+            env.file("entered").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn a_container_run_is_recorded_as_not_enforced() {
+    let env = Env::new();
+    let path = fake_podman(&env);
+    let report = env.file("r.json");
+    let out = env
+        .cmd(&[
+            "--rule",
+            "gate",
+            "--report",
+            report.to_str().unwrap(),
+            "--",
+            "bash",
+            "-c",
+            "podman exec box true",
+        ])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let r = &env.runs()[0];
+    assert_eq!(r["enforced"], false, "{r}");
+    assert_eq!(r["enforced_reason"], "container", "{r}");
+    // The scope saw only podman and conmon: no figures rather than wrong ones.
+    assert!(r["cpu_s"].is_null() && r["mem_peak_mb"].is_null(), "{r}");
+    let rep: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(rep["enforced"], false);
+    assert_eq!(rep["enforced_reason"], "container");
+    // Both additive sets survive together: D35's lock times and D16a's reason.
+    assert!(
+        rep["admitted_ms"].is_u64() && rep["released_ms"].is_u64(),
+        "{rep}"
+    );
+
+    // A host run gets no reason field in either place.
+    let out = env
+        .cmd(&["--report", report.to_str().unwrap(), "--", "true"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(env.runs()[1].get("enforced_reason").unwrap().is_null());
+    let rep: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert!(rep.get("enforced_reason").is_none(), "{rep}");
+}
+
+#[test]
+fn group_kill_of_a_container_gate_holds_the_slots_until_its_scope_empties() {
+    if cfg!(not(target_os = "linux")) || !muzzle::proc::systemd_user_reachable() {
+        eprintln!("skipped: needs a systemd user manager (D15, D16a)");
+        return;
+    }
+    let env = Env::new();
+    let path = fake_podman(&env);
+    let mut gate = env
+        .leader(&["--slots", "4", "--", "podman", "exec", "box", "sleep", "3"])
+        .env("PATH", &path)
+        .spawn()
+        .unwrap();
+    assert!(eventually(Duration::from_secs(5), || env
+        .file("entered")
+        .exists()));
+    let started = Instant::now();
+    let h = &env.state().holders[0];
+    assert_eq!(h.enforced_reason.map(|_| ()), Some(()));
+    assert!(
+        h.scope
+            .as_deref()
+            .is_some_and(|u| u.starts_with(&env.units))
+    );
+
+    let mut next = env.cmd(&["--slots", "1", "--", "true"]).spawn().unwrap();
+    // pi on Esc: muzzle and its group die, the "in-container" sleep doesn't.
+    kill(-(gate.id() as i32), libc::SIGKILL);
+    gate.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        next.try_wait().unwrap().is_none(),
+        "admitted while the container job ran: {:?}",
+        env.runs()
+    );
+    let status = muzzle_status(&env);
+    assert_eq!(status["held"], 4, "{status}");
+    assert_eq!(status["holders"][0]["enforced_reason"], "container");
+
+    assert!(
+        wait_for(&mut next, Duration::from_secs(6))
+            .unwrap()
+            .success()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(2800));
+    let r = &env.runs()[0];
+    assert_eq!(r["killed"], "holder", "{r}");
+    assert_eq!(r["enforced_reason"], "container", "{r}");
+}
+
+fn muzzle_status(env: &Env) -> Value {
+    let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
+        .args(["status", "--json"])
+        .env("XDG_STATE_HOME", &env.state)
+        .env("XDG_CONFIG_HOME", &env.config)
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}

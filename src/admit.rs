@@ -25,6 +25,18 @@ pub trait Liveness {
     fn alive(&self, pid: u32, start: u64) -> bool;
     /// The group has at least one live, non-zombie member.
     fn group_alive(&self, pgid: u32) -> bool;
+    /// The systemd scope unit (`muzzle-….scope`) still has processes.
+    fn scope_alive(&self, unit: &str) -> bool;
+}
+
+/// The holder's claim is still in use: its muzzle (or keeper) lives, its
+/// group has members (D16), or, for a container run, its scope still holds
+/// processes (D16a). A container job runs under conmon in its own session,
+/// so a group kill leaves it running with only the scope to show for it.
+pub fn holds(h: &Holder, live: &impl Liveness) -> bool {
+    live.alive(h.pid, h.start)
+        || h.pgid.is_some_and(|g| live.group_alive(g))
+        || h.scope.as_deref().is_some_and(|u| live.scope_alive(u))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,15 +71,16 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
     state.waiters.retain(|w| live.alive(w.pid, w.start));
 
     // Pruning: a holder goes once its muzzle (or keeper) is dead *and* its
-    // group is empty. A dead muzzle with a live group keeps its slots: the
-    // job is still using the machine (D16).
+    // group is empty (and, for a container run, its scope too: D16a). A
+    // dead muzzle with a live group keeps its slots: the job is still using
+    // the machine (D16).
     // D7 gives cores − reserve, which is 0 on a 2-core host or a small
     // container (D17a). Floor it once here so `cap` and `free` agree and a
     // job still runs alone (D8) instead of every waiter blocking forever.
     let budget = state.budget.map(|b| b.budget.max(1));
     let (kept, dead): (Vec<Holder>, Vec<Holder>) = std::mem::take(&mut state.holders)
         .into_iter()
-        .partition(|h| live.alive(h.pid, h.start) || h.pgid.is_some_and(|g| live.group_alive(g)));
+        .partition(|h| holds(h, live));
     state.holders = kept;
     let records = dead
         .into_iter()
@@ -115,6 +128,8 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         waited_s: now_ms.saturating_sub(w.enqueued_ms) as f64 / 1000.0,
         enforced: false,
         kept: false,
+        enforced_reason: None,
+        scope: None,
         claim,
     }
 }
@@ -141,6 +156,7 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         nested: false,
         kept: h.kept,
         budget,
+        enforced_reason: h.enforced_reason,
     }
 }
 
@@ -165,6 +181,7 @@ mod tests {
     struct Table {
         procs: HashSet<(u32, u64)>,
         groups: HashSet<u32>,
+        scopes: HashSet<String>,
     }
 
     impl Liveness for Table {
@@ -173,6 +190,9 @@ mod tests {
         }
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
+        }
+        fn scope_alive(&self, unit: &str) -> bool {
+            self.scopes.contains(unit)
         }
     }
 
@@ -404,6 +424,49 @@ mod tests {
         let out = admit(out.state, 4, &live);
         assert_eq!(out.admitted, vec![w]);
         assert_eq!(out.records.len(), 1);
+    }
+
+    #[test]
+    fn container_run_keeps_its_slots_until_the_scope_empties() {
+        // D16a: pi's group kill took muzzle and its group, but conmon and
+        // the in-container job live on in the scope.
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 1).state;
+        s.holders[0].scope = Some("muzzle-1-2-3.scope".into());
+        s.holders[0].enforced_reason = Some(crate::state::EnforcedReason::Container);
+        let w = push(&mut s, 1, Class::Normal, 2);
+        let mut live = all_alive(&s);
+        live.procs.remove(&(t as u32 + 100, START));
+        live.groups.clear();
+        live.scopes.insert("muzzle-1-2-3.scope".into());
+        let out = admit(s, 3, &live);
+        assert!(out.admitted.is_empty());
+        assert!(out.records.is_empty());
+        assert_eq!(holder_tickets(&out.state), vec![t]);
+        // The job ends, conmon exits, the scope empties: pruned like a dead
+        // keeper, with the reason carried into the record.
+        live.scopes.clear();
+        let out = admit(out.state, 4, &live);
+        assert_eq!(out.admitted, vec![w]);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].killed, Some(Killed::Holder));
+        assert_eq!(
+            out.records[0].enforced_reason,
+            Some(crate::state::EnforcedReason::Container)
+        );
+    }
+
+    #[test]
+    fn a_live_scope_does_not_hold_a_non_container_run() {
+        // Only a holder that names its scope is held by it.
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let s = run(s, 1).state;
+        let mut live = Table::default();
+        live.scopes.insert(format!("muzzle-{}.scope", t));
+        let out = admit(s, 2, &live);
+        assert!(out.state.holders.is_empty());
     }
 
     #[test]
