@@ -182,6 +182,12 @@ struct Outcome {
     start: f64,
     admitted: f64,
     end: f64,
+    /// Under muzzle, the slots as muzzle held them, in seconds from replay
+    /// start: the report's epoch ms, read under the state lock, so a
+    /// release never reads later than the admission it allows. `start + waited_s` can't stand in: it
+    /// is late by the spawn and the first lock, and overlapping intervals
+    /// read 20 slots held of 14.
+    held: Option<(f64, f64)>,
     status: Option<ExitStatus>,
 }
 
@@ -282,7 +288,7 @@ impl Plan {
         Ok((cmd, report))
     }
 
-    fn run_call(&self, i: usize, call: &Call, t0: Instant) -> anyhow::Result<Outcome> {
+    fn run_call(&self, i: usize, call: &Call, t0: Instant, t0_ms: u64) -> anyhow::Result<Outcome> {
         let (mut cmd, report) = self.command(i, call)?;
         let start = t0.elapsed().as_secs_f64();
         let status = cmd.status().context("spawning a replayed call")?;
@@ -297,6 +303,7 @@ impl Plan {
             start,
             admitted: start,
             end,
+            held: None,
             status: Some(status),
         };
         if let Some(file) = report {
@@ -308,6 +315,13 @@ impl Plan {
                     o.admitted = start + r["waited_s"].as_f64().unwrap_or(0.0);
                     o.end = o.admitted + r["ran_s"].as_f64().unwrap_or(end - start);
                     o.slots = r["slots"].as_u64().map_or(o.slots, |n| n as u32);
+                    // released_ms is null for a run a keeper released later
+                    // (D16); the bench's own end is an upper bound for that.
+                    let rel = |ms: u64| ms.saturating_sub(t0_ms) as f64 / 1000.0;
+                    o.held = r["admitted_ms"].as_u64().map(|a| {
+                        let r = r["released_ms"].as_u64().map_or(end, rel);
+                        (rel(a), r)
+                    });
                 }
                 // No report: muzzle itself failed before admission.
                 None => o.status = None,
@@ -478,6 +492,7 @@ pub fn run_main(args: &BenchRunArgs) -> anyhow::Result<ExitCode> {
         args.speed
     );
     let t0 = Instant::now();
+    let t0_ms = now_ms();
     let mut handles = Vec::new();
     for (i, call) in calls.iter().cloned().enumerate() {
         let due = Duration::from_secs_f64(call.t / args.speed);
@@ -485,7 +500,9 @@ pub fn run_main(args: &BenchRunArgs) -> anyhow::Result<ExitCode> {
             std::thread::sleep(wait);
         }
         let plan = plan.clone();
-        handles.push(std::thread::spawn(move || plan.run_call(i, &call, t0)));
+        handles.push(std::thread::spawn(move || {
+            plan.run_call(i, &call, t0, t0_ms)
+        }));
     }
     let outcomes = handles
         .into_iter()
@@ -559,7 +576,11 @@ fn result_json(f: &Figures) -> Value {
     let held: Vec<(f64, f64, u32)> = o
         .iter()
         .filter(|c| c.matched)
-        .map(|c| (c.admitted, c.end, c.slots))
+        .map(|c| match c.held {
+            Some((a, r)) => (a, r, c.slots),
+            // Mode none, or no report: the bench's own view.
+            None => (c.admitted, c.end, c.slots),
+        })
         .collect();
     // D30a: the scope's oom-kill under muzzle; without a scope, a SIGKILL
     // is the kernel OOM killer's signature.
@@ -805,6 +826,47 @@ mod tests {
         assert_eq!(max_held(&[(0.0, 1.0, 4), (1.0, 2.0, 4)]), 4);
     }
 
+    /// Under muzzle the held figure uses muzzle's locked times, not the
+    /// bench's spawn-relative estimate, which can overlap.
+    #[test]
+    fn held_slots_prefer_muzzles_own_times() {
+        let header = Header {
+            host: "linuxpc".into(),
+            cores: 16,
+            ram_gb: 31,
+            date: "2026-10-08".into(),
+            window_s: 10.0,
+            calls_kept: 2,
+        };
+        let o = |admitted: f64, end: f64, held| Outcome {
+            matched: true,
+            slots: 3,
+            start: 0.0,
+            admitted,
+            end,
+            held,
+            status: None,
+        };
+        // Estimates overlap by 0.5 s; muzzle's own times hand over at 1.2 s.
+        let outcomes = [o(0.0, 1.5, Some((0.1, 1.2))), o(1.0, 2.0, Some((1.2, 2.1)))];
+        let r = result_json(&Figures {
+            mode: BenchMode::Muzzle,
+            tier: BenchTier::Synthetic,
+            speed: 1.0,
+            window: None,
+            window_start: None,
+            header: &header,
+            light: 0,
+            outcomes: &outcomes,
+            makespan: 2.1,
+            bursts: &[],
+            runs: "",
+            budget: Some(4),
+            cfg: "abc".into(),
+        });
+        assert_eq!(r["max_slots_held"], 3);
+    }
+
     #[test]
     fn trace_needs_a_header_first() {
         let header = r#"{"v":1,"kind":"header","host":"linuxpc","cores":16,"ram_gb":31,"date":"2026-10-08","window_s":86400,"source":"museum","calls_total":1,"calls_kept":1,"calls_dropped":0}"#;
@@ -832,6 +894,7 @@ mod tests {
             start,
             admitted,
             end,
+            held: None,
             status: None,
         };
         let outcomes = [o(0.0, 0.0, 2.0, 4), o(1.0, 2.0, 3.0, 4)];

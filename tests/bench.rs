@@ -48,9 +48,17 @@ fn muzzle(dir: &Path, args: &[&str]) -> Output {
 }
 
 fn bench(mode: &str, extra: &[&str]) -> (tempfile::TempDir, PathBuf, Value) {
+    bench_trace(&fixture("tiny-trace.jsonl"), mode, "20", extra)
+}
+
+fn bench_trace(
+    trace: &Path,
+    mode: &str,
+    speed: &str,
+    extra: &[&str],
+) -> (tempfile::TempDir, PathBuf, Value) {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
-    let trace = fixture("tiny-trace.jsonl");
     let mut args = vec![
         "bench",
         "run",
@@ -60,7 +68,7 @@ fn bench(mode: &str, extra: &[&str]) -> (tempfile::TempDir, PathBuf, Value) {
         "--tier",
         "synthetic",
         "--speed",
-        "20",
+        speed,
         "--out",
         out.to_str().unwrap(),
     ];
@@ -118,6 +126,33 @@ fn muzzle_mode_queues_matched_calls_and_logs_them() {
     let summary = std::fs::read_to_string(out.join("summary.md")).unwrap();
     assert!(summary.contains("mode muzzle"), "{summary}");
     assert!(summary.contains("10 ms sleep late p99"), "{summary}");
+}
+
+/// The held figure comes from muzzle's own admission and release times,
+/// so under overload it never exceeds the budget. Rebuilt from the
+/// bench's spawn time plus `waited_s`, 40 calls at once read 20/14 on
+/// linuxpc while live `muzzle status` never passed 14. The overlap is a
+/// timing race (this trace read 6/4 on 1 of 2 CLI runs, 0 of 4 under
+/// `cargo test`), so this guards the bound; the unit test
+/// `held_slots_prefer_muzzles_own_times` pins the fix.
+#[test]
+fn muzzle_mode_held_slots_stay_within_budget_under_overload() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("overload.jsonl");
+    let mut rows = vec![
+        r#"{"v":1,"kind":"header","host":"linuxpc","cores":16,"ram_gb":31,"date":"2026-10-08","window_s":10,"source":"museum","calls_total":12,"calls_kept":12,"calls_dropped":0}"#.to_string(),
+    ];
+    for i in 0..12 {
+        rows.push(format!(
+            r#"{{"v":1,"kind":"call","t":0.0,"dur_s":1.0,"dur_src":"durationMs","bg":false,"rule":"gate","role":"worker","agent":"a{i}","project":"p1"}}"#
+        ));
+    }
+    std::fs::write(&trace, rows.join("\n") + "\n").unwrap();
+    let (_dir, _out, r) = bench_trace(&trace, "muzzle", "1", &[]);
+    assert_eq!(r["calls"]["failed"], 0, "{r:#}");
+    assert_eq!(r["machine"]["budget"], 4);
+    // A gate claims 3 of 4: any overlap would read 6.
+    assert_eq!(r["max_slots_held"], 3, "{r:#}");
 }
 
 #[test]

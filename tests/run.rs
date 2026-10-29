@@ -828,3 +828,47 @@ fn report_file_has_the_spec_fields() {
     assert!(r["enforced"].is_boolean());
     assert!(r["waited_s"].is_f64() && r["ran_s"].is_f64());
 }
+
+/// `admitted_ms`/`released_ms` (additive, epoch ms) are read under the
+/// state lock, so slots that pass from one run to the next never overlap:
+/// the bench counts slots held from them.
+#[test]
+fn report_times_hand_slots_over_without_overlap() {
+    let env = Env::new();
+    let (a, b) = (env.file("a.json"), env.file("b.json"));
+    let first = env
+        .leader(&[
+            "--slots",
+            "4",
+            "--report",
+            a.to_str().unwrap(),
+            "--",
+            "sleep",
+            "1",
+        ])
+        .spawn()
+        .unwrap();
+    job_started(&first, "sleep");
+    let out = env
+        .cmd(&[
+            "--slots",
+            "4",
+            "--report",
+            b.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(first.wait_with_output().unwrap().status.success());
+    let read =
+        |p: &PathBuf| -> Value { serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap() };
+    let (a, b) = (read(&a), read(&b));
+    let ms = |r: &Value, k: &str| r[k].as_u64().unwrap_or_else(|| panic!("{k}: {r}"));
+    assert!(ms(&a, "admitted_ms") <= ms(&a, "released_ms"), "{a}");
+    assert!(ms(&a, "released_ms") <= ms(&b, "admitted_ms"), "{a} {b}");
+    assert!(ms(&b, "admitted_ms") <= ms(&b, "released_ms"), "{b}");
+    // B queued behind A's whole second of sleep.
+    assert!(b["waited_s"].as_f64().unwrap() >= 0.5, "{b}");
+}

@@ -312,9 +312,12 @@ impl Queue<'_> {
     /// One locked `admit` pass: prune, admit, append any `killed: "holder"`
     /// lines, and report where this ticket stands.
     fn poll(&self) -> anyhow::Result<Poll> {
-        let now = now_ms();
         let mut pruned = Vec::new();
-        let poll = self.store.update(now, |s| {
+        let poll = self.store.update(now_ms(), |s| {
+            // Read under the lock: an admission's `run_start_ms` then never
+            // precedes the release that freed its slots, and `--report`'s
+            // `admitted_ms` can be compared with another run's `released_ms`.
+            let now = now_ms();
             let budget = s.resolve_budget(self.reading, self.config_slots);
             // A holder's scope is named for its muzzle; after a handoff the
             // keeper resets it itself. `enforced` isn't checked: it is set
@@ -757,7 +760,13 @@ fn run_nested(args: &RunArgs, run_timeout: Option<Duration>) -> anyhow::Result<E
     };
     if let Some(path) = &args.report {
         let ran = started.elapsed().as_secs_f64();
-        write_report(path, 0.0, ran, None, None, None, code, false, false)?;
+        let t = Times {
+            waited_s: 0.0,
+            ran_s: ran,
+            admitted_ms: None,
+            released_ms: None,
+        };
+        write_report(path, &t, None, None, None, code, false, false)?;
     }
     Ok(ExitCode::from(code))
 }
@@ -803,11 +812,23 @@ fn spawn_failed(program: &str, e: &std::io::Error) -> u8 {
     }
 }
 
+/// The timing half of a `--report`.
+struct Times {
+    waited_s: f64,
+    ran_s: f64,
+    /// Epoch ms, read under the state lock: one run's `released_ms` is at
+    /// most the `admitted_ms` of the run its slots went to, so the bench can
+    /// count slots held without the overlap that spawn time plus `waited_s`
+    /// gave (20 held of 14 on linuxpc). Null for a nested run, and
+    /// `released_ms` is null when a keeper releases later (D16).
+    admitted_ms: Option<u64>,
+    released_ms: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)] // one flat JSON object, spec §CLI
 fn write_report(
     path: &Path,
-    waited_s: f64,
-    ran_s: f64,
+    t: &Times,
     slots: Option<u32>,
     class: Option<Class>,
     rule: Option<&str>,
@@ -816,8 +837,10 @@ fn write_report(
     kept: bool,
 ) -> anyhow::Result<()> {
     let v = json!({
-        "waited_s": round3(waited_s),
-        "ran_s": round3(ran_s),
+        "waited_s": round3(t.waited_s),
+        "ran_s": round3(t.ran_s),
+        "admitted_ms": t.admitted_ms,
+        "released_ms": t.released_ms,
         "slots": slots,
         "class": class.map(class_str),
         "rule": rule,
@@ -953,6 +976,7 @@ impl Job<'_> {
         }
 
         let kept = !deadline.fired() && !target.others().is_empty();
+        let mut released_ms = None;
         if kept {
             self.hand_off(target, sampler, unit, started, &ending)?;
         } else {
@@ -978,9 +1002,9 @@ impl Job<'_> {
                     ending.killed = Some(Killed::Oom);
                 }
             }
-            self.release(ran_s, &ending, Some(cpu_s), Some(mb(peak)), false)?;
+            released_ms = Some(self.release(ran_s, &ending, Some(cpu_s), Some(mb(peak)), false)?);
         }
-        self.finish(args, ran_s, &ending, enforced, kept)?;
+        self.finish(args, ran_s, released_ms, &ending, enforced, kept)?;
         Ok(ending.code)
     }
 
@@ -1017,6 +1041,7 @@ impl Job<'_> {
     }
 
     /// Free the slots and append the run line, in one locked update.
+    /// Returns when, read under the lock (see `Times::released_ms`).
     fn release(
         &self,
         ran_s: f64,
@@ -1024,9 +1049,9 @@ impl Job<'_> {
         cpu_s: Option<f64>,
         mem_peak_mb: Option<u64>,
         kept: bool,
-    ) -> anyhow::Result<()> {
-        let now = now_ms();
-        self.store.update(now, |s| {
+    ) -> anyhow::Result<u64> {
+        self.store.update(now_ms(), |s| {
+            let now = now_ms();
             let budget = s.budget.map(|b| b.budget.max(1));
             let rec = self.record(ran_s, ending, cpu_s, mem_peak_mb, kept, budget);
             // A keeper whose entry was pruned (it was SIGSTOPped, say) has
@@ -1034,7 +1059,7 @@ impl Job<'_> {
             if s.remove(self.ticket) || !kept {
                 append_runs(self.store.dir(), &[rec], now)?;
             }
-            Ok(())
+            Ok(now)
         })
     }
 
@@ -1043,6 +1068,7 @@ impl Job<'_> {
         &self,
         args: &RunArgs,
         ran_s: f64,
+        released_ms: Option<u64>,
         ending: &Ending,
         enforced: bool,
         kept: bool,
@@ -1051,8 +1077,12 @@ impl Job<'_> {
         match &args.report {
             Some(path) => write_report(
                 path,
-                h.waited_s,
-                ran_s,
+                &Times {
+                    waited_s: h.waited_s,
+                    ran_s,
+                    admitted_ms: Some(h.run_start_ms),
+                    released_ms,
+                },
                 Some(h.claim.slots),
                 Some(h.claim.class),
                 h.claim.rule.as_deref(),
