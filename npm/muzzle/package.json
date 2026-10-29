@@ -22,6 +22,9 @@
     "extension",
     "skills"
   ],
+  "scripts": {
+    "test": "node --test 'test/*.test.ts'"
+  },
   "pi": {
     "extensions": [
       "./extension/muzzle.ts"

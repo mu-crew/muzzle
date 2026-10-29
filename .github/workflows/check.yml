@@ -39,5 +39,10 @@ jobs:
           node-version: 24
       - name: Check npm versions match Cargo.toml
         run: node scripts/npm-version.js --check "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+      # The pi extension's tests drive the real binary (MUZZLE_BIN defaults
+      # to target/debug/muzzle). Node 24 runs the .ts files directly.
+      - run: cargo build --locked
+      - name: pi extension tests
+        run: npm test --prefix npm/muzzle
       - name: npm pack (wrapper, extension, skill)
         run: npm pack --dry-run ./npm/muzzle
