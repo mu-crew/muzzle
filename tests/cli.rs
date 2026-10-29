@@ -1,5 +1,6 @@
 //! Every subcommand from spec §Interface/CLI parses and, until its unit
-//! lands, exits 125 ("muzzle itself failed").
+//! lands, exits 125 ("muzzle itself failed"). Landed units drop out of the
+//! list and test themselves (match, wrap, hook: `tests/rules.rs`).
 
 use std::process::Command;
 
@@ -31,19 +32,6 @@ fn every_subcommand_parses() {
             "true",
             "x",
         ],
-        &["match", "--json", "--cwd", ".", "--", "cargo test"],
-        &[
-            "wrap",
-            "--json",
-            "--cwd",
-            ".",
-            "--timeout",
-            "60",
-            "--",
-            "cargo test",
-        ],
-        &["hook", "claude"],
-        &["hook", "codex"],
         &["status", "--json"],
         &["doctor", "--json"],
         &[

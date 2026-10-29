@@ -1,0 +1,12 @@
+{
+  "session_id": "thr_123",
+  "turn_id": "turn_456",
+  "transcript_path": "/workspace/.codex/rollout.jsonl",
+  "cwd": "/workspace",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "tool_name": "apply_patch",
+  "tool_use_id": "call_789",
+  "tool_input": {"command": "*** Begin Patch\n*** Update File: gate.sh\n@@\n-cargo test\n+cargo test --all\n*** End Patch\n"}
+}
