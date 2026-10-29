@@ -31,7 +31,13 @@ fn muzzle(dir: &Path, args: &[&str]) -> Output {
     muzzle_env(dir, args, &[])
 }
 
+/// Every bench run burns real CPU, and the timing tests assert on wall time,
+/// so bench runs in this binary go one at a time (bench_uncontended_test_flaky:
+/// in parallel, the other tests' burners stretched an "uncontended" call).
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn muzzle_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     let config = dir.join("config");
     std::fs::create_dir_all(config.join("muzzle")).unwrap();
     std::fs::write(config.join("muzzle/config.toml"), CONFIG).unwrap();
