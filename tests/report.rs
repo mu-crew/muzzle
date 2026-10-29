@@ -65,8 +65,21 @@ fn one_day_tags_each_suggestion() {
     // ceil(1.25 * 6000 MB / 2048 MB) = 4.
     assert_eq!(js["suggest"]["tag"], "oom");
     assert_eq!(js["suggest"]["slots"], 4);
-    assert!(v["machine"]["cpu_efficiency"].is_number());
-    assert_eq!(v["machine"]["budget"], 8);
+    // Recomputed by hand over the day's 86400 s, budget 8. Held: gate
+    // 5 x 6 x 200 + cargo-test 3 x 2 x 100 + js-test 2 x 30 = 6660 slot-s.
+    // The gate waits (10+20+30+40 s) never overlap a hold: 8 x 100 idle.
+    // CPU: 5 x 1100 + 3 x 150 + 20 = 5970.
+    let m = &v["machine"];
+    assert_eq!(m["budget"], 8);
+    let close = |k: &str, want: f64| {
+        let got = m[k].as_f64().unwrap_or_else(|| panic!("{k} in {m}"));
+        assert!((got - want).abs() < 1e-9, "{k}: {got} != {want}");
+    };
+    close("held_slot_s", 6660.0);
+    close("utilisation", 6660.0 / (8.0 * 86400.0));
+    close("blocked_idle_slot_s", 800.0);
+    close("queue_nonempty", 100.0 / 86400.0);
+    close("cpu_efficiency", 5970.0 / 6660.0);
 }
 
 #[test]

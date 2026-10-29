@@ -389,7 +389,9 @@ fn gb(mb: f64) -> String {
 /// - measured: `max(ceil(p90 cores), ceil(p90 mem / mem-per-slot))` over
 ///   clean runs, after [`MIN_CLEAN_RUNS`] (D30). Memory can only raise it.
 /// - experiment: `slots + 2` when cores p50 at the current slots is at
-///   least 90% of them (D30a), under the same threshold.
+///   least 90% of them (D30a), over at least [`MIN_CLEAN_RUNS`] clean runs
+///   at those slots: right after a slot change, the runs at the old
+///   setting say nothing about saturation at the new one (D30).
 /// - oom: `ceil(1.25 × max oom peak / mem-per-slot)` (D30a). It needs no
 ///   clean runs: a rule that OOMs every time would otherwise never get 5
 ///   clean runs, and the kill itself is the evidence.
@@ -432,7 +434,8 @@ fn suggest(i: SuggestIn) -> Suggest {
             .filter(|r| r.rec.slots == i.slots)
             .filter_map(|r| r.cores())
             .collect();
-        if let Some(p50) = percentile(&at_slots, 50.0)
+        if at_slots.len() >= MIN_CLEAN_RUNS
+            && let Some(p50) = percentile(&at_slots, 50.0)
             && p50 >= SATURATED * f64::from(i.slots)
         {
             let to = cap(i.slots + EXPERIMENT_STEP);
@@ -1059,6 +1062,33 @@ mod tests {
     }
 
     #[test]
+    fn experiment_needs_five_clean_runs_at_the_current_slots() {
+        // The reviewer's repro: 4 runs at 4 slots, then 1 saturated run at
+        // 6. Five clean runs in all, but one at 6 slots is no evidence of
+        // saturation there (D30).
+        let mut runs = with_cores(T0, 4, &[1.0; 4]);
+        runs.extend(with_cores(T0 + 1e6, 6, &[5.9]));
+        let r = one_row(&runs);
+        assert_eq!(r.slots, 6);
+        let (slots, tag, evidence) = slots_tag(&r.suggest);
+        assert_eq!((slots, tag), (6, Tag::Measured), "{evidence}");
+    }
+
+    #[test]
+    fn saturation_counts_only_runs_at_the_latest_slots() {
+        // 6 runs at 2 slots using 1 core, then 5 at 4 slots using 3.8.
+        // At 4 slots p50 3.8 >= 3.6 is saturated. Over all 11 runs p50 is
+        // 1.0, and at the first run's 2 slots it is 50%: neither saturates.
+        let mut runs = with_cores(T0, 2, &[1.0; 6]);
+        runs.extend(with_cores(T0 + 1e6, 4, &[3.8; 5]));
+        let r = one_row(&runs);
+        assert_eq!(r.slots, 4, "the latest run's slots");
+        let (slots, tag, evidence) = slots_tag(&r.suggest);
+        assert_eq!((slots, tag), (6, Tag::Experiment));
+        assert_eq!(evidence, "saturated at 4: cores p50 3.8 over 5 clean runs");
+    }
+
+    #[test]
     fn experiment_is_capped_and_dropped_at_the_budget() {
         let mut runs = with_cores(T0, 7, &[7.0; 5]);
         runs.iter_mut().for_each(|r| r.rec.budget = Some(8));
@@ -1151,6 +1181,35 @@ mod tests {
         let m = machine(&[a], p).unwrap();
         assert_eq!(m.held_slot_s, 200.0);
         assert_eq!(m.utilisation, Some(0.5));
+    }
+
+    #[test]
+    fn machine_figures_clip_waits_to_the_period() {
+        // Budget 4, nothing else held. Waits T0-50..T0+50, then holds 4
+        // slots T0+50..T0+110.
+        let mut a = run(T0 + 110.0, 60.0);
+        a.rec.slots = 4;
+        a.rec.budget = Some(4);
+        a.rec.waited_s = 100.0;
+        let runs = [a];
+        // The wait crosses `since`: 50 s of it fall in the 110 s period.
+        let since = Period {
+            since: Some(T0),
+            until: None,
+        };
+        let m = machine(&runs, since).unwrap();
+        assert_eq!(m.held_slot_s, 240.0);
+        assert_eq!(m.queue_nonempty, 50.0 / 110.0);
+        assert_eq!(m.blocked_idle_slot_s, Some(200.0));
+        // The wait crosses `until`: 50 s of it fall in the 100 s period.
+        let until = Period {
+            since: Some(T0 - 100.0),
+            until: Some(T0),
+        };
+        let m = machine(&runs, until).unwrap();
+        assert_eq!(m.held_slot_s, 0.0);
+        assert_eq!(m.queue_nonempty, 0.5);
+        assert_eq!(m.blocked_idle_slot_s, Some(200.0));
     }
 
     #[test]
