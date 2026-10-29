@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  # Build-only run: the first release is published by hand from these
+  # artifacts (RELEASING.md, "Before the first release").
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to build, for example v0.1.0"
+        required: true
 
 permissions:
   contents: read
@@ -26,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Check release versions
-        run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+        run: node scripts/npm-version.js --check "${{ inputs.version || github.ref_name }}"
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -41,6 +48,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # id-token: trusted publishing to npm and crates.io. No tokens are stored;
     # both registries trust this repo's release.yml for muzzle's packages.
