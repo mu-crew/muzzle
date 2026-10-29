@@ -10,6 +10,7 @@ Benchmark traces and the tools that make and check them (spec D36–D40,
 | `pre-commit` | git hook: checks anything staged under `traces/` and the labels, refuses private sidecars and data files elsewhere |
 | `allowed-labels.txt` | the rule and kept-project labels a trace may carry |
 | `traces/` | committed traces (linuxpc only) |
+| `linuxpc-config.toml` | the linuxpc rules used for traces, smoke, replays and rollout; install as the muzzle config. A change records the new config hash (D28) |
 | `real.toml` | tier-2 commands per rule label; local, never committed (copy `real.toml.example`) |
 
 Install the hook once per clone:

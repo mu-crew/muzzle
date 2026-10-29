@@ -1,0 +1,58 @@
+# muzzle config for linuxpc: the one used for traces, smoke, replays and
+# rollout (linuxpc_config). Install as ~/.config/muzzle/config.toml.
+# Weights start from today's hand-set caps (D14) and report/tune moves them
+# (D29). A change here changes the config hash (D28): record the new one.
+#
+# Rules are global, not project rules: the gates run from mu workspaces and
+# worktrees as well as the repo checkouts, so a cwd glob would miss most.
+# D17b: agents type `distrobox enter … -- bash -lc '…'` themselves, so the
+# whole string is matched on the host and the job enters the container
+# inside the claim.
+#
+# Every pattern anchors the command word in command position: start of the
+# string, after ; & | ( or a newline, or right inside a `-c '…'` quote,
+# with env assignments and time/timeout/npx/env/nice before it. That keeps
+# polls such as `pgrep -f 'contrib/fast-gate'`, `cat contrib/gate` and
+# `tail …/oracle-sweep.lock` unclaimed: a wrapped poll loop would hold the
+# gate's slots a second time while the real gate runs. The first match
+# wins, so the gates come before the cargo rule their scripts contain.
+
+reserve = 2
+
+[[rule]]
+name  = "oracle-sweep"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?)*(\S*/)?oracle-sweep(\s|['"]|$)|\bflock\s+(-\w+\s+(\d+\s+)?)*\S*oracle-sweep\.lock['"]?\s+(\S*/)?(podman|distrobox|systemd-run|bash|sh|\S*oracle-sweep|contrib/)|oracle-sweep\.lock['"]?;?\s+exec\s+\d+>'''
+slots = 999
+# why: D8 replaces oracle-sweep.lock, the exclusive lock taken today as
+# `flock [-w N] <lock> <cmd>` or `L=<lock>; exec 9>>$L; flock 9`; 999 is
+# capped to the whole budget, so it runs alone. `flock -n <lock> true` is a
+# probe in a poll loop and stays unclaimed.
+
+[[rule]]
+name  = "fast-gate"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?)*(\./)?contrib/fast-gate\b'''
+slots = 6
+# why: swayward's full gate (fmt, clippy, cargo test --all, doc checks);
+# role cap 6. Museum: median 650 s, the most frequent heavy call.
+
+[[rule]]
+name  = "gate"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?)*(\./)?contrib/gate\b'''
+slots = 6
+# why: swaywardlock's full gate, cargo plus pytest -n auto e2e; role cap 6.
+# Museum: median 265 s. Its own label so report tunes it apart from fast-gate.
+
+[[rule]]
+name  = "js-test"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?|npx\s+)*(vitest|npm\s+(run\s+)?test)\b'''
+slots = 2
+# why: mu's vitest suite (`npm run test`, `test:fast`, `npx vitest`);
+# role cap 2.
+
+[[rule]]
+name  = "cargo-test"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?)*cargo\s+(\+\S+\s+)?(test|nextest|clippy|build)\b'''
+slots = 4
+# why: a bare cargo test/clippy/nextest, or a release build for the oracle;
+# role cap CARGO_BUILD_JOBS=4 (142 museum calls set 4, 27 set 2).
+# `cargo +nightly fmt` stays unclaimed.

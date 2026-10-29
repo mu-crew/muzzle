@@ -14,3 +14,6 @@ rule gate
 rule cargo-test
 rule js-test
 rule oracle-sweep
+
+# The linuxpc config adds the swayward fast gate under its own label.
+rule fast-gate
