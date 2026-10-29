@@ -5,7 +5,7 @@ whether muzzle helps comes from the proof: the tier-2 replay plus the rollout
 week, written up in `docs/eval/`.
 
 - **Traces:** `bench/traces/2026-10-21.jsonl` and `2026-10-08.jsonl`.
-- **Window:** `busiest:3h` (10-21 from 10:00; 10-08 from 14:00).
+- **Window:** `busiest:3h` (10-21 from 06:58Z; 10-08 from 15:38Z).
 - **Speed:** 12, so each 3 h window replays in about 15 min.
 - **Config:** `bench/linuxpc-config.toml`, hash b7e2bb.
 - **Machine:** linuxpc, 16 cores, budget 14, run while it was otherwise
@@ -36,8 +36,10 @@ show admission behaviour, not real gate times.
 - **10-21 (a measured, moderate day):** nothing queued in either mode, and
   makespan and run times are identical. muzzle holds more slots at peak (14
   against 12), because its claims follow the rule weights rather than the
-  lower role caps, so load is higher. On a day with no overload, muzzle adds
-  nothing and costs nothing measurable.
+  lower role caps, so load is higher. On a day with no overload, muzzle
+  doesn't change makespan or run times. It does raise load (p50 2.7 to 5.1,
+  max 7.0 to 14.8) and `git status` p95 (3.5 to 5.4 ms), because it runs those
+  gates at their configured 6 slots instead of the 4-thread role cap.
 - **10-08 (the overload day; durations estimated, so a workload replay
   only, D43):** at speed 12 the synthetic window held at most 24 slots in
   `none`, 1.7x the budget. muzzle capped it at 14. Some calls queued (wait
@@ -50,6 +52,11 @@ show admission behaviour, not real gate times.
   memory work, and museum's estimated durations under-represent gates that
   ran in the background. The tier-2 replay (real `contrib/fast-gate`,
   per-agent worktrees) is where that gets tested.
+- **A confound in the tier-1 model:** in muzzle mode a call burns its full
+  claim for `dur_s`, while `none` caps threads at the role cap. So muzzle mode
+  does about 22% more CPU-seconds of work in both windows (10-21: 20,834
+  against 16,683; 10-08: 112,399 against 88,228). Part of its extra load, and
+  part of the 10-08 makespan growth, is that extra work, not admission.
 - An earlier synthetic example (40 calls in 90 s) claimed jobs ran "4-6x
   faster once admitted". That was largely a bench artifact, fixed in
   `fix_bench`, so it is not repeated here.
