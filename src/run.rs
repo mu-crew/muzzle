@@ -313,10 +313,25 @@ impl Queue<'_> {
     /// lines, and report where this ticket stands.
     fn poll(&self) -> anyhow::Result<Poll> {
         let now = now_ms();
-        self.store.update(now, |s| {
+        let mut pruned = Vec::new();
+        let poll = self.store.update(now, |s| {
             let budget = s.resolve_budget(self.reading, self.config_slots);
+            // A holder's scope is named for its muzzle; after a handoff the
+            // keeper resets it itself. `enforced` isn't checked: it is set
+            // just after spawn, and a kill in that window is the case here.
+            let scopes: Vec<(u64, String)> = s
+                .holders
+                .iter()
+                .filter(|h| !h.kept && proc::systemd_user_reachable())
+                .map(|h| (h.ticket, unit_name(h.pid, h.start, h.ticket)))
+                .collect();
             let out = admit::admit(std::mem::take(s), now, &ProcLive);
             *s = out.state;
+            pruned = scopes
+                .into_iter()
+                .filter(|(t, _)| !s.holders.iter().any(|h| h.ticket == *t))
+                .map(|(_, unit)| format!("{unit}.scope"))
+                .collect();
             append_runs(self.store.dir(), &out.records, now)?;
             if let Some(h) = s.holders.iter().find(|h| h.ticket == self.ticket) {
                 return Ok(Poll::Admitted(Box::new(h.clone()), budget));
@@ -332,7 +347,14 @@ impl Queue<'_> {
                 of: queue.len(),
                 line: progress_line(s, at + 1, queue.len()),
             })
-        })
+        });
+        // A group SIGKILLed while systemd-run was still setting up the scope
+        // (pi on Esc) leaves it `failed` with Result=resources, and nobody
+        // but the pruner is left to reset it (2/10 on linuxpc, systemd 259).
+        for unit in &pruned {
+            reset_failed(unit);
+        }
+        poll
     }
 
     fn wait(&self, enqueued: Instant, timeout: Option<Duration>) -> anyhow::Result<Turn> {
@@ -491,6 +513,28 @@ fn exited(pid: Pid) -> bool {
     proc::start_time(pid).is_none()
 }
 
+/// The job's scope unit. `MUZZLE_UNIT_PREFIX` exists for the integration
+/// tests: each test names its own scopes, so it can check that it left none
+/// `failed` among other suites' units on a shared host.
+fn unit_name(pid: u32, start: StartTime, ticket: u64) -> String {
+    let prefix = std::env::var("MUZZLE_UNIT_PREFIX")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "muzzle".to_string());
+    format!("{prefix}-{pid}-{start}-{ticket}")
+}
+
+/// Drop a scope's `failed` state; failed units stay loaded until reset.
+/// Harmless on a unit that is gone or never existed.
+fn reset_failed(name: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "reset-failed"])
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// The last figures read from the job's scope (Linux, enforced). The scope
 /// is removed the moment it empties, so figures are sampled while it lives
 /// (FROM proc: systemd 259 collects a finished scope at once).
@@ -569,14 +613,11 @@ fn scope_outcome(unit: &str) -> Show {
             "active" | "activating" | "deactivating" | "reloading"
         );
         if settled || Instant::now() >= deadline {
-            if show.active == "failed" {
-                // Failed units stay loaded until reset; don't leave one per
-                // OOM behind.
-                let _ = Command::new("systemctl")
-                    .args(["--user", "reset-failed"])
-                    .arg(&name)
-                    .stderr(Stdio::null())
-                    .status();
+            // Don't leave one failed unit per OOM behind. A scope still
+            // settling at the deadline may fail after this read, so reset it
+            // too: anything not cleanly `inactive`.
+            if show.active != "inactive" {
+                reset_failed(&name);
             }
             return show;
         }
@@ -640,6 +681,32 @@ impl Deadline {
 
     fn fired(&self) -> bool {
         self.termed.is_some()
+    }
+
+    /// D18: the top command is gone, but what it left behind gets the rest
+    /// of `KILL_GRACE` from the SIGTERM before the SIGKILL. A `bash -c` top
+    /// dies on TERM at once, and its children's TERM handlers (a gate
+    /// cleaning up worktrees) would otherwise have no time at all.
+    fn drain(&mut self, target: Target, mut sampler: Option<&mut Sampler>) {
+        let Some(termed) = self.termed else { return };
+        loop {
+            let others = target.others();
+            let Some(&member) = others.first() else {
+                return;
+            };
+            if termed.elapsed() >= KILL_GRACE {
+                target.signal(libc::SIGKILL);
+                self.killed = true;
+                return;
+            }
+            if let Some(sig) = take_signal() {
+                target.forward(sig);
+            }
+            if let Some(s) = sampler.as_deref_mut() {
+                s.sample(member);
+            }
+            std::thread::sleep(TICK);
+        }
     }
 }
 
@@ -788,7 +855,7 @@ impl Job<'_> {
     fn run(&mut self, args: &RunArgs, run_timeout: Option<Duration>) -> anyhow::Result<u8> {
         let slots = self.holder.claim.slots;
         let enforced = proc::systemd_user_reachable();
-        let unit = format!("muzzle-{}-{}-{}", self.me, self.my_start, self.ticket);
+        let unit = unit_name(self.me, self.my_start, self.ticket);
         let mut cmd = if enforced {
             let mut c = Command::new("systemd-run");
             c.args(["--user", "--scope", "--quiet"]);
@@ -870,10 +937,7 @@ impl Job<'_> {
             killed: false,
         };
         let (status, ru) = supervise(pid, target, &mut deadline, sampler.as_mut())?;
-        if deadline.fired() {
-            // The job is out of time: whatever it left behind goes too.
-            target.signal(libc::SIGKILL);
-        }
+        deadline.drain(target, sampler.as_mut());
         let ran_s = started.elapsed().as_secs_f64();
         let mut ending = Ending {
             code: exit_code(status),
@@ -902,16 +966,16 @@ impl Job<'_> {
                     peak = peak.max(f.mem_peak_bytes.unwrap_or(0));
                 }
                 let oom_sampled = s.last.is_some_and(|f| f.oom_kills > 0);
-                // OOMPolicy=stop SIGKILLs the process that hit the cap and
-                // SIGTERMs the rest of the scope, so a top command that
-                // survived its child's kill exits 143 or 137.
-                if oom_sampled || ending.code >= 128 {
-                    let show = scope_outcome(&unit);
-                    cpu_s = cpu_s.max(show.cpu_s.unwrap_or(0.0));
-                    peak = peak.max(show.peak.unwrap_or(0));
-                    if oom_sampled || show.result == "oom-kill" {
-                        ending.killed = Some(Killed::Oom);
-                    }
+                // Always ask the unit: OOMPolicy=stop SIGTERMs the top
+                // command, and one that handles TERM can exit with any code,
+                // so the exit status says nothing. A clean scope reads
+                // `inactive` on the first call. This also resets a failed
+                // unit, so none is left loaded.
+                let show = scope_outcome(&unit);
+                cpu_s = cpu_s.max(show.cpu_s.unwrap_or(0.0));
+                peak = peak.max(show.peak.unwrap_or(0));
+                if oom_sampled || show.result == "oom-kill" {
+                    ending.killed = Some(Killed::Oom);
                 }
             }
             self.release(ran_s, &ending, Some(cpu_s), Some(mb(peak)), false)?;

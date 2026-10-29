@@ -20,6 +20,9 @@ struct Env {
     state: PathBuf,
     config: PathBuf,
     scratch: PathBuf,
+    /// `MUZZLE_UNIT_PREFIX`: this test's scopes, told apart from other
+    /// suites' on a shared host.
+    units: String,
 }
 
 const CONFIG: &str = r#"
@@ -40,6 +43,7 @@ impl Env {
             state: dir.path().join("state"),
             config: dir.path().join("config"),
             scratch: dir.path().join("scratch"),
+            units: format!("muzzle-t{}x{}", std::process::id(), next_env()),
             _dir: dir,
         };
         for d in [&env.config.join("muzzle"), &env.scratch] {
@@ -87,6 +91,7 @@ impl Env {
             .args(args)
             .env("XDG_STATE_HOME", &self.state)
             .env("XDG_CONFIG_HOME", &self.config)
+            .env("MUZZLE_UNIT_PREFIX", &self.units)
             // A test run under muzzle must not read as nested.
             .env_remove("MUZZLE_HOLD")
             .env_remove("MUZZLE_CLASS")
@@ -114,6 +119,38 @@ impl Env {
         job_started(&child, "sleep");
         child
     }
+}
+
+/// No run may leave its scope loaded as `failed`: failed units pile up on
+/// the host until someone resets them. A keeper or pruner may still be
+/// finishing, so allow a few seconds.
+impl Drop for Env {
+    fn drop(&mut self) {
+        if std::thread::panicking() || !muzzle::proc::systemd_user_reachable() {
+            return;
+        }
+        let left = eventually(Duration::from_secs(5), || {
+            failed_units(&self.units).is_empty()
+        });
+        assert!(left, "failed scopes left: {:?}", failed_units(&self.units));
+    }
+}
+
+fn failed_units(prefix: &str) -> Vec<String> {
+    let out = Command::new("systemctl")
+        .args(["--user", "list-units", "--all", "--state=failed", "--plain"])
+        .args(["--no-legend", &format!("{prefix}-*")])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+        .collect()
+}
+
+fn next_env() -> u32 {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn now_ms() -> u64 {
@@ -415,6 +452,52 @@ fn oom_kill_is_recorded_on_linux() {
     );
 }
 
+/// OOMPolicy=stop SIGTERMs the top command; one that handles TERM exits
+/// with whatever code it likes, and the unit's Result still says oom-kill.
+#[test]
+fn oom_kill_is_recorded_when_the_top_survives_term() {
+    if cfg!(not(target_os = "linux")) || !muzzle::proc::systemd_user_reachable() {
+        eprintln!("skipped: needs a systemd user manager (D15)");
+        return;
+    }
+    let env = Env::new();
+    let out = env
+        .cmd(&[
+            "--slots",
+            "1",
+            "--",
+            "sh",
+            "-c",
+            r#"trap "" TERM; perl -e '$x = "x" x (300 * 1024 * 1024)'; exit 1"#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(env.runs()[0]["killed"], "oom", "{}", env.runs()[0]);
+}
+
+/// pi on Esc can SIGKILL the group while systemd-run is still setting up
+/// the scope, which leaves the unit `failed` (Result=resources). The next
+/// muzzle to prune the holder resets it; `Env`'s drop checks none is left.
+#[test]
+fn a_scope_killed_during_setup_is_not_left_failed() {
+    let env = Env::new();
+    for i in 0..10u64 {
+        let mut hog = env
+            .leader(&["--slots", "4", "--", "sleep", "30"])
+            .spawn()
+            .unwrap();
+        // Wait for admission, then kill at a spread of points in the setup.
+        assert!(eventually(Duration::from_secs(5), || env.state().held() == 4));
+        std::thread::sleep(Duration::from_millis(i * 3));
+        kill(-(hog.id() as i32), libc::SIGKILL);
+        hog.wait().unwrap();
+        // The next run prunes the dead holder.
+        let out = env.cmd(&["--", "true"]).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+}
+
 #[test]
 fn nested_run_through_ancestry_starts_at_once() {
     let env = Env::new();
@@ -517,6 +600,63 @@ fn run_timeout_counts_from_admission() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("muzzle: admitted after "), "{err}");
     hog.wait().unwrap();
+}
+
+/// D18: the SIGKILL comes 10 s after the SIGTERM, even when the top
+/// command dies at once: a `bash -c` top's children get their TERM grace.
+#[test]
+fn run_timeout_gives_children_the_term_grace() {
+    let env = Env::new();
+    let cleaned = env.file("cleaned");
+    let inner = format!(
+        "trap 'sleep 2; touch {}; exit 0' TERM; while :; do sleep 0.1; done",
+        cleaned.display()
+    );
+    let started = Instant::now();
+    let out = env
+        .cmd(&[
+            "--run-timeout",
+            "1",
+            "--",
+            "bash",
+            "-c",
+            r#"bash -c "$0" & wait"#,
+            &inner,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(124), "{out:?}");
+    assert!(cleaned.exists(), "the child's TERM handler was cut short");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(env.runs()[0]["killed"], "timeout");
+}
+
+#[test]
+fn run_timeout_escalates_to_sigkill_after_the_grace() {
+    let env = Env::new();
+    let started = Instant::now();
+    let out = env
+        .cmd(&[
+            "--run-timeout",
+            "0.5",
+            "--",
+            "sh",
+            "-c",
+            r#"trap "" TERM; sleep 30"#,
+        ])
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(124), "{out:?}");
+    assert!(
+        (Duration::from_secs(10)..Duration::from_secs(12)).contains(&took),
+        "{took:?}"
+    );
+    assert_eq!(env.runs()[0]["killed"], "timeout");
 }
 
 #[test]
@@ -631,6 +771,11 @@ fn exit_codes() {
     kill(c.id() as i32, libc::SIGTERM);
     let s = wait_for(&mut c, Duration::from_secs(3)).unwrap();
     assert_eq!((s.code(), s.signal()), (Some(143), None));
+    let last = env.runs().pop().unwrap();
+    assert_eq!(
+        (&last["killed"], &last["exit"]),
+        (&"signal".into(), &143.into())
+    );
 }
 
 #[test]
