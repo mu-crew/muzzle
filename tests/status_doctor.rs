@@ -176,6 +176,8 @@ fn status_json_shows_live_holders_and_waiters() {
     assert_eq!(h["pgid"].as_u64(), Some(u64::from(orch.id())));
     assert!(h["run_s"].is_u64());
     assert!(h["cwd"].as_str().unwrap().ends_with("cwd"), "{h}");
+    // D27a: the tempdir cwd is in no repo.
+    assert_eq!(h.get("repo"), Some(&Value::Null), "{h}");
 
     let w: Vec<(u64, &str, &str, u64)> = v["waiting"]
         .as_array()

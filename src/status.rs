@@ -39,6 +39,8 @@ pub struct HolderView {
     pub agent: Option<String>,
     pub rule: Option<String>,
     pub cwd: String,
+    /// Added field (D27a): the repo's main checkout, or null.
+    pub repo: Option<String>,
     pub run_s: u64,
     pub pid: u32,
     pub pgid: Option<u32>,
@@ -116,6 +118,7 @@ pub fn view(
                 agent: h.claim.agent.clone(),
                 rule: h.claim.rule.clone(),
                 cwd: h.claim.cwd.clone(),
+                repo: h.claim.repo.clone(),
                 run_s: secs(h.run_start_ms),
                 pid: h.pid,
                 pgid: h.pgid,
@@ -280,6 +283,7 @@ mod tests {
             agent: Some(agent.into()),
             rule: Some("gate".into()),
             cwd: "/w".into(),
+            repo: Some("/w".into()),
             cfg: None,
         }
     }
@@ -432,7 +436,7 @@ mod tests {
             assert!(v.get(k).is_some(), "missing {k}: {v}");
         }
         for k in [
-            "slots", "class", "agent", "rule", "cwd", "run_s", "pid", "pgid",
+            "slots", "class", "agent", "rule", "cwd", "repo", "run_s", "pid", "pgid",
         ] {
             assert!(v["holders"][0].get(k).is_some(), "holder missing {k}");
         }
@@ -440,5 +444,6 @@ mod tests {
             assert!(v["waiting"][0].get(k).is_some(), "waiter missing {k}");
         }
         assert_eq!(v["waiting"][0]["class"], "high");
+        assert_eq!(v["holders"][0]["repo"], "/w", "D27a: copied from the claim");
     }
 }

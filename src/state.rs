@@ -74,6 +74,10 @@ pub struct Claim {
     pub agent: Option<String>,
     pub rule: Option<String>,
     pub cwd: String,
+    /// The repo's main checkout (D27a). Added field: absent in a state
+    /// file an older muzzle wrote.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// The config hash (D28), copied into the run record.
     pub cfg: Option<String>,
 }
@@ -158,6 +162,9 @@ pub struct RunRecord {
     pub cfg: Option<String>,
     pub agent: Option<String>,
     pub cwd: String,
+    /// Added field (D27a); absent on older lines.
+    #[serde(default)]
+    pub repo: Option<String>,
     pub waited_s: f64,
     pub ran_s: f64,
     pub exit: Option<i32>,
@@ -418,6 +425,7 @@ mod tests {
             agent: Some("worker-7".into()),
             rule: Some("gate".into()),
             cwd: "/tmp".into(),
+            repo: None,
             cfg: Some("a1b2c3".into()),
         }
     }
@@ -602,6 +610,7 @@ mod tests {
             cfg: Some("a1b2c3".into()),
             agent: None,
             cwd: "/x".into(),
+            repo: None,
             waited_s: 1.5,
             ran_s: 2.0,
             exit: None,

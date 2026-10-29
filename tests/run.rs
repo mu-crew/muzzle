@@ -783,6 +783,61 @@ fn a_run_appends_its_line_to_runs_jsonl() {
     );
 }
 
+/// D27a: `repo` is the main checkout's canonical path, the same from a git
+/// worktree as from the main checkout, in `runs.jsonl` and `--report`;
+/// null outside a repo.
+#[test]
+fn runs_record_the_repo_main_checkout() {
+    let env = Env::new();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    let main = env.file("main");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(&main, &["worktree", "add", "-q", "../wt"]);
+    let wt = env.file("wt/src");
+    std::fs::create_dir_all(&wt).unwrap();
+    let outside = env.file("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let report = env.file("r.json");
+    for dir in [&main, &wt, &outside] {
+        let out = env
+            .cmd(&["--report", report.to_str().unwrap(), "--", "true"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert!(r.get("repo").is_some(), "{r}");
+    }
+    let want = main.canonicalize().unwrap();
+    let repos: Vec<Value> = env.runs().iter().map(|r| r["repo"].clone()).collect();
+    assert_eq!(
+        repos,
+        vec![
+            Value::from(want.to_str().unwrap()),
+            Value::from(want.to_str().unwrap()),
+            Value::Null,
+        ]
+    );
+    let r: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(r["repo"], Value::Null, "{r}");
+}
+
 #[test]
 fn exit_codes() {
     let env = Env::new();

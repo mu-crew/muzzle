@@ -917,6 +917,7 @@ mod tests {
                 cfg: Some("c1".into()),
                 agent: None,
                 cwd: "/x".into(),
+                repo: None,
                 waited_s: 0.0,
                 ran_s,
                 exit: Some(0),

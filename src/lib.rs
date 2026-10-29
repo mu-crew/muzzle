@@ -11,6 +11,7 @@ pub mod cli;
 pub mod doctor;
 pub mod exit;
 pub mod proc;
+pub mod repo;
 pub mod report;
 pub mod rules;
 pub mod run;

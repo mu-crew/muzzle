@@ -17,6 +17,7 @@ use crate::admit::{self, Class, Liveness};
 use crate::cli::{self, RunArgs};
 use crate::exit;
 use crate::proc::{self, CgroupFigures, Pid, StartTime};
+use crate::repo;
 use crate::rules::config::{Config, ConfigError};
 use crate::state::{
     Budget, Claim, EnforcedReason, Holder, Killed, RunRecord, ScopeProbe, State, Store,
@@ -311,6 +312,7 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
     // kills the group (pi on Esc) kills the job too.
     // SAFETY: plain syscall.
     let leader = unsafe { libc::getpgrp() } == me as Pid;
+    let cwd = std::env::current_dir().ok();
     let claim = Claim {
         slots: args.slots.or(rule.map(|r| r.slots)).unwrap_or(1),
         class,
@@ -318,9 +320,11 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
             .ok()
             .filter(|s| !s.is_empty()),
         rule: args.rule.clone(),
-        cwd: std::env::current_dir()
+        cwd: cwd
+            .as_ref()
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        repo: repo_str(cwd.as_deref()),
         cfg: Some(config.hash()),
     };
     let enqueued = Instant::now();
@@ -886,7 +890,19 @@ fn run_nested(args: &RunArgs, run_timeout: Option<Duration>) -> anyhow::Result<E
             admitted_ms: None,
             released_ms: None,
         };
-        write_report(path, &t, None, None, None, code, false, None, false)?;
+        let repo = repo_str(std::env::current_dir().ok().as_deref());
+        write_report(
+            path,
+            &t,
+            None,
+            None,
+            None,
+            repo.as_deref(),
+            code,
+            false,
+            None,
+            false,
+        )?;
     }
     Ok(ExitCode::from(code))
 }
@@ -952,6 +968,7 @@ fn write_report(
     slots: Option<u32>,
     class: Option<Class>,
     rule: Option<&str>,
+    repo: Option<&str>,
     exit: u8,
     enforced: bool,
     reason: Option<EnforcedReason>,
@@ -965,6 +982,7 @@ fn write_report(
         "slots": slots,
         "class": class.map(class_str),
         "rule": rule,
+        "repo": repo,
         "exit": exit,
         "enforced": enforced,
         "kept": kept,
@@ -974,6 +992,12 @@ fn write_report(
         v["enforced_reason"] = json!(r);
     }
     fs::write(path, format!("{v}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+/// D27a: the repo `cwd` belongs to, as recorded in `runs.jsonl`, status
+/// and `--report`.
+fn repo_str(cwd: Option<&Path>) -> Option<String> {
+    repo::repo_of(cwd?).map(|p| p.to_string_lossy().into_owned())
 }
 
 fn round3(x: f64) -> f64 {
@@ -1220,6 +1244,7 @@ impl Job<'_> {
             cfg: h.claim.cfg.clone(),
             agent: h.claim.agent.clone(),
             cwd: h.claim.cwd.clone(),
+            repo: h.claim.repo.clone(),
             waited_s: h.waited_s,
             ran_s: round3(ran_s),
             exit: Some(ending.exit),
@@ -1280,6 +1305,7 @@ impl Job<'_> {
                 Some(h.claim.slots),
                 Some(h.claim.class),
                 h.claim.rule.as_deref(),
+                h.claim.repo.as_deref(),
                 ending.code,
                 enforced,
                 h.enforced_reason,
@@ -1527,6 +1553,7 @@ mod tests {
                 agent: Some("worker-7".into()),
                 rule: Some("gate".into()),
                 cwd: "/w".into(),
+                repo: None,
                 cfg: None,
             },
         }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 (unreleased)
+
+- Runs record `repo`, the canonical path of the repo's main checkout
+  (git or jj; every worktree and workspace maps to the same path), or
+  `null` outside a repo (spec D27a). It is an added field in `runs.jsonl`,
+  `--report` and `status --json` holders. It is found by reading files,
+  never by running git or jj. 0.1.1 only records it; per-repo reports come
+  later.
+
 ## 0.1.0
 
 First release: per-host admission for heavy commands, with a run log that

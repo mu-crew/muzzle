@@ -151,6 +151,7 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         cfg: h.claim.cfg,
         agent: h.claim.agent,
         cwd: h.claim.cwd,
+        repo: h.claim.repo,
         waited_s: h.waited_s,
         ran_s: now_ms.saturating_sub(h.run_start_ms) as f64 / 1000.0,
         exit: None,
@@ -236,6 +237,7 @@ mod tests {
             agent: None,
             rule: Some("gate".into()),
             cwd: "/w".into(),
+            repo: None,
             cfg: None,
         }
     }
