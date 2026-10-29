@@ -1,0 +1,66 @@
+[package]
+# `muzzle` may be taken on crates.io; the package takes the `-cli` suffix as
+# mule does. The binary and library keep the short name.
+name = "muzzle-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Per-host admission for heavy commands, with a run log that tunes itself."
+license = "MIT"
+repository = "https://github.com/mu-crew/muzzle"
+homepage = "https://github.com/mu-crew/muzzle"
+documentation = "https://github.com/mu-crew/muzzle"
+readme = "README.md"
+keywords = ["cpu", "queue", "admission", "agents", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# 1.89: `std::fs::File::lock` guards state.json (spec §Architecture, state).
+rust-version = "1.89"
+include = ["src/**/*.rs", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[lib]
+name = "muzzle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muzzle"
+path = "src/main.rs"
+
+# Every dependency the v1 units expect is declared here up front (scaffold
+# AMEND), so parallel units don't fight over this file.
+[dependencies]
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+# state.json, runs.jsonl, config.toml, --json output, --report files.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# rules: patterns match the whole shell string; project keys are globs.
+regex = "1"
+globset = "0.4"
+
+# Errors: anyhow at the boundary, thiserror for errors callers switch on
+# (exit 2 for bad config, 125 for muzzle's own failures).
+anyhow = "1.0"
+thiserror = "2.0"
+
+# XDG state/config dirs.
+directories = "6.0"
+
+# runs.jsonl timestamps and report --since/--until.
+jiff = "0.2"
+
+# The config hash (D28): a short digest of the normalised rules.
+sha2 = "0.10"
+
+# proc and run: process groups, signals, sessions, rusage.
+rustix = { version = "1", features = ["process", "fs", "system", "termios"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Group members and ancestry: proc_listpgrppids, proc_pidinfo.
+libproc = "0.14"
+
+[dev-dependencies]
+# Private XDG_STATE_HOME per integration test.
+tempfile = "3"

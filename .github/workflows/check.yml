@@ -1,0 +1,40 @@
+name: Check
+
+# The commit gate from AGENTS.md on both platforms, for pushes to main, PRs
+# and manual runs. macOS code paths (libproc, rusage-only figures) are only
+# exercised here, so a unit touching them needs a green run before review.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Check npm versions match Cargo.toml
+        run: node scripts/npm-version.js --check "v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+      - name: npm pack (wrapper, extension, skill)
+        run: npm pack --dry-run ./npm/muzzle

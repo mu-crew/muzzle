@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            package: muzzle-linux-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            package: muzzle-linux-arm64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            package: muzzle-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check release versions
+        run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Add Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.package }}
+          path: target/${{ matrix.target }}/release/muzzle
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # id-token: trusted publishing to npm and crates.io. No tokens are stored;
+    # both registries trust this repo's release.yml for muzzle's packages.
+    permissions:
+      contents: write # the GitHub release
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Check release versions
+        run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Fill platform packages
+        run: |
+          for package in muzzle-linux-x64 muzzle-linux-arm64 muzzle-darwin-arm64; do
+            mkdir -p "npm/$package/bin"
+            cp "artifacts/$package/muzzle" "npm/$package/bin/muzzle"
+            chmod +x "npm/$package/bin/muzzle"
+          done
+      # Trusted publishing (OIDC) needs npm 11.5.1+; older npm fails with a
+      # misleading 404.
+      - run: npm install -g npm@^11.5.1
+      - name: Publish npm packages
+        # ./ prefix: npm reads a bare `npm/muzzle` as the GitHub repo npm/muzzle.
+        run: |
+          for package in muzzle-linux-x64 muzzle-linux-arm64 muzzle-darwin-arm64; do
+            npm publish "./npm/$package" --access public
+          done
+          npm publish ./npm/muzzle --access public
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: crates-io
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+        run: cargo publish --locked
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python3 scripts/changelog-section.py CHANGELOG.md "$version" > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "muzzle $version" --notes-file notes.md --verify-tag

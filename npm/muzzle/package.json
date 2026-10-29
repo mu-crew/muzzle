@@ -1,0 +1,46 @@
+{
+  "name": "@mu-crew/muzzle",
+  "version": "0.1.0",
+  "description": "Per-host admission for heavy commands, with a run log that tunes itself",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mu-crew/muzzle.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "agents",
+    "cpu",
+    "queue"
+  ],
+  "bin": {
+    "muzzle": "bin/muzzle"
+  },
+  "files": [
+    "bin/muzzle",
+    "extension",
+    "skills"
+  ],
+  "pi": {
+    "extensions": [
+      "./extension/muzzle.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "optionalDependencies": {
+    "@mu-crew/muzzle-linux-x64": "0.1.0",
+    "@mu-crew/muzzle-linux-arm64": "0.1.0",
+    "@mu-crew/muzzle-darwin-arm64": "0.1.0"
+  }
+}
