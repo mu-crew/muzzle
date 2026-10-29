@@ -68,7 +68,7 @@ impl Liveness for ProcLive {
 }
 
 /// The status of `state` at `now_ms`. The budget is the stored one (D17a)
-/// when there is one, else what the next run would store: `reading`, with
+/// when there is one and it hasn't expired, else what the next run would store: `reading`, with
 /// a config `slots =` in place of its budget.
 pub fn view(
     state: &State,
@@ -80,6 +80,9 @@ pub fn view(
     enforced: bool,
 ) -> Status {
     let mut state = state.clone();
+    // Before pruning, as in `Store::update`: the next run expires on the
+    // raw file, dead entries included.
+    state.budget = state.live_budget(now_ms);
     let stored = state.budget.is_some();
     let b = state.resolve_budget(reading, if stored { None } else { config_slots });
     // Same floor as `admit`: a 0 budget still runs one job alone (D8).
@@ -345,6 +348,24 @@ mod tests {
         // A stored budget wins over config slots until the next run.
         let s = view(&state(), 0, &live(), READING, Some(3), 2, false);
         assert_eq!(s.budget, 4);
+    }
+
+    #[test]
+    fn expired_stored_budget_is_not_reported() {
+        // Reviewer repro (sd_expired_budget): idle and over an hour old.
+        let mut old = State {
+            budget: state().budget,
+            updated_ms: 1_000,
+            ..State::default()
+        };
+        let later = 1_000 + crate::state::BUDGET_TTL_MS + 1;
+        let s = view(&old, later, &live(), READING, None, 2, false);
+        assert_eq!((s.budget, s.cores, s.free), (6, 8, 6));
+        // Dead entries still count as busy until a run prunes them, as in
+        // `Store::update`, which expires before pruning.
+        old.enqueue(22, 1, None, claim(1, Class::Normal, "dead-waiter"), 0);
+        let s = view(&old, later, &live(), READING, None, 2, false);
+        assert_eq!((s.budget, s.cores), (4, 6));
     }
 
     #[test]

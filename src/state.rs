@@ -205,14 +205,14 @@ impl State {
         budget
     }
 
-    /// D17a: forget the stored budget once the file is idle and old.
-    fn expire_budget(&mut self, now_ms: u64) {
-        if self.waiters.is_empty()
+    /// D17a: the stored budget as the next [`Store::update`] at `now_ms`
+    /// sees it: `None` once the file is idle and old. `status` and `doctor`
+    /// read through this too, so they report the budget the next run uses.
+    pub fn live_budget(&self, now_ms: u64) -> Option<Budget> {
+        let expired = self.waiters.is_empty()
             && self.holders.is_empty()
-            && now_ms.saturating_sub(self.updated_ms) > BUDGET_TTL_MS
-        {
-            self.budget = None;
-        }
+            && now_ms.saturating_sub(self.updated_ms) > BUDGET_TTL_MS;
+        if expired { None } else { self.budget }
     }
 }
 
@@ -279,7 +279,7 @@ impl Store {
     ) -> anyhow::Result<T> {
         let _lock = self.lock()?;
         let mut state = self.load()?;
-        state.expire_budget(now_ms);
+        state.budget = state.live_budget(now_ms);
         let out = f(&mut state)?;
         state.updated_ms = now_ms;
         self.save(&state)?;
@@ -534,6 +534,19 @@ mod tests {
             .unwrap();
         let gone = store.update(5 * BUDGET_TTL_MS, |s| Ok(s.budget)).unwrap();
         assert_eq!(gone, None);
+    }
+
+    #[test]
+    fn live_budget_is_the_expiry_rule() {
+        let mut s = State {
+            budget: Some(READING),
+            updated_ms: 1_000,
+            ..State::default()
+        };
+        assert_eq!(s.live_budget(1_000 + BUDGET_TTL_MS), Some(READING));
+        assert_eq!(s.live_budget(1_001 + BUDGET_TTL_MS), None);
+        s.enqueue(1, 1, None, claim(1), 0);
+        assert_eq!(s.live_budget(10 * BUDGET_TTL_MS), Some(READING));
     }
 
     #[test]

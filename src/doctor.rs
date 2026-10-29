@@ -6,8 +6,9 @@
 //! is busy, and a check that changes what it checks is no check.
 //!
 //! Exit 0 means usable, even when only advisory (spec). A bad config exits
-//! 2, as `muzzle run` would; an unwritable state directory exits 125, since
-//! every `run` would fail on it.
+//! 2, as `muzzle run` would; an unwritable state directory or an unreadable
+//! `state.json` (a newer schema, say) exits 125, since every `run` would
+//! fail on it.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,11 +47,15 @@ pub struct Facts {
     pub config_path: PathBuf,
     pub config_exists: bool,
     pub config: Result<Config, String>,
-    /// `state.json`'s stored budget (D17a), when one is stored.
+    /// `state.json`'s stored budget (D17a), when one is stored and not
+    /// expired ([`crate::state::State::live_budget`]).
     pub stored: Option<Budget>,
     pub state_dir: PathBuf,
     /// `Err` with the reason when a file can't be created there.
     pub state_writable: Result<(), String>,
+    /// `Err` with the reason when `state.json` can't be read, as every
+    /// `run` would fail on it.
+    pub state_readable: Result<(), String>,
     pub systemd: bool,
     pub runs: Option<RunsLog>,
     pub harnesses: Harnesses,
@@ -89,6 +94,7 @@ pub struct Report {
     pub enforcement: String,
     pub state_dir: PathBuf,
     pub state_writable: bool,
+    pub state_readable: bool,
     pub config_path: PathBuf,
     pub config_exists: bool,
     pub config_error: Option<String>,
@@ -100,7 +106,8 @@ pub struct Report {
     pub codex_hook: &'static str,
     pub harness_files: Harnesses,
     pub warnings: Vec<String>,
-    /// Exit status: 0 usable, 2 bad config, 125 state unwritable.
+    /// Exit status: 0 usable, 2 bad config, 125 state unwritable or
+    /// unreadable.
     #[serde(skip)]
     pub exit: u8,
 }
@@ -192,6 +199,9 @@ pub fn check(f: &Facts) -> Report {
     if let Err(e) = &f.state_writable {
         warnings.push(format!("state directory not writable: {e}"));
     }
+    if let Err(e) = &f.state_readable {
+        warnings.push(format!("state.json unreadable, every run fails: {e}"));
+    }
     if let Some(e) = &config_error {
         warnings.push(format!("config: {e}"));
     }
@@ -204,7 +214,7 @@ pub fn check(f: &Facts) -> Report {
     let systemd = f.systemd && f.os == "linux";
     let exit = if config_error.is_some() {
         crate::exit::USAGE
-    } else if f.state_writable.is_err() {
+    } else if f.state_writable.is_err() || f.state_readable.is_err() {
         crate::exit::INTERNAL
     } else {
         0
@@ -224,6 +234,7 @@ pub fn check(f: &Facts) -> Report {
         enforcement: enforcement(f.os, systemd),
         state_dir: f.state_dir.clone(),
         state_writable: f.state_writable.is_ok(),
+        state_readable: f.state_readable.is_ok(),
         config_path: f.config_path.clone(),
         config_exists: f.config_exists,
         config_error,
@@ -260,10 +271,10 @@ pub fn render_text(r: &Report) -> String {
         format!(
             "{} ({})",
             r.state_dir.display(),
-            if r.state_writable {
-                "writable"
-            } else {
-                "NOT writable"
+            match (r.state_writable, r.state_readable) {
+                (false, _) => "NOT writable",
+                (true, false) => "writable, state.json unreadable",
+                (true, true) => "writable",
             }
         ),
     );
@@ -387,6 +398,26 @@ fn pi_in_settings(path: &Path) -> bool {
     })
 }
 
+/// `p` in pi's extensions directory is a muzzle extension pi loads: a
+/// `muzzle*.ts`/`.js` file, or a `muzzle*` directory with an `index.ts`,
+/// `index.js` or `package.json`. `muzzle.ts.disabled` or `muzzle-notes.md`
+/// are not loaded, so they don't count.
+fn pi_loads(p: &Path) -> bool {
+    if !p
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("muzzle"))
+    {
+        return false;
+    }
+    if p.is_dir() {
+        ["index.ts", "index.js", "package.json"]
+            .iter()
+            .any(|f| p.join(f).is_file())
+    } else {
+        p.is_file() && p.extension().is_some_and(|e| e == "ts" || e == "js")
+    }
+}
+
 fn env_dir(var: &str) -> Option<PathBuf> {
     std::env::var_os(var)
         .filter(|v| !v.is_empty())
@@ -408,10 +439,7 @@ pub fn harnesses(home: &Path, cwd: &Path) -> Harnesses {
         pi_in_settings,
     );
     if let Ok(dir) = std::fs::read_dir(pi.join("extensions")) {
-        pi_found.extend(dir.flatten().map(|e| e.path()).filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("muzzle"))
-        }));
+        pi_found.extend(dir.flatten().map(|e| e.path()).filter(|p| pi_loads(p)));
     }
     Harnesses {
         pi_extension: pi_found,
@@ -438,15 +466,17 @@ pub fn harnesses(home: &Path, cwd: &Path) -> Harnesses {
 
 fn gather() -> Facts {
     let (config_path, config, config_exists) = read_config();
-    let (state_dir, state_writable, stored) = match Store::open_default() {
+    let (state_dir, state_writable, state_readable, stored) = match Store::open_default() {
         Ok(store) => {
             let w = writable(store.dir());
-            // Unreadable state (newer schema, lock trouble) is a warning
-            // through `stored: None`, not a doctor failure.
-            let stored = store.read().ok().and_then(|s| s.budget);
-            (store.dir().to_path_buf(), w, stored)
+            let (readable, stored) = match store.read() {
+                Ok(s) => (Ok(()), s.live_budget(crate::status::now_ms())),
+                Err(e) => (Err(format!("{e:#}")), None),
+            };
+            (store.dir().to_path_buf(), w, readable, stored)
         }
-        Err(e) => (PathBuf::from("?"), Err(format!("{e:#}")), None),
+        // The directory error already covers the file.
+        Err(e) => (PathBuf::from("?"), Err(format!("{e:#}")), Ok(()), None),
     };
     let home = directories::BaseDirs::new()
         .map(|d| d.home_dir().to_path_buf())
@@ -464,6 +494,7 @@ fn gather() -> Facts {
         runs: runs_log(&state_dir.join("runs.jsonl")),
         state_dir,
         state_writable,
+        state_readable,
         systemd: crate::proc::systemd_user_reachable(),
         harnesses: harnesses(&home, &cwd),
     }
@@ -501,6 +532,7 @@ mod tests {
             stored: None,
             state_dir: "/s".into(),
             state_writable: Ok(()),
+            state_readable: Ok(()),
             systemd: true,
             runs: None,
             harnesses: Harnesses::default(),
@@ -587,6 +619,18 @@ mod tests {
         let mut f = facts();
         f.state_writable = Err("read-only".into());
         assert_eq!(check(&f).exit, 125);
+        // Reviewer repro (sd_unreadable_state): a newer schema fails every
+        // run, so doctor must not call it usable.
+        let mut f = facts();
+        f.state_readable = Err("schema v99, this muzzle reads up to v1".into());
+        let r = check(&f);
+        assert_eq!((r.exit, r.state_readable), (125, false));
+        assert!(
+            r.warnings.iter().any(|w| w.contains("schema v99")),
+            "{:?}",
+            r.warnings
+        );
+        assert!(render_text(&r).contains("(writable, state.json unreadable)"));
     }
 
     #[test]
@@ -654,6 +698,38 @@ mod tests {
         assert!(hook_in(&t));
         std::fs::write(&t, "[[hooks.PreToolUse.hooks]]\ncommand = \"other\"\n").unwrap();
         assert!(!hook_in(&t));
+    }
+
+    #[test]
+    fn pi_extension_dir_counts_only_what_pi_loads() {
+        // Reviewer repro (sd_pi_ext_prefix).
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for f in ["muzzle.ts.disabled", "muzzle-notes.md", "other.ts"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        std::fs::create_dir(d.join("muzzle-empty")).unwrap();
+        for f in [
+            "muzzle.ts.disabled",
+            "muzzle-notes.md",
+            "other.ts",
+            "muzzle-empty",
+        ] {
+            assert!(!pi_loads(&d.join(f)), "{f}");
+        }
+        std::fs::write(d.join("muzzle.ts"), "").unwrap();
+        std::fs::write(d.join("muzzle.js"), "").unwrap();
+        for (sub, entry) in [
+            ("muzzle-a", "index.ts"),
+            ("muzzle-b", "index.js"),
+            ("muzzle", "package.json"),
+        ] {
+            std::fs::create_dir(d.join(sub)).unwrap();
+            std::fs::write(d.join(sub).join(entry), "").unwrap();
+        }
+        for f in ["muzzle.ts", "muzzle.js", "muzzle-a", "muzzle-b", "muzzle"] {
+            assert!(pi_loads(&d.join(f)), "{f}");
+        }
     }
 
     #[test]

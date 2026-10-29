@@ -365,3 +365,57 @@ fn doctor_reads_the_runs_log_and_exits_2_on_bad_config() {
     // status still answers on a bad config.
     assert!(env.output(&["status", "--json"]).status.success());
 }
+
+#[test]
+fn expired_stored_budget_is_not_reported() {
+    // Reviewer repro (sd_expired_budget): idle and written long ago, so the
+    // next run would drop it and use this host's reading.
+    let env = Env::new();
+    std::fs::create_dir_all(env.path("state/muzzle")).unwrap();
+    std::fs::write(
+        env.path("state/muzzle/state.json"),
+        r#"{"v":1,"next_ticket":1,"budget":{"budget":998,"cores":1000,"ram_per_slot":1048576},"waiters":[],"holders":[],"updated_ms":1000}"#,
+    )
+    .unwrap();
+    let s = env.json(&["status", "--json"]);
+    let cores = s["cores"].as_u64().unwrap();
+    assert_ne!(cores, 1000, "{s}");
+    assert_eq!(
+        s["budget"].as_u64().unwrap(),
+        cores.saturating_sub(2).max(1)
+    );
+    let d = env.json(&["doctor", "--json"]);
+    assert_eq!(d["budget_source"], "measured", "{d}");
+    assert_eq!(d["stored"], Value::Null, "{d}");
+    assert_eq!(d["warnings"], Value::Array(vec![]), "{d}");
+}
+
+#[test]
+fn doctor_exits_125_on_an_unreadable_state_file() {
+    // Reviewer repro (sd_unreadable_state): every run exits 125 here.
+    let env = Env::new();
+    std::fs::create_dir_all(env.path("state/muzzle")).unwrap();
+    std::fs::write(env.path("state/muzzle/state.json"), r#"{"v":99}"#).unwrap();
+    let out = env.output(&["run", "--slots", "1", "--", "true"]);
+    assert_eq!(out.status.code(), Some(125), "{out:?}");
+    let out = env.output(&["doctor"]);
+    assert_eq!(out.status.code(), Some(125), "{out:?}");
+    let t = String::from_utf8(out.stdout).unwrap();
+    assert!(t.contains("warning: state.json unreadable"), "{t}");
+    assert!(t.contains("schema v99"), "{t}");
+}
+
+#[test]
+fn doctor_ignores_files_pi_does_not_load() {
+    // Reviewer repro (sd_pi_ext_prefix).
+    let env = Env::new();
+    let ext = env.path("home/.pi/agent/extensions");
+    std::fs::create_dir_all(&ext).unwrap();
+    std::fs::write(ext.join("muzzle.ts.disabled"), "").unwrap();
+    std::fs::write(ext.join("muzzle-notes.md"), "").unwrap();
+    let v = env.json(&["doctor", "--json"]);
+    assert_eq!(v["pi_extension"], "not installed", "{v}");
+    std::fs::write(ext.join("muzzle.ts"), "").unwrap();
+    let v = env.json(&["doctor", "--json"]);
+    assert_eq!(v["pi_extension"], "loaded", "{v}");
+}
