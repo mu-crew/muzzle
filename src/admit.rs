@@ -173,7 +173,11 @@ mod tests {
         }
     }
 
-    /// Every pid in `state` alive with start time 1, and its group too.
+    /// Start time of every process `push` creates. Not 1, so code that
+    /// passes a constant start instead of the recorded one fails the tests.
+    const START: u64 = 4_242;
+
+    /// Every pid in `state` alive with its recorded start, and its group too.
     fn all_alive(state: &State) -> Table {
         let mut t = Table::default();
         for w in &state.waiters {
@@ -211,7 +215,7 @@ mod tests {
     /// Enqueue with pid = ticket-to-be, so tests can name processes.
     fn push(s: &mut State, slots: u32, class: Class, now_ms: u64) -> u64 {
         let pid = s.next_ticket as u32 + 100;
-        s.enqueue(pid, 1, Some(pid), claim(slots, class), now_ms)
+        s.enqueue(pid, START, Some(pid), claim(slots, class), now_ms)
     }
 
     fn run(s: State, now_ms: u64) -> Outcome {
@@ -307,7 +311,7 @@ mod tests {
         let next = push(&mut s, 2, Class::Normal, 3);
         s.remove(head);
         let mut live = all_alive(&s);
-        live.procs.remove(&(dead as u32 + 100, 1));
+        live.procs.remove(&(dead as u32 + 100, START));
         let out = admit(s, 4, &live);
         assert_eq!(out.admitted, vec![next]);
         assert!(out.state.waiters.is_empty());
@@ -320,10 +324,24 @@ mod tests {
         let t = push(&mut s, 1, Class::Normal, 0);
         let pid = t as u32 + 100;
         let mut live = Table::default();
-        live.procs.insert((pid, 2)); // same pid, different start time
+        live.procs.insert((pid, START + 1)); // same pid, different start time
         let out = admit(s, 1, &live);
         assert!(out.state.waiters.is_empty());
         assert!(out.admitted.is_empty());
+    }
+
+    #[test]
+    fn a_holder_with_a_recycled_pid_and_empty_group_is_pruned() {
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let s = run(s, 1).state;
+        let pid = t as u32 + 100;
+        let mut live = Table::default();
+        live.procs.insert((pid, START + 1)); // the muzzle's pid, reused
+        let out = admit(s, 2, &live);
+        assert!(out.state.holders.is_empty());
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].killed, Some(Killed::Holder));
     }
 
     #[test]
@@ -334,7 +352,7 @@ mod tests {
         let w = push(&mut s, 2, Class::Normal, 2_000);
         // pi's group kill: the muzzle and the whole group are gone.
         let mut live = all_alive(&s);
-        live.procs.remove(&(t as u32 + 100, 1));
+        live.procs.remove(&(t as u32 + 100, START));
         live.groups.remove(&(t as u32 + 100));
         let out = admit(s, 61_000, &live);
         assert_eq!(out.admitted, vec![w]);
@@ -356,7 +374,7 @@ mod tests {
         let mut s = run(s, 1).state;
         let w = push(&mut s, 1, Class::Normal, 2);
         let mut live = all_alive(&s);
-        live.procs.remove(&(t as u32 + 100, 1)); // muzzle SIGKILLed, job lives
+        live.procs.remove(&(t as u32 + 100, START)); // muzzle SIGKILLed, job lives
         let out = admit(s, 3, &live);
         assert!(out.admitted.is_empty());
         assert!(out.records.is_empty());
@@ -377,6 +395,28 @@ mod tests {
         s.holders[0].pgid = None;
         let out = run(s, 2);
         assert_eq!(holder_tickets(&out.state), vec![t]);
+    }
+
+    #[test]
+    fn live_keeper_keeps_its_slots_after_the_group_empties() {
+        // D16: the keeper sits outside the job's group and releases the
+        // slots itself (writing the real run record), so an empty group with
+        // a live keeper must not be pruned or recorded here.
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 1).state;
+        let w = push(&mut s, 1, Class::Normal, 2);
+        s.holders[0].pid = 9_999;
+        s.holders[0].start = 7;
+        s.holders[0].kept = true;
+        assert!(s.holders[0].pgid.is_some());
+        let mut live = all_alive(&s);
+        live.groups.clear();
+        let out = admit(s, 3, &live);
+        assert_eq!(holder_tickets(&out.state), vec![t]);
+        assert!(out.records.is_empty());
+        assert!(out.admitted.is_empty());
+        assert_eq!(queue(&out.state)[0].ticket, w);
     }
 
     #[test]
@@ -424,7 +464,7 @@ mod tests {
         push(&mut s, 1, Class::Normal, 0);
         let alive = push(&mut s, 1, Class::Normal, 0);
         let mut live = all_alive(&s);
-        live.procs.remove(&(101, 1));
+        live.procs.remove(&(101, START));
         let out = admit(s, 1, &live);
         assert!(out.admitted.is_empty());
         let left: Vec<u64> = out.state.waiters.iter().map(|w| w.ticket).collect();

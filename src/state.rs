@@ -296,8 +296,27 @@ impl Store {
         if text.trim().is_empty() {
             return Ok(State::default());
         }
-        let state: State =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let state: State = match serde_json::from_str(&text) {
+            Ok(state) => state,
+            // A file nobody can parse would fail every update and wedge the
+            // queue until a human deletes it. It can only come from a host
+            // crash (or a hand edit), after which every pid in it is dead,
+            // so start over and keep the bad file for inspection.
+            Err(e) => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let aside = self.dir.join(format!("state.json.corrupt-{ts}"));
+                fs::rename(&path, &aside)
+                    .with_context(|| format!("moving aside {}", path.display()))?;
+                eprintln!(
+                    "muzzle: warning: {} is unreadable ({e}); moved to {} and starting from an empty queue",
+                    path.display(),
+                    aside.display()
+                );
+                return Ok(State::default());
+            }
+        };
         if state.v > SCHEMA_VERSION {
             bail!(
                 "{} has schema v{}, this muzzle reads up to v{SCHEMA_VERSION}",
@@ -308,11 +327,12 @@ impl Store {
         Ok(state)
     }
 
-    /// Temp file plus rename, so a crashed writer leaves the old file. No
-    /// fsync: every waiter writes on each 250 ms poll, and only a host crash
-    /// can lose the write, after which every pid in the file is dead anyway
-    /// (an empty file reads as default). The 8-thread test at up to 400
-    /// waiters took 2.3 s with fsync and 1.1 s without, on btrfs.
+    /// Temp file, fsync, rename, so a crashed writer or a host crash leaves
+    /// the old file or the new one, not a zero-filled one. No directory
+    /// fsync: losing the rename itself only loses the last write. If a file
+    /// does come back unparseable, [`Store::load`] moves it aside. The
+    /// 8-thread test at up to 400 waiters took 2.3 s with fsync and 1.1 s
+    /// without, on btrfs.
     fn save(&self, state: &State) -> anyhow::Result<()> {
         let path = self.state_path();
         let tmp = self.dir.join("state.json.tmp");
@@ -322,6 +342,8 @@ impl Store {
         bytes.push(b'\n');
         let mut file = File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
         file.write_all(&bytes)?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
         fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
@@ -376,6 +398,28 @@ mod tests {
         fs::write(store.state_path(), r#"{"v":2,"next_ticket":1}"#).unwrap();
         let err = store.read().unwrap_err().to_string();
         assert!(err.contains("schema v2"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_file_is_moved_aside_and_the_queue_starts_over() {
+        let zeros = [0u8; 64];
+        for bad in [&zeros[..], br#"{"v":1,"next_tic"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            fs::write(store.state_path(), bad).unwrap();
+            let ticket = store
+                .update(1, |s| Ok(s.enqueue(1, 1, None, claim(1), 1)))
+                .unwrap();
+            assert_eq!(ticket, 1);
+            assert_eq!(store.read().unwrap().waiters.len(), 1);
+            let aside: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|n| n.starts_with("state.json.corrupt-"))
+                .collect();
+            assert_eq!(aside.len(), 1, "{aside:?}");
+            assert_eq!(fs::read(dir.path().join(&aside[0])).unwrap(), bad);
+        }
     }
 
     #[test]
