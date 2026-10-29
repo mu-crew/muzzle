@@ -17,10 +17,14 @@ input" (Bash), "PreToolUse decision control"). See also
   command and tool fields changed.
 - Bash `tool_input` is `command`, `description`, `timeout` (milliseconds)
   and `run_in_background`.
-- The reply is `hookSpecificOutput` with `hookEventName: "PreToolUse"`,
-  `permissionDecision: "allow"` and `updatedInput`. `updatedInput`
-  replaces the whole input object, so muzzle copies the other fields.
-  `allow` also skips Claude's permission prompt.
+- The reply is `hookSpecificOutput` with `hookEventName: "PreToolUse"`
+  and `updatedInput`. `updatedInput` replaces the whole input object, so
+  muzzle copies the other fields. Without `permissionDecision` the new
+  input still applies and goes through Claude's normal permission
+  evaluation; `allow` skips the permission prompt. muzzle sends `allow`
+  only for one simple command (spec §Interface CLI `hook`).
+- `claude-bash-compound.json` (`&&` and `|`) gets no decision;
+  `claude-bash-quoted-operator.json` (`'a&&b'` quoted) is still simple.
 - Exit 2 blocks the call. Any other non-zero exit is a non-blocking error.
   That is why `muzzle hook` exits 1, never 2, when it can't answer.
 
@@ -49,4 +53,5 @@ with these sources.
   `tool_input.command`, which is why muzzle checks `tool_name`.
 - To rewrite a call, reply `permissionDecision: "allow"` with
   `updatedInput.command`. `updatedInput` without `allow` is an error, and
-  `ask` is not supported. Exit 2 blocks the call.
+  `ask` is not supported. Exit 2 blocks the call. So Codex always gets
+  `allow`, compound commands included (`codex-bash-compound.json`).
