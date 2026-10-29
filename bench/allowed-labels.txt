@@ -1,0 +1,16 @@
+# Labels a committed trace may carry besides the fixed ones (D40).
+# check-trace rejects any other string. Adding a line here is how a new
+# rule name, or a project name the user has made public (D39), gets in.
+#
+#   rule NAME      a rule `name` from the config
+#   project NAME   a name kept with from-museum --keep-project
+#
+# Review every `project` line by hand. check-trace also refuses the local
+# user name, but in CI that user is "runner", so there the check is vacuous:
+# this file's review is the only guard against a real name as a project.
+
+# The template rules (spec §Config).
+rule gate
+rule cargo-test
+rule js-test
+rule oracle-sweep

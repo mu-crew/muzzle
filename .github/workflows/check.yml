@@ -26,6 +26,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # D40: every committed trace passes the checker. cargo test runs it
+      # too (tests/bench_tools.rs); this step names it in the CI log.
+      - run: bench/check-trace
 
   package:
     runs-on: ubuntu-latest

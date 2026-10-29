@@ -1,0 +1,7 @@
+[
+ {"start": "2026-10-21T09:00:00", "secs": 400, "duration_source": "durationMs", "tool": "bash", "role": "worker", "agent": "worker-9", "workstream": "secret-ws", "error": false, "background": false, "file": "otherhost/--home-x-secret--/2026-10-21T08-00-00-000Z_s6.jsonl", "command": "contrib/gate"},
+ {"start": "2026-10-21T09:00:00", "secs": 400, "duration_source": "durationMs", "tool": "bash", "role": "worker", "agent": "worker-9", "workstream": "secret-ws", "error": false, "background": false, "file": "linuxpc-old/--home-x-secret--/2026-10-21T08-00-00-000Z_s7.jsonl", "command": "contrib/gate"},
+ {"start": "2026-10-21T09:00:00", "secs": 400, "duration_source": "durationMs", "tool": "bash", "role": "worker", "agent": "worker-9", "workstream": "secret-ws", "error": false, "background": false, "file": "linuxpc/../otherhost/--home-x-secret--/2026-10-21T08-00-00-000Z_s8.jsonl", "command": "contrib/gate"},
+ {"start": "2026-10-21T09:00:00", "secs": 400, "duration_source": "durationMs", "tool": "bash", "role": "worker", "agent": "worker-9", "workstream": "secret-ws", "error": false, "background": false, "file": "/linuxpc/--home-x-secret--/2026-10-21T08-00-00-000Z_s9.jsonl", "command": "contrib/gate"},
+ {"start": "2026-10-21T09:00:00", "secs": 400, "duration_source": "durationMs", "tool": "bash", "role": "worker", "agent": "worker-9", "workstream": "secret-ws", "error": false, "background": false, "file": "linuxpc/2026-10-21T08-00-00-000Z_s10.jsonl", "command": "contrib/gate"}
+]

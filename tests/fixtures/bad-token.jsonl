@@ -1,0 +1,4 @@
+{"v":1,"kind":"header","host":"linuxpc","cores":16,"ram_gb":31,"date":"2026-10-08","window_s":86400,"source":"museum","calls_total":4,"calls_kept":3,"calls_dropped":1}
+{"v":1,"kind":"call","t":12.0,"dur_s":184.2,"dur_src":"durationMs","bg":false,"rule":"gate","role":"worker","agent":"a3","project":"p1"}
+{"v":1,"kind":"call","t":40.5,"dur_s":1500,"dur_src":"estimated","bg":true,"rule":"light","role":"orchestrator","agent":"a1","project":"p2"}
+{"v":1,"kind":"call","t":1,"dur_s":31,"dur_src":"durationMs","bg":false,"rule":"light","role":"worker","agent":"a1","project":"ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345"}

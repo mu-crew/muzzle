@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Pre-commit hook (D40): every staged file under bench/traces/ passes
+# check-trace, and no private sidecar is ever committed. Install from the
+# repo root with
+#   ln -s ../../bench/pre-commit "$(git rev-parse --git-common-dir)/hooks/pre-commit"
+# It checks the staged blobs, not the working tree, so a fix that isn't
+# `git add`ed doesn't let a bad trace through. Names are read NUL-separated
+# so a space or newline in a path can't split it past the checks.
+set -eu
+root=$(git rev-parse --show-toplevel)
+status=0
+labels_changed=0
+
+# A trace is anything staged under bench/traces/; check-trace refuses one
+# that isn't .jsonl, so a misnamed or nested file can't slip past.
+check() { # check FILE [LABELS]
+	local f=$1
+	case $f in
+	*/.gitkeep | .gitkeep) return 0 ;;
+	esac
+	if [ "${f%.jsonl}" = "$f" ]; then
+		echo "pre-commit: $f: not a .jsonl trace; only traces belong in bench/traces/ (D40)" >&2
+		status=1
+		return 0
+	fi
+	git show ":$f" | "$root/bench/check-trace" ${2:+--labels "$2"} --name "$f" - >/dev/null || status=1
+}
+
+while IFS= read -r -d '' f; do
+	case $f in
+	*.private.jsonl*)
+		echo "pre-commit: $f is a private sidecar; it must never be committed (D38)" >&2
+		status=1
+		;;
+	bench/traces/*)
+		check "$f"
+		;;
+	bench/allowed-labels.txt)
+		labels_changed=1
+		;;
+	esac
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+# The label list decides what check-trace allows, so a change to it
+# re-checks every staged trace against the staged list.
+if [ $labels_changed = 1 ]; then
+	tmp=$(mktemp)
+	git show :bench/allowed-labels.txt >"$tmp"
+	while IFS= read -r -d '' f; do
+		check "$f" "$tmp"
+	done < <(git ls-files -z -- bench/traces/)
+	rm -f "$tmp"
+fi
+exit $status

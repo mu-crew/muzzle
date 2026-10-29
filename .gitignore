@@ -2,3 +2,4 @@
 node_modules/
 bench/real.toml
 *.private.jsonl
+__pycache__/

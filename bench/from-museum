@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Build a benchmark trace from museum's call log (spec D36-D39, D43,
+§Interface "Trace format").
+
+    bench/from-museum --date 2026-10-08 [--calls FILE|-] [--out TRACE]
+                      [--keep-project NAME ...] [--muzzle BIN]
+
+Reads `museum-search calls --json` (from --calls, or by running
+museum-search for the day), keeps one day of linuxpc bash calls, labels each
+with the local config through `muzzle match`, and writes:
+
+- the trace, default bench/traces/<date>.jsonl, with allowlisted fields only;
+- the private sidecar, $XDG_STATE_HOME/muzzle/bench/<trace>.private.jsonl,
+  mapping each trace line back to its command, cwd and session. Never commit
+  it (D38).
+
+Calls from any host's session files but linuxpc are refused: dropped
+before anything looks at them, and not counted in the header (D37). Input
+with no linuxpc call fails. The trace is run through
+bench/check-trace before it is written, so a label missing from
+bench/allowed-labels.txt stops the import instead of reaching a commit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
+
+BENCH = Path(__file__).resolve().parent
+HOST = "linuxpc"
+HEAVY_S = 30.0  # spec: unmatched-heavy is ≥ 30 s with no rule.
+
+
+def load_checker():
+    loader = importlib.machinery.SourceFileLoader("check_trace", str(BENCH / "check-trace"))
+    spec = importlib.util.spec_from_loader("check_trace", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# --- the light-call rule (spec §Trace format, builder check 2) -------------
+#
+# A call that waits on something else is light however long it takes, or
+# tier 1 would burn a thread for each 1500 s `mu agent wait`. Segments are
+# split on shell operators outside quotes; heredoc bodies are dropped.
+
+WAIT = "wait"
+POLL = "poll"
+OTHER = "other"
+# Words that neither do work nor wait: they don't change a segment's kind.
+NEUTRAL = {"cd", "export", "set", "unset", "source", ".", "true", ":", "echo", "printf", "date"}
+# Reading a log or the process table: a poll, not work.
+POLLS = {"tail", "cat", "head", "grep", "rg", "ls", "ps", "pgrep", "wc", "jq", "stat", "test", "["}
+# Prefixes to skip to find the real command word.
+PREFIX_WITH_ARG = {"timeout"}
+PREFIX = {"env", "time", "nice", "command", "exec"}
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def strip_heredocs(cmd: str) -> str:
+    out, lines, i = [], cmd.split("\n"), 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in HEREDOC.finditer(line):
+            while i < len(lines) and lines[i].strip() != m.group(2):
+                i += 1
+            i += 1
+    return "\n".join(out)
+
+
+def segments(cmd: str) -> list[str]:
+    """Split on ; & | newline ( ) outside quotes. A heuristic, like museum's."""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            cur.append(c)
+            if c == quote:
+                quote = None
+            elif c == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i + 1])
+                i += 1
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c == "\\" and i + 1 < len(cmd):
+            cur += [c, cmd[i + 1]]
+            i += 1
+        elif c in ";&|\n()`":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    segs.append("".join(cur))
+    return [s.strip() for s in segs if s.strip()]
+
+
+def kind_of(seg: str) -> str | None:
+    """WAIT, POLL, OTHER, or None for a neutral segment."""
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        words = seg.split()
+    while words:
+        w = words[0]
+        if ASSIGN.match(w) or w in PREFIX:
+            words = words[1:]
+        elif w in PREFIX_WITH_ARG:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                # -k DUR and -s SIG take a separate argument.
+                words = words[2:] if words[0] in ("-k", "-s", "--kill-after", "--signal") else words[1:]
+            words = words[1:]  # the duration
+        else:
+            break
+    if not words:
+        return None
+    w, base = words[0], os.path.basename(words[0])
+    if base == "museum-search" or w == "sleep":
+        return WAIT
+    if w == "tail" and any(a in ("-f", "-F", "--follow") or a.startswith("--follow") for a in words):
+        return WAIT
+    if w == "mu" and WAIT in words[1:3]:
+        return WAIT  # mu wait, mu agent wait, mu task wait
+    if w in NEUTRAL:
+        return None
+    if w in POLLS:
+        return POLL
+    return OTHER
+
+
+def classify(cmd: str) -> tuple[bool, bool]:
+    """(all segments wait/poll/neutral with at least one wait or poll,
+    any segment waits)."""
+    kinds = [k for k in map(kind_of, segments(strip_heredocs(cmd))) if k]
+    return (bool(kinds) and OTHER not in kinds, WAIT in kinds)
+
+
+def label(cmd: str, secs: float, rule: str | None) -> str:
+    """The trace's `rule`. A pure wait or poll is light even when a rule's
+    regex hits its text (`tail contrib/gate.log`); a matched rule wins over
+    a wait elsewhere in the string (`sleep 5; cargo test`); an unmatched
+    call that waits is light; otherwise unmatched calls ≥ 30 s are heavy."""
+    only_waits, waits = classify(cmd)
+    if only_waits:
+        return "light"
+    if rule:
+        return rule
+    if waits:
+        return "light"
+    return "unmatched-heavy" if secs >= HEAVY_S else "light"
+
+
+# --- roles, agents and projects -------------------------------------------
+
+# museum's role is the leading word of the mu agent name, "main" for a
+# human-driven session, "other" without museum metadata. *(my call: the
+# short forms seen on linuxpc, w and rv, follow their long names; anything
+# unrecognised is other.)*
+ROLES = {
+    "main": "orchestrator",
+    "worker": "worker",
+    "w": "worker",
+    "fixer": "worker",
+    "reviewer": "reviewer",
+    "review": "reviewer",
+    "rv": "reviewer",
+}
+
+
+def decode_folder(folder: str) -> Path | None:
+    """pi's cwd folder (`--var-home-x-.local-state-a-b--`) back to a path.
+    `-` is both the separator and a legal name character, so walk the
+    filesystem and keep the deepest directory that exists. A worktree that
+    has since been removed decodes to its nearest surviving parent."""
+    best = Path("/")
+
+    def walk(base: Path, rest: list[str]) -> None:
+        nonlocal best
+        if len(base.parts) > len(best.parts):
+            best = base
+        for n in range(1, len(rest) + 1):
+            if (base / "-".join(rest[:n])).is_dir():
+                walk(base / "-".join(rest[:n]), rest[n:])
+
+    walk(Path("/"), folder.strip("-").split("-"))
+    return None if best == Path("/") else best
+
+
+def git_project(cwd: Path) -> str | None:
+    """The main repository's folder name, through worktrees."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    common = Path(out.stdout.strip())
+    return (common.parent if common.name == ".git" else common).name.removesuffix(".git")
+
+
+class Namer:
+    """`a1, a2, …` / `p1, p2, …` in order of first appearance (D38, D39)."""
+
+    def __init__(self, prefix: str, keep: set[str] = frozenset()):
+        self.prefix, self.keep, self.names = prefix, keep, {}
+
+    def __call__(self, key: str) -> str:
+        if key in self.keep:
+            return key
+        if key not in self.names:
+            self.names[key] = f"{self.prefix}{len(self.names) + 1}"
+        return self.names[key]
+
+
+# --- muzzle match -----------------------------------------------------------
+
+
+class Matcher:
+    def __init__(self, muzzle: str):
+        self.muzzle, self.cache, self.cfg = muzzle, {}, None
+
+    def __call__(self, cmd: str, cwd: Path | None) -> str | None:
+        key = (cmd, cwd)
+        if key not in self.cache:
+            args = [self.muzzle, "match", "--json"]
+            if cwd:
+                args += ["--cwd", str(cwd)]
+            out = subprocess.run([*args, "--", cmd], capture_output=True, text=True)
+            if out.returncode != 0:
+                sys.exit(f"from-museum: muzzle match failed ({out.returncode}): {out.stderr.strip()}")
+            v = json.loads(out.stdout)
+            self.cfg = v.get("cfg", self.cfg)
+            self.cache[key] = v.get("rule") if v.get("slots") is not None else None
+        return self.cache[key]
+
+
+# --- the import -------------------------------------------------------------
+
+
+def read_calls(ns) -> list[dict]:
+    if ns.calls == "-":
+        return json.load(sys.stdin)
+    if ns.calls:
+        return json.loads(Path(ns.calls).read_text())
+    day = date.fromisoformat(ns.date)
+    # --since/--until select sessions by start date, so take the day before
+    # too: a session started late on D-1 still has calls on D.
+    args = [
+        ns.museum_search, "calls", "--json", "--sort", "time", "--limit", "100000000",
+        "--since", (day - timedelta(days=1)).isoformat(), "--until", ns.date,
+    ]  # fmt: skip
+    if ns.tool:
+        args += ["--tool", ns.tool]
+    out = subprocess.run(args, capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"from-museum: museum-search failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def is_ours(file: object) -> bool:
+    """A linuxpc/<folder>/<session> store path (D37). Checked by path part,
+    so `linuxpc/../otherhost/...`, `./linuxpc/...` or an absolute path
+    can't pass as ours."""
+    if not isinstance(file, str):
+        return False
+    # The raw split, since PurePosixPath drops "." and "//" before we look.
+    raw = file.split("/")
+    parts = PurePosixPath(file).parts
+    return len(parts) >= 3 and parts[0] == HOST and not any(x in ("", ".", "..") for x in raw)
+
+
+def ram_gb() -> int:
+    try:
+        return round(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3)
+    except (ValueError, OSError):
+        return 0
+
+
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    return Path(base) / "muzzle" / "bench"
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="from-museum", description=__doc__.split("\n\n")[0])
+    p.add_argument("--date", required=True, help="the UTC day to import, YYYY-MM-DD")
+    p.add_argument("--calls", help="museum-search calls --json output, or - for stdin")
+    p.add_argument("--out", type=Path, help="trace file (default bench/traces/<date>.jsonl)")
+    p.add_argument("--keep-project", action="append", default=[], metavar="NAME")
+    p.add_argument("--muzzle", default="muzzle", help="muzzle binary for rule labels")
+    p.add_argument("--museum-search", default="museum-search")
+    p.add_argument("--tool", default="bash", help="tool filter when running museum-search")
+    p.add_argument("--cores", type=int, default=os.cpu_count())
+    p.add_argument("--ram-gb", type=int, default=None)
+    p.add_argument("--labels", type=Path, default=BENCH / "allowed-labels.txt")
+    ns = p.parse_args(argv)
+
+    checker = load_checker()
+    for k in ns.keep_project:
+        if not checker.LABEL.fullmatch(k) or checker.PROJECT.fullmatch(k):
+            sys.exit(f"from-museum: --keep-project {k!r}: want [a-z0-9_-], not p<digits>")
+    try:
+        day = datetime.fromisoformat(ns.date).replace(tzinfo=timezone.utc)
+    except ValueError:
+        sys.exit("from-museum: --date must be YYYY-MM-DD")
+    out_path = ns.out or BENCH / "traces" / f"{ns.date}.jsonl"
+    trace = out_path.name.removesuffix(".jsonl")
+
+    rows = read_calls(ns)
+    ours = [r for r in rows if is_ours(r.get("file"))]
+    refused = len(rows) - len(ours)
+    if refused:
+        # D37: other hosts' session files are refused. Say how many, not
+        # which hosts, to keep their names out of any pasted log.
+        print(f"from-museum: refused {refused} call(s) from non-{HOST} session files", file=sys.stderr)
+    rows = ours
+    if not rows:
+        sys.exit(f"from-museum: no {HOST} calls in the input (D37)")
+
+    def offset(r: dict) -> float | None:
+        try:
+            t = datetime.fromisoformat(r["start"]).replace(tzinfo=timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            return None
+        s = (t - day).total_seconds()
+        return s if 0 <= s < 86400 else None
+
+    in_day = [(offset(r), r) for r in rows]
+    in_day = sorted(((t, r) for t, r in in_day if t is not None), key=lambda x: x[0])
+    match = Matcher(ns.muzzle)
+    agents = Namer("a")
+    projects = Namer("p", set(ns.keep_project))
+    cwds: dict[str, Path | None] = {}
+    repos: dict[str, str | None] = {}
+    calls, private = [], []
+    for t, r in in_day:
+        if r.get("tool") != "bash" or not isinstance(r.get("command"), str):
+            continue  # dropped: only shell commands are replayed
+        try:
+            secs = float(r["secs"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        file = r["file"]
+        folder = file.split("/")[1] if file.count("/") >= 2 else ""
+        if folder not in cwds:
+            cwds[folder] = decode_folder(folder)
+            repos[folder] = git_project(cwds[folder]) if cwds[folder] else None
+        cwd = cwds[folder]
+        # The project is the repository; outside one, the mu workstream;
+        # else the session folder. A session without an agent name is its
+        # own agent.
+        project = repos[folder] or r.get("workstream") or folder.strip("-")
+        agent_key = f"{r.get('workstream')}/{r['agent']}" if r.get("agent") else file
+        a, proj = agents(agent_key), projects(project)
+        rule = label(r["command"], secs, match(r["command"], cwd))
+        calls.append({
+            "v": 1, "kind": "call", "t": round(t, 3), "dur_s": round(secs, 3),
+            "dur_src": r.get("duration_source"), "bg": bool(r.get("background")),
+            "rule": rule, "role": ROLES.get(r.get("role"), "other"), "agent": a, "project": proj,
+        })  # fmt: skip
+        private.append({
+            "line": len(calls) + 1, "agent": a, "agent_was": agent_key, "project": proj,
+            "project_was": project, "cwd": str(cwd) if cwd else None, "file": file,
+            "start": r["start"], "command": r["command"],
+        })  # fmt: skip
+    header = {
+        "v": 1, "kind": "header", "host": HOST, "cores": ns.cores,
+        "ram_gb": ns.ram_gb if ns.ram_gb is not None else ram_gb(), "date": ns.date,
+        "window_s": 86400, "source": "museum", "calls_total": len(in_day),
+        "calls_kept": len(calls), "calls_dropped": len(in_day) - len(calls),
+    }  # fmt: skip
+    text = "".join(json.dumps(x, separators=(",", ":")) + "\n" for x in [header, *calls])
+
+    # The same check CI runs, so a trace that would fail there is never
+    # written. A kept project must be in the labels file too (D39, D40).
+    rules, kept, errors = checker.load_labels(ns.labels)
+    errors += checker.check(str(out_path), text, rules, kept)
+    if errors:
+        for e in errors:
+            print(f"from-museum: {e}", file=sys.stderr)
+        print(
+            "from-museum: trace not written. A rule or kept project missing "
+            "from bench/allowed-labels.txt needs a `rule NAME` or "
+            "`project NAME` line there.",
+            file=sys.stderr,
+        )
+        return 1
+
+    side = state_dir() / f"{trace}.private.jsonl"
+    side.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(side, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"trace": str(out_path), "cfg": match.cfg}) + "\n")
+        for x in private:
+            f.write(json.dumps(x) + "\n")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text)
+    print(f"from-museum: {out_path}: {len(calls)} of {len(in_day)} calls kept; sidecar {side}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
