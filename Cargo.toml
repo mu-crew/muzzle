@@ -57,10 +57,6 @@ sha2 = "0.10"
 rustix = { version = "1", features = ["process", "fs", "system", "termios"] }
 libc = "0.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Group members and ancestry: proc_listpgrppids, proc_pidinfo.
-libproc = "0.14"
-
 [dev-dependencies]
 # Private XDG_STATE_HOME per integration test.
 tempfile = "3"
