@@ -121,24 +121,25 @@ impl Env {
     }
 }
 
-/// No run may leave its scope loaded as `failed`: failed units pile up on
-/// the host until someone resets them. A keeper or pruner may still be
-/// finishing, so allow a few seconds.
+/// No run may leave its scope loaded, `failed` or otherwise: such units pile
+/// up on the host until someone resets or stops them (75 empty `active`
+/// scopes once did). A keeper or pruner may still be finishing, so allow a
+/// few seconds.
 impl Drop for Env {
     fn drop(&mut self) {
         if std::thread::panicking() || !muzzle::proc::systemd_user_reachable() {
             return;
         }
         let left = eventually(Duration::from_secs(5), || {
-            failed_units(&self.units).is_empty()
+            loaded_units(&self.units).is_empty()
         });
-        assert!(left, "failed scopes left: {:?}", failed_units(&self.units));
+        assert!(left, "scopes left: {:?}", loaded_units(&self.units));
     }
 }
 
-fn failed_units(prefix: &str) -> Vec<String> {
+fn loaded_units(prefix: &str) -> Vec<String> {
     let out = Command::new("systemctl")
-        .args(["--user", "list-units", "--all", "--state=failed", "--plain"])
+        .args(["--user", "list-units", "--all", "--plain"])
         .args(["--no-legend", &format!("{prefix}-*")])
         .output()
         .unwrap();
@@ -883,7 +884,9 @@ fn fake_podman(env: &Env) -> String {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\n[ \"$1\" = exec ] || exit 2\nshift 2\ntouch {}\nsetsid \"$@\" &\nwait\n",
+            // `entered` only after the fork: a kill between the two would
+            // leave the scope empty, and a pruner rightly frees it.
+            "#!/bin/sh\n[ \"$1\" = exec ] || exit 2\nshift 2\nsetsid \"$@\" &\ntouch {}\nwait\n",
             env.file("entered").display()
         ),
     )

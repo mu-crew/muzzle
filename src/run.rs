@@ -380,7 +380,15 @@ impl Queue<'_> {
         // A group SIGKILLed while systemd-run was still setting up the scope
         // (pi on Esc) leaves it `failed` with Result=resources, and nobody
         // but the pruner is left to reset it (2/10 on linuxpc, systemd 259).
+        // The same race can instead leave it `active running` with an empty
+        // cgroup: its only PID died before systemd watched it, so no empty
+        // notification ever comes (3-4/10 on linuxpc, systemd 259; 75 such
+        // units had piled up). Stop it, but only if empty: a populated scope
+        // holds a job that outlived its group.
         for unit in &pruned {
+            if scope_loaded(unit) && !scope_populated(unit) {
+                stop_unit(unit);
+            }
             reset_failed(unit);
         }
         poll
@@ -553,6 +561,26 @@ fn unit_name(pid: u32, start: StartTime, ticket: u64) -> String {
     format!("{prefix}-{pid}-{start}-{ticket}")
 }
 
+/// Whether systemd has the unit loaded at all; `false` if unanswerable.
+fn scope_loaded(name: &str) -> bool {
+    Command::new("systemctl")
+        .args(["--user", "show", "-p", "LoadState", "--value"])
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "loaded")
+}
+
+fn stop_unit(name: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop"])
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Drop a scope's `failed` state; failed units stay loaded until reset.
 /// Harmless on a unit that is gone or never existed.
 fn reset_failed(name: &str) {
@@ -644,7 +672,13 @@ fn scope_outcome(unit: &str) -> Show {
         if settled || Instant::now() >= deadline {
             // Don't leave one failed unit per OOM behind. A scope still
             // settling at the deadline may fail after this read, so reset it
-            // too: anything not cleanly `inactive`.
+            // too: anything not cleanly `inactive`. A scope whose systemd-run
+            // was signalled mid-setup stays `active` with an empty cgroup
+            // forever (see `poll`); stop it, only here at the deadline so an
+            // OOM-killed scope has had time to record `oom-kill`.
+            if !settled && scope_loaded(&name) && !scope_populated(&name) {
+                stop_unit(&name);
+            }
             if show.active != "inactive" {
                 reset_failed(&name);
             }
