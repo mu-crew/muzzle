@@ -329,10 +329,14 @@ def main(argv: list[str]) -> int:
         # CI's mode: every path under traces/, so a nested, misnamed or
         # identifying one can't slip past (D40).
         root = BENCH / "traces"
-        bad = 0
+        bad = links = 0
         for f in sorted(root.rglob("*")):
             rel = f.relative_to(root).as_posix()
-            if f.is_dir() or not trace_path_ok(rel):
+            # Before is_file()/is_dir(), which follow the link: git
+            # publishes the link's target text, not what it points at.
+            if f.is_symlink():
+                links += 1
+            elif f.is_dir() or not trace_path_ok(rel):
                 bad += 1
             elif rel == ".gitkeep":
                 continue
@@ -342,6 +346,11 @@ def main(argv: list[str]) -> int:
                 errors.append(f"{f}: not a regular file")
         if bad:
             errors.append(bad_paths_error(bad))
+        if links:
+            errors.append(
+                f"bench/traces/ has {links} symlink(s); git would publish the link "
+                "target, so only regular files are allowed; names withheld (D40)"
+            )
     for t in traces:
         if t == "-":
             errors += check(ns.name or "<stdin>", sys.stdin.read(), rules, projects)

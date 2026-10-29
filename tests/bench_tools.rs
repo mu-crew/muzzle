@@ -631,3 +631,127 @@ fn pre_commit_rechecks_traces_when_labels_change() {
         stderr(&out)
     );
 }
+
+fn commit(repo: &Path, msg: &str) {
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            msg,
+        ],
+    );
+}
+
+/// A symlink target that names someone: git would publish it as the blob.
+#[cfg(unix)]
+fn leaky_target(tmp: &Path) -> PathBuf {
+    let dir = tmp.join("jane.doe@example.com");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(fixture("good.jsonl"), dir.join("good.jsonl")).unwrap();
+    dir
+}
+
+/// The trace_symlink_typechange repro: a committed trace replaced by a
+/// symlink stages as T, which the hook's filter used to leave out.
+#[cfg(unix)]
+#[test]
+fn pre_commit_refuses_a_trace_typechanged_to_a_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = hook_repo(tmp.path());
+    let target = leaky_target(tmp.path());
+    let trace = repo.join("bench/traces/2026-01-01.jsonl");
+    fs::copy(fixture("good.jsonl"), &trace).unwrap();
+    git(&repo, &["add", "."]);
+    commit(&repo, "base");
+
+    fs::remove_file(&trace).unwrap();
+    std::os::unix::fs::symlink(target.join("good.jsonl"), &trace).unwrap();
+    git(&repo, &["add", "bench/traces/2026-01-01.jsonl"]);
+    let out = hook(&repo);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("not a regular file"), "{err}");
+    assert_name_withheld(&err);
+    assert!(!err.contains("2026-01-01"), "{err}");
+}
+
+/// A new symlink (A) and one already committed, re-checked when the
+/// labels change: both are refused on mode, not on the blob's content.
+#[cfg(unix)]
+#[test]
+fn pre_commit_refuses_new_and_committed_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = hook_repo(tmp.path());
+    let target = leaky_target(tmp.path());
+    let link = repo.join("bench/traces/2026-01-02.jsonl");
+    std::os::unix::fs::symlink(target.join("good.jsonl"), &link).unwrap();
+    git(&repo, &["add", "."]);
+    let out = hook(&repo);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a regular file"),
+        "{}",
+        stderr(&out)
+    );
+    assert_name_withheld(&stderr(&out));
+
+    commit(&repo, "link");
+    fs::write(repo.join("bench/allowed-labels.txt"), "rule gate\n").unwrap();
+    git(&repo, &["add", "bench/allowed-labels.txt"]);
+    let out = hook(&repo);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not a regular file"),
+        "{}",
+        stderr(&out)
+    );
+    assert_name_withheld(&stderr(&out));
+}
+
+/// CI mode refuses a symlinked file and a symlinked dir under
+/// bench/traces/, even when the name and the target's content are good.
+#[cfg(unix)]
+#[test]
+fn default_mode_refuses_symlinks_without_echoing_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = leaky_target(tmp.path());
+    for (name, to) in [
+        ("2026-01-01.jsonl", target.join("good.jsonl")),
+        ("2026-01-02", target.clone()),
+    ] {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let repo = hook_repo(repo_tmp.path());
+        std::os::unix::fs::symlink(&to, repo.join("bench/traces").join(name)).unwrap();
+        let out = Command::new(repo.join("bench/check-trace"))
+            .env("HOME", repo_tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("1 symlink(s)"), "{name}: {err}");
+        assert_name_withheld(&err);
+        assert!(!err.contains(name), "{name}: {err}");
+    }
+}
+
+/// A rename's raw record carries two paths; the hook must check the
+/// destination, or `git mv x.jsonl bench/traces/<leak>` slips past.
+#[test]
+fn pre_commit_checks_the_destination_of_a_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = hook_repo(tmp.path());
+    fs::copy(fixture("good.jsonl"), repo.join("x.jsonl")).unwrap();
+    git(&repo, &["add", "."]);
+    commit(&repo, "base");
+    let name = "bench/traces/jane.doe@example.com.jsonl";
+    git(&repo, &["mv", "x.jsonl", name]);
+    let out = hook(&repo);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("names withheld"), "{}", stderr(&out));
+    assert_name_withheld(&stderr(&out));
+}

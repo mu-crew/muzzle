@@ -6,6 +6,12 @@
 # It checks the staged blobs, not the working tree, so a fix that isn't
 # `git add`ed doesn't let a bad trace through. Names are read NUL-separated
 # so a space or newline in a path can't split it past the checks.
+#
+# Only regular files (mode 100644/100755) may sit under bench/traces/: git
+# publishes a symlink's target text, an arbitrary path, as the blob, and a
+# typechange (T) to a symlink keeps the trace's good name (D40). So the mode
+# comes from git's index records (`diff --raw`, `ls-files -s`), not the
+# name list, and T is in the filter.
 set -eu
 root=$(git rev-parse --show-toplevel)
 status=0
@@ -15,39 +21,56 @@ labels_changed=0
 # too, so check-trace --paths first refuses any that isn't a dated .jsonl
 # name or the top-level .gitkeep, without echoing it: the name may be the
 # leak (D40). Only then is the content checked.
-check() { # check FILE [LABELS]
-	local f=$1
+check() { # check MODE FILE [LABELS]
+	local mode=$1 f=$2
+	case $mode in
+	100644 | 100755) ;;
+	*)
+		# Neither the name nor the link target is echoed: either may be the leak.
+		echo "pre-commit: a staged path under bench/traces/ is not a regular file (a symlink?); name withheld (D40)" >&2
+		status=1
+		return 0
+		;;
+	esac
 	"$root/bench/check-trace" --paths -- "${f#bench/traces/}" || {
 		status=1
 		return 0
 	}
 	[ "$f" = bench/traces/.gitkeep ] && return 0
-	git show ":$f" | "$root/bench/check-trace" ${2:+--labels "$2"} --name "$f" - >/dev/null || status=1
+	git show ":$f" | "$root/bench/check-trace" ${3:+--labels "$3"} --name "$f" - >/dev/null || status=1
 }
 
-while IFS= read -r -d '' f; do
+# `diff --raw -z` gives ":SRCMODE DSTMODE SRCSHA DSTSHA STATUS" NUL PATH NUL,
+# with a second (destination) PATH for a rename or copy.
+while IFS= read -r -d '' meta && IFS= read -r -d '' f; do
+	case ${meta##* } in
+	R* | C*) IFS= read -r -d '' f ;;
+	esac
+	mode=${meta#:* }
+	mode=${mode%% *}
 	case $f in
 	*.private.jsonl*)
 		echo "pre-commit: $f is a private sidecar; it must never be committed (D38)" >&2
 		status=1
 		;;
 	bench/traces/*)
-		check "$f"
+		check "$mode" "$f"
 		;;
 	bench/allowed-labels.txt)
 		labels_changed=1
 		;;
 	esac
-done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+done < <(git diff --cached --raw -z --diff-filter=ACMRT)
 
 # The label list decides what check-trace allows, so a change to it
 # re-checks every staged trace against the staged list.
 if [ $labels_changed = 1 ]; then
 	tmp=$(mktemp)
 	git show :bench/allowed-labels.txt >"$tmp"
-	while IFS= read -r -d '' f; do
-		check "$f" "$tmp"
-	done < <(git ls-files -z -- bench/traces/)
+	# `ls-files -s -z` gives "MODE SHA STAGE" TAB PATH NUL.
+	while IFS= read -r -d '' rec; do
+		check "${rec%% *}" "${rec#*	}" "$tmp"
+	done < <(git ls-files -s -z -- bench/traces/)
 	rm -f "$tmp"
 fi
 exit $status
