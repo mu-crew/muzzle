@@ -28,6 +28,10 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn muzzle(dir: &Path, args: &[&str]) -> Output {
+    muzzle_env(dir, args, &[])
+}
+
+fn muzzle_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let config = dir.join("config");
     std::fs::create_dir_all(config.join("muzzle")).unwrap();
     std::fs::write(config.join("muzzle/config.toml"), CONFIG).unwrap();
@@ -43,6 +47,7 @@ fn muzzle(dir: &Path, args: &[&str]) -> Output {
         // The gate may run this under muzzle: the bench must not nest.
         .env_remove("MUZZLE_HOLD")
         .env_remove("MUZZLE_CLASS")
+        .envs(env.iter().copied())
         .output()
         .unwrap()
 }
@@ -56,6 +61,16 @@ fn bench_trace(
     mode: &str,
     speed: &str,
     extra: &[&str],
+) -> (tempfile::TempDir, PathBuf, Value) {
+    bench_trace_env(trace, mode, speed, extra, &[])
+}
+
+fn bench_trace_env(
+    trace: &Path,
+    mode: &str,
+    speed: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
 ) -> (tempfile::TempDir, PathBuf, Value) {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
@@ -73,7 +88,7 @@ fn bench_trace(
         out.to_str().unwrap(),
     ];
     args.extend(extra);
-    let o = muzzle(dir.path(), &args);
+    let o = muzzle_env(dir.path(), &args, env);
     assert!(o.status.success(), "{o:?}");
     let result: Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("result.json")).unwrap()).unwrap();
@@ -162,12 +177,63 @@ fn none_mode_starts_everything_at_once_with_role_caps() {
     assert_eq!(r["mode"], "none");
     assert_eq!(r["calls"]["replayed"], 5);
     assert_eq!(r["calls"]["failed"], 0);
-    // No queue: nothing waits. C3 caps: worker 4 + orchestrator 6 +
-    // reviewer 2 overlap at t = 2 s.
+    // No queue: nothing waits. Each burns its rule's slots capped at the
+    // C3 role cap: worker gate 3 (cap 4) + orchestrator gate 3 (cap 6) +
+    // reviewer js-test 2 (cap 2) overlap at t = 2 s.
     assert_eq!(r["wait_s"]["p90"], 0.0);
-    assert_eq!(r["max_slots_held"], 12);
+    assert_eq!(r["max_slots_held"], 8);
     assert!(!out.join("runs.jsonl").exists());
     assert!(out.join("summary.md").exists());
+}
+
+/// A one-call trace, written into `dir`.
+fn one_call(dir: &Path, rule: &str, role: &str, dur_s: f64) -> PathBuf {
+    let trace = dir.join("one.jsonl");
+    std::fs::write(
+        &trace,
+        format!(
+            "{}\n{}\n",
+            r#"{"v":1,"kind":"header","host":"linuxpc","cores":16,"ram_gb":31,"date":"2026-10-08","window_s":10,"source":"museum","calls_total":1,"calls_kept":1,"calls_dropped":0}"#,
+            format_args!(
+                r#"{{"v":1,"kind":"call","t":0.0,"dur_s":{dur_s},"dur_src":"durationMs","bg":false,"rule":"{rule}","role":"{role}","agent":"a1","project":"p1"}}"#
+            )
+        ),
+    )
+    .unwrap();
+    trace
+}
+
+/// bench_none_work_model: uncontended, a call takes about `dur_s / speed`
+/// in both modes, even for a role whose cap (reviewer 2) is below the
+/// rule's slots (gate 3). It used to burn 3 x dur_s over 2 threads in
+/// none mode: 1.5 x dur_s. The burner counts CPU time, so it is never
+/// faster than dur_s; the upper bound leaves room for a busy machine.
+#[test]
+fn an_uncontended_call_takes_its_duration_in_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = one_call(dir.path(), "gate", "reviewer", 2.0);
+    for mode in ["none", "muzzle"] {
+        let (_d, _out, r) = bench_trace(&trace, mode, "1", &[]);
+        assert_eq!(r["calls"]["failed"], 0, "{mode}: {r:#}");
+        let run = r["run_s"]["p50"].as_f64().unwrap();
+        assert!((1.9..2.7).contains(&run), "{mode}: run_s {run}, want ~2");
+    }
+}
+
+/// bench_unmatched_thread_test: an unmatched-heavy call burns one thread,
+/// not the bench's inherited CARGO_BUILD_JOBS (8 here would finish its
+/// 1 CPU-second in 0.125 s). The burner counts CPU time, so only a lower
+/// bound is needed.
+#[test]
+fn unmatched_heavy_burns_one_thread_whatever_the_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = one_call(dir.path(), "unmatched-heavy", "worker", 1.0);
+    for mode in ["none", "muzzle"] {
+        let (_d, _out, r) = bench_trace_env(&trace, mode, "1", &[], &[("CARGO_BUILD_JOBS", "8")]);
+        assert_eq!(r["calls"]["unmatched_heavy"], 1, "{mode}: {r:#}");
+        let run = r["run_s"]["p50"].as_f64().unwrap();
+        assert!(run >= 0.9, "{mode}: run_s {run}, want ~1");
+    }
 }
 
 #[test]
@@ -262,8 +328,8 @@ fn real_tier_runs_rule_commands_in_per_agent_prebuilt_worktrees() {
     std::fs::write(
         &real,
         format!(
-            "repo = {:?}\ncommit = \"HEAD\"\nworkdir = {:?}\nsetup = \"touch built\"\n\
-             [rules]\ngate = 'test -f built && echo \"$CARGO_BUILD_JOBS\" >> gate.log'\n\
+            "repo = {:?}\ncommit = \"HEAD\"\nworkdir = {:?}\nsetup = 'touch built && echo \"$CARGO_TARGET_DIR\" >> td.log'\n\
+             [rules]\ngate = 'test -f built && echo \"$CARGO_BUILD_JOBS\" >> gate.log && echo \"$CARGO_TARGET_DIR\" >> td.log'\n\
              js-test = 'test -f built && echo js >> js.log'\n",
             repo,
             d.join("wt")
@@ -288,7 +354,8 @@ fn real_tier_runs_rule_commands_in_per_agent_prebuilt_worktrees() {
             "--out",
             out.to_str().unwrap(),
         ];
-        let o = muzzle(d, &args);
+        // An inherited target dir must not be shared by the agents.
+        let o = muzzle_env(d, &args, &[("CARGO_TARGET_DIR", "/tmp/shared-target")]);
         assert!(o.status.success(), "{mode}: {o:?}");
         let r: Value =
             serde_json::from_str(&std::fs::read_to_string(out.join("result.json")).unwrap())
@@ -304,6 +371,16 @@ fn real_tier_runs_rule_commands_in_per_agent_prebuilt_worktrees() {
         "6\n3\n"
     );
     assert!(d.join("wt/a3/js.log").exists());
+    // bench_real_target_dir: each agent's own target dir, for setup (once
+    // per mode) and every replayed call, in both modes.
+    for (agent, gates) in [("a1", 4), ("a2", 2)] {
+        let want = format!("{}\n", d.join("wt").join(agent).join("target").display());
+        assert_eq!(
+            std::fs::read_to_string(d.join("wt").join(agent).join("td.log")).unwrap(),
+            want.repeat(2 + gates),
+            "{agent}"
+        );
+    }
     // unmatched-heavy (a4) burns a thread and needs no worktree command.
     assert!(d.join("wt/a4/built").exists());
 }

@@ -91,27 +91,33 @@ pub fn parse_window(s: &str) -> anyhow::Result<f64> {
     }
 }
 
-/// Matched call-seconds inside `[start, start + len)`, calls clipped.
+/// Whether the window `[start, start + len)` replays `call`: it starts in
+/// the window. Scoring and replay share this, so the window chosen as
+/// busiest is busiest among the calls actually replayed
+/// (bench_window_straddle).
+pub fn in_window(call: &Call, start: f64, len: f64) -> bool {
+    call.t >= start && call.t < start + len
+}
+
+/// The matched call-seconds a window replays: whole `dur_s` of the calls
+/// starting in it, not clipped.
 pub fn window_load(calls: &[Call], start: f64, len: f64) -> f64 {
     calls
         .iter()
-        .filter(|c| c.matched())
-        .map(|c| ((c.t + c.dur_s).min(start + len) - c.t.max(start)).max(0.0))
+        .filter(|c| c.matched() && in_window(c, start, len))
+        .map(|c| c.dur_s)
         .sum()
 }
 
-/// The earliest start of the `len`-second window with the most matched
-/// call-seconds. The load is piecewise linear in the start, so its maximum
-/// is at a breakpoint: a call's start, or where a call's end meets the
-/// window's end.
+/// The earliest call start that begins a `len`-second window with the most
+/// matched call-seconds. Some best window starts at a call: sliding any
+/// window right until its first call sits on its start loses nothing.
 pub fn busiest_start(calls: &[Call], len: f64) -> f64 {
     let mut best = (0.0, window_load(calls, 0.0, len));
     for c in calls.iter().filter(|c| c.matched()) {
-        for s in [c.t, (c.t + c.dur_s - len).max(0.0)] {
-            let v = window_load(calls, s, len);
-            if v > best.1 || (v == best.1 && s < best.0) {
-                best = (s, v);
-            }
+        let v = window_load(calls, c.t, len);
+        if v > best.1 || (v == best.1 && c.t < best.0) {
+            best = (c.t, v);
         }
     }
     best.0
@@ -126,13 +132,27 @@ pub fn role_cap(role: &str) -> u32 {
     }
 }
 
-/// The CPU-seconds a synthetic call burns: the rule's slots busy for
-/// `dur_s` (one thread for `unmatched-heavy`), compressed by `speed`. The
-/// work is fixed per call and split over however many threads the mode
-/// allows, so contention or a smaller cap stretches the wall time as it
-/// would for a real build.
-pub fn work_s(call: &Call, rule_slots: u32, speed: f64) -> f64 {
-    let threads = if call.matched() { rule_slots } else { 1 };
+/// The threads a synthetic call burns. `unmatched-heavy` never reaches
+/// muzzle: one thread in both modes. Under muzzle a matched call burns
+/// its claim (`None`: the burner reads `CARGO_BUILD_JOBS`, which `muzzle
+/// run` sets from the claim, D14). In mode none it burns the rule's slots
+/// capped at the C3 role cap: the trace's `dur_s` was measured under those
+/// caps, so an uncontended call takes about `dur_s` in both modes
+/// (bench_none_work_model).
+pub fn synthetic_threads(call: &Call, mode: BenchMode, rule_slots: u32) -> Option<u32> {
+    match (call.matched(), mode) {
+        (false, _) => Some(1),
+        (true, BenchMode::Muzzle) => None,
+        (true, BenchMode::None) => Some(rule_slots.min(role_cap(&call.role))),
+    }
+}
+
+/// The CPU-seconds a synthetic call burns: its threads busy for `dur_s`,
+/// compressed by `speed`, with the claim taken as the rule's slots. The
+/// work is fixed per call, so contention or a claim cut to the budget
+/// stretches the wall time as it would for a real build.
+pub fn work_s(call: &Call, mode: BenchMode, rule_slots: u32, speed: f64) -> f64 {
+    let threads = synthetic_threads(call, mode, rule_slots).unwrap_or(rule_slots);
     f64::from(threads) * call.dur_s / speed
 }
 
@@ -213,31 +233,29 @@ struct Plan {
 }
 
 impl Plan {
+    fn rule_slots(&self, call: &Call) -> u32 {
+        self.config.rule(&call.rule).map_or(1, |r| r.slots)
+    }
+
     fn command(&self, i: usize, call: &Call) -> anyhow::Result<(Command, Option<PathBuf>)> {
-        let rule_slots = self.config.rule(&call.rule).map_or(1, |r| r.slots);
-        let burn = |threads: Option<u32>| {
-            let mut c = vec![
-                self.exe.to_string_lossy().into_owned(),
-                "bench".into(),
-                "burn".into(),
-                "--cpu-s".into(),
-                format!("{}", work_s(call, rule_slots, self.speed)),
-            ];
-            if let Some(t) = threads {
-                c.extend(["--threads".into(), t.to_string()]);
+        let rule_slots = self.rule_slots(call);
+        let argv = match &self.real {
+            Some((real, _)) if call.matched() => {
+                vec!["bash".into(), "-c".into(), real.rules[&call.rule].clone()]
             }
-            c
-        };
-        // Unclaimed commands never reach muzzle: one thread, in both modes.
-        let argv = if !call.matched() {
-            burn(Some(1))
-        } else if let Some((real, _)) = &self.real {
-            vec!["bash".into(), "-c".into(), real.rules[&call.rule].clone()]
-        } else {
-            // The burner reads its threads from CARGO_BUILD_JOBS, which
-            // `muzzle run` sets from the claim (D14) and mode none sets
-            // from the role cap.
-            burn(None)
+            _ => {
+                let mut c = vec![
+                    self.exe.to_string_lossy().into_owned(),
+                    "bench".into(),
+                    "burn".into(),
+                    "--cpu-s".into(),
+                    format!("{}", work_s(call, self.mode, rule_slots, self.speed)),
+                ];
+                if let Some(t) = synthetic_threads(call, self.mode, rule_slots) {
+                    c.extend(["--threads".into(), t.to_string()]);
+                }
+                c
+            }
         };
         let mut report = None;
         let mut cmd = if call.matched() && self.mode == BenchMode::Muzzle {
@@ -264,7 +282,11 @@ impl Plan {
                 .env("MAKEFLAGS", format!("-j{n}"));
         }
         let cwd = match &self.real {
-            Some((_, dir)) => dir.join(&call.agent),
+            Some((_, dir)) => {
+                let wt = dir.join(&call.agent);
+                own_target_dir(&mut cmd, &wt);
+                wt
+            }
             None => self.out.clone(),
         };
         cmd.current_dir(cwd)
@@ -295,10 +317,14 @@ impl Plan {
         let end = t0.elapsed().as_secs_f64();
         let mut o = Outcome {
             matched: call.matched(),
-            slots: if self.mode == BenchMode::None {
-                role_cap(&call.role)
-            } else {
-                self.config.rule(&call.rule).map_or(1, |r| r.slots)
+            slots: match (self.mode, &self.real) {
+                (BenchMode::Muzzle, _) => self.rule_slots(call),
+                // Real commands get the role cap through the env above.
+                (BenchMode::None, Some(_)) => role_cap(&call.role),
+                (BenchMode::None, None) => {
+                    synthetic_threads(call, self.mode, self.rule_slots(call))
+                        .unwrap_or_else(|| role_cap(&call.role))
+                }
             },
             start,
             admitted: start,
@@ -331,13 +357,25 @@ impl Plan {
     }
 }
 
+/// Spec §Benchmark runner: each replayed agent has its own target
+/// directory, in setup and replay alike. An inherited `CARGO_TARGET_DIR`
+/// would point every agent at one shared dir, contending on cargo's lock
+/// and sharing the cache the pre-build equalises (bench_real_target_dir).
+fn own_target_dir(cmd: &mut Command, worktree: &Path) {
+    let target = worktree.join("target");
+    cmd.env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_BUILD_TARGET_DIR", &target);
+}
+
 /// Set up tier 2's per-agent worktrees and pre-build each once.
 fn prepare_real(real: &Real, agents: &BTreeSet<&str>) -> anyhow::Result<PathBuf> {
     let repo = expand(&real.repo);
     let dir = expand(&real.workdir);
     std::fs::create_dir_all(&dir)?;
     let sh = |cwd: &Path, script: &str| -> anyhow::Result<()> {
-        let st = Command::new("bash")
+        let mut c = Command::new("bash");
+        own_target_dir(&mut c, cwd);
+        let st = c
             .arg("-c")
             .arg(script)
             .current_dir(cwd)
@@ -398,7 +436,7 @@ pub fn run_main(args: &BenchRunArgs) -> anyhow::Result<ExitCode> {
             let s = busiest_start(&all, len);
             let mut kept: Vec<Call> = all
                 .iter()
-                .filter(|c| c.t >= s && c.t < s + len)
+                .filter(|c| in_window(c, s, len))
                 .cloned()
                 .collect();
             kept.iter_mut().for_each(|c| c.t -= s);
@@ -782,7 +820,27 @@ mod tests {
         ];
         let s = busiest_start(&calls, 600.0);
         assert_eq!(window_load(&calls, s, 600.0), 600.0);
-        assert_eq!(s, 800.0, "earliest of the tied starts");
+        assert_eq!(s, 1000.0, "the earliest call start of the tied windows");
+    }
+
+    /// bench_window_straddle: a call that started before the window is
+    /// not replayed, so it must not count towards choosing the window.
+    #[test]
+    fn busiest_window_is_scored_by_the_calls_it_replays() {
+        let calls = [call(0.0, 1000.0, "gate"), call(900.0, 100.0, "gate")];
+        let replayed = |s: f64| -> f64 {
+            calls
+                .iter()
+                .filter(|c| in_window(c, s, 600.0))
+                .map(|c| c.dur_s)
+                .sum()
+        };
+        let s = busiest_start(&calls, 600.0);
+        // Clipped scoring picked 400 (700 call-seconds, 600 of them from
+        // the t = 0 call) and then replayed 100.
+        assert_eq!(s, 0.0);
+        assert_eq!(window_load(&calls, s, 600.0), replayed(s));
+        assert_eq!(replayed(s), 1000.0);
     }
 
     #[test]
@@ -812,10 +870,22 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_work_is_slots_times_duration_over_speed() {
-        assert_eq!(work_s(&call(0.0, 10.0, "gate"), 6, 2.0), 30.0);
-        // unmatched-heavy burns one thread whatever the slots.
-        assert_eq!(work_s(&call(0.0, 10.0, UNMATCHED), 6, 2.0), 5.0);
+    fn synthetic_work_is_threads_times_duration_over_speed() {
+        let gate = call(0.0, 10.0, "gate"); // a worker: cap 4
+        let un = call(0.0, 10.0, UNMATCHED);
+        // Muzzle: the claim (the burner reads it from CARGO_BUILD_JOBS).
+        assert_eq!(synthetic_threads(&gate, BenchMode::Muzzle, 6), None);
+        assert_eq!(work_s(&gate, BenchMode::Muzzle, 6, 2.0), 30.0);
+        // None: the rule's slots capped at the role cap, so dur_s holds.
+        assert_eq!(synthetic_threads(&gate, BenchMode::None, 6), Some(4));
+        assert_eq!(work_s(&gate, BenchMode::None, 6, 2.0), 20.0);
+        assert_eq!(synthetic_threads(&gate, BenchMode::None, 3), Some(3));
+        assert_eq!(work_s(&gate, BenchMode::None, 3, 2.0), 15.0);
+        // unmatched-heavy burns one explicit thread whatever the slots.
+        for mode in [BenchMode::None, BenchMode::Muzzle] {
+            assert_eq!(synthetic_threads(&un, mode, 6), Some(1));
+            assert_eq!(work_s(&un, mode, 6, 2.0), 5.0);
+        }
     }
 
     #[test]
