@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Pre-commit hook (D40): every staged file under bench/traces/ passes
-# check-trace, and no private sidecar is ever committed. Install from the
+# check-trace, no private sidecar is ever committed, nothing else under
+# bench/ is generated data (*.json, *.jsonl, .gitattributes, *.private.*),
+# and allowed-labels.txt, comments included, carries no identifier. Install from the
 # repo root with
 #   ln -s ../../bench/pre-commit "$(git rev-parse --git-common-dir)/hooks/pre-commit"
 # It checks the staged blobs, not the working tree, so a fix that isn't
@@ -59,6 +61,10 @@ while IFS= read -r -d '' meta && IFS= read -r -d '' f; do
 	bench/allowed-labels.txt)
 		labels_changed=1
 		;;
+	bench/*)
+		# Not echoed: the name may be the leak (D40).
+		"$root/bench/check-trace" --bench-paths -- "${f#bench/}" || status=1
+		;;
 	esac
 done < <(git diff --cached --raw -z --diff-filter=ACMRT)
 
@@ -67,6 +73,7 @@ done < <(git diff --cached --raw -z --diff-filter=ACMRT)
 if [ $labels_changed = 1 ]; then
 	tmp=$(mktemp)
 	git show :bench/allowed-labels.txt >"$tmp"
+	"$root/bench/check-trace" --labels "$tmp" --labels-only || status=1
 	# `ls-files -s -z` gives "MODE SHA STAGE" TAB PATH NUL.
 	while IFS= read -r -d '' rec; do
 		check "${rec%% *}" "${rec#*	}" "$tmp"

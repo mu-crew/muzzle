@@ -7,7 +7,7 @@ Benchmark traces and the tools that make and check them (spec D36–D40,
 | --- | --- |
 | `from-museum` | builds `traces/<date>.jsonl` from `museum-search calls --json` |
 | `check-trace` | validates traces; CI and the pre-commit hook run it |
-| `pre-commit` | git hook: checks anything staged under `traces/`, refuses private sidecars |
+| `pre-commit` | git hook: checks anything staged under `traces/` and the labels, refuses private sidecars and data files elsewhere |
 | `allowed-labels.txt` | the rule and kept-project labels a trace may carry |
 | `traces/` | committed traces (linuxpc only) |
 | `real.toml` | tier-2 commands per rule label; local, never committed |
@@ -56,10 +56,25 @@ checks every file under `traces/`, recursively. Errors name the line, field
 and kind, never the value.
 
 Git publishes file names too, so every path under `traces/` must be
-`YYYY-MM-DD(-[a-z0-9]{1,16})?.jsonl` (a real date; a suffix such as
-`-tier2`, not your user name) or the top-level `.gitkeep`, with no
-subdirectories. CI mode, the hook (`check-trace --paths`) and
-`from-museum --out` all refuse any other name, and the error never echoes it.
+`YYYY-MM-DD.jsonl` or `YYYY-MM-DD-<n>.jsonl` (a real date, n from 1 to 99;
+no free-text suffix) or the top-level `.gitkeep`, with no subdirectories.
+CI mode, the hook (`check-trace --paths`) and `from-museum --out` all refuse
+any other name, and the error never echoes it.
+
+Elsewhere under `bench/`, CI mode and the hook refuse any `*.json`,
+`*.jsonl` or `.gitattributes`, and any name containing `.private.`. They
+also run the email, home-dir, token and hostname patterns over every line of
+`allowed-labels.txt`, comments included, without echoing the match.
+
+## Threat model
+
+The checks guard generated data: traces, and anything shaped like one, can
+never carry command text, paths, names or other hosts (D36–D40), because
+they are built by a tool from private sources and too large to read. Prose
+written by a person (this README, `allowed-labels.txt` comments, notes,
+scripts) is reviewed like any code and is not scanned beyond the labels
+file. A `project` line in `allowed-labels.txt` is published on review, by
+design (D39).
 
 Tests: `tests/bench_tools.rs` (run by `cargo test`) drives the scripts and
 `bench/test_tools.py`.

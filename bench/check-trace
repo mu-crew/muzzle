@@ -7,18 +7,24 @@
 With no TRACE, checks every file under bench/traces/, recursively. `-` reads
 stdin (the pre-commit hook pipes the staged blob). `--paths REL ...` checks
 only that each path, relative to bench/traces/, may be published there (the
-hook runs it on every staged path).
+hook runs it on every staged path); `--bench-paths REL ...` does the same
+for paths relative to bench/ outside traces/.
 
 Git publishes file names as well as contents, so every path under
-bench/traces/ must be `YYYY-MM-DD(-[a-z0-9]{1,16})?.jsonl` or the top-level
-`.gitkeep`, with no subdirectories; a suffix holding the user name is
-refused too. A refused path is never echoed: it may be the leak itself. Exit 0 when every trace passes, 1
-otherwise. Errors name the line, the field and the kind of problem, never
+bench/traces/ must be `YYYY-MM-DD.jsonl`, `YYYY-MM-DD-<n>.jsonl` (n 1-99) or
+the top-level `.gitkeep`, with no subdirectories: no free text in a name.
+Elsewhere under bench/, generated data has no place, so no-argument mode
+also refuses any `*.json`, `*.jsonl` or `.gitattributes`, and any name
+containing `.private.` (the hook does the same for staged paths). A refused
+path is never echoed: it may be the leak itself. Exit 0 when every check
+passes, 1 otherwise. Errors name the line, the field and the kind of problem, never
 the offending value, so a leaked token doesn't land in a CI log.
 
 Every string must come from a label list: the fixed ones below, or the
 `rule NAME` / `project NAME` lines of bench/allowed-labels.txt, so adding a
-publishable label is a reviewed commit. The leak patterns run first, over
+publishable label is a reviewed commit. That file is published whole, so the
+email, home-dir, token and hostname patterns run over every line of it,
+comments included (`--labels-only` checks just that, for the hook). The leak patterns run first, over
 every key and string, so a bad trace says *why* it is bad.
 
 The published file is the raw text, so the checks must see exactly what is
@@ -57,10 +63,11 @@ DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # What a label in allowed-labels.txt may look like: short, lowercase, no
 # separators that could carry a path or a host.
 LABEL = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
-# The only publishable names under bench/traces/ (D40): too narrow for an
-# email, a token or a host (no `.`, `@` or `_`, at most 16 suffix chars).
-TRACE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})(?:-([a-z0-9]{1,16}))?\.jsonl")
-NAME_RULE = "YYYY-MM-DD(-[a-z0-9]{1,16})?.jsonl"
+# The only publishable names under bench/traces/ (D40): a date and an
+# optional counter. A free-text suffix, however short, can spell a name or
+# an alias (`-jdoe`), and the user-name check is vacuous in CI.
+TRACE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})(?:-[1-9][0-9]?)?\.jsonl")
+NAME_RULE = "YYYY-MM-DD.jsonl or YYYY-MM-DD-<n>.jsonl (n 1-99)"
 # Number bounds: generous for any real machine and day, too tight to smuggle
 # text (a 33-byte name as an integer is ~10^79).
 MAX_CORES = 1024
@@ -86,6 +93,22 @@ LEAKS = [
 ]
 
 
+# The leak kinds run over allowed-labels.txt lines. Not "path": the file's
+# prose may say `a/b`. Not the user name: CI's user is "runner", which the
+# file's own comment names.
+LABEL_LEAKS = [(k, p) for k, p in LEAKS if k != "path"]
+# Words of a labels line, so the anchored patterns (`^~`, `\.local$`) apply.
+WORD_SPLIT = re.compile(r"[\s`'\"(),;<>]+")
+
+
+def labels_line_leak(line: str) -> str | None:
+    for word in WORD_SPLIT.split(line):
+        for kind, pattern in LABEL_LEAKS:
+            if word and pattern.search(word):
+                return kind
+    return None
+
+
 def load_labels(path: Path) -> tuple[set[str], set[str], list[str]]:
     """(rules, projects, errors) from an allowed-labels file."""
     rules: set[str] = set()
@@ -96,6 +119,11 @@ def load_labels(path: Path) -> tuple[set[str], set[str], list[str]]:
     except OSError as e:
         return rules, projects, [f"{path}: cannot read labels: {e.strerror}"]
     for n, line in enumerate(lines, 1):
+        # The whole line, comments included: git publishes them too (D40).
+        kind = labels_line_leak(line)
+        if kind:
+            errors.append(f"{path}:{n}: {kind} in the labels file; value withheld (D40)")
+            continue
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
@@ -130,7 +158,7 @@ def trace_file_ok(name: str) -> bool:
         date.fromisoformat(m[1])
     except ValueError:
         return False
-    return not (m[2] and leak(m[2], user_names()))
+    return True
 
 
 def trace_path_ok(rel: str) -> bool:
@@ -142,6 +170,24 @@ def bad_paths_error(n: int) -> str:
     return (
         f"bench/traces/ has {n} path(s) not named {NAME_RULE} or the top-level "
         ".gitkeep (no subdirectories); names withheld (D40)"
+    )
+
+
+def bench_file_ok(rel: str) -> bool:
+    """Whether REL, relative to bench/ and outside traces/, may be committed.
+
+    Generated data (JSON, sidecars) and git attributes, which can carry
+    anything, have no place there; prose is reviewed like code (D40)."""
+    name = rel.rsplit("/", 1)[-1]
+    return not (
+        name.endswith((".json", ".jsonl")) or name == ".gitattributes" or ".private." in name
+    )
+
+
+def bad_bench_files_error(n: int) -> str:
+    return (
+        f"bench/ has {n} file(s) outside traces/ that may not be published "
+        "(*.json, *.jsonl, .gitattributes, *.private.*); names withheld (D40)"
     )
 
 
@@ -317,13 +363,24 @@ def main(argv: list[str]) -> int:
     p.add_argument("--labels", type=Path, default=BENCH / "allowed-labels.txt")
     p.add_argument("--name", help="the name to report for stdin")
     p.add_argument("--paths", action="store_true", help="check TRACES as paths under bench/traces/ only")
+    p.add_argument("--bench-paths", action="store_true", help="check TRACES as paths under bench/, outside traces/")
+    p.add_argument("--labels-only", action="store_true", help="check only the labels file")
     ns = p.parse_args(argv)
     if ns.paths:
         bad = sum(not trace_path_ok(t) for t in ns.traces)
         if bad:
             print(f"check-trace: {bad_paths_error(bad)}", file=sys.stderr)
         return 1 if bad else 0
+    if ns.bench_paths:
+        bad = sum(not bench_file_ok(t) for t in ns.traces)
+        if bad:
+            print(f"check-trace: {bad_bench_files_error(bad)}", file=sys.stderr)
+        return 1 if bad else 0
     rules, projects, errors = load_labels(ns.labels)
+    if ns.labels_only:
+        for e in errors:
+            print(f"check-trace: {e}", file=sys.stderr)
+        return 1 if errors else 0
     traces = ns.traces
     if not traces:
         # CI's mode: every path under traces/, so a nested, misnamed or
@@ -346,6 +403,13 @@ def main(argv: list[str]) -> int:
                 errors.append(f"{f}: not a regular file")
         if bad:
             errors.append(bad_paths_error(bad))
+        others = sum(
+            not bench_file_ok(f.relative_to(BENCH).as_posix())
+            for f in BENCH.rglob("*")
+            if root not in f.parents and f != root and not f.is_dir()
+        )
+        if others:
+            errors.append(bad_bench_files_error(others))
         if links:
             errors.append(
                 f"bench/traces/ has {links} symlink(s); git would publish the link "

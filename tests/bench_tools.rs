@@ -177,7 +177,7 @@ fn default_mode_checks_traces_and_refuses_other_paths() {
     let bad = fixture("bad-path.jsonl");
     let out = check_default(&[
         ("2026-10-08.jsonl", &good),
-        ("2026-10-08-tier2.jsonl", &good),
+        ("2026-10-08-1.jsonl", &good),
         (".gitkeep", &good),
     ]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -197,6 +197,8 @@ fn default_mode_checks_traces_and_refuses_other_paths() {
         "2026/2026-10-08.jsonl",
         "2026-13-08.jsonl",
         "2026-10-08-Tier2.jsonl",
+        "2026-10-08-tier2.jsonl",
+        "2026-10-08-100.jsonl",
         "sub/.gitkeep",
     ] {
         let out = check_default(&[("2026-10-08.jsonl", &good), (name, &good)]);
@@ -581,7 +583,7 @@ fn pre_commit_refuses_any_path_under_traces_not_named_as_a_trace() {
 fn pre_commit_allows_dated_traces_and_the_top_level_gitkeep() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = hook_repo(tmp.path());
-    for name in ["2026-10-08.jsonl", "2026-10-21-tier2.jsonl"] {
+    for name in ["2026-10-08.jsonl", "2026-10-21-2.jsonl"] {
         fs::copy(fixture("good.jsonl"), repo.join("bench/traces").join(name)).unwrap();
     }
     fs::write(repo.join("bench/traces/.gitkeep"), "").unwrap();
@@ -754,4 +756,147 @@ fn pre_commit_checks_the_destination_of_a_rename() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(stderr(&out).contains("names withheld"), "{}", stderr(&out));
     assert_name_withheld(&stderr(&out));
+}
+
+/// Fake identifiers the trace_leak_refute repros smuggled outside a trace.
+const LEAKY_PROSE: &str = "owner: jane.doe@example.com host: jdoe-laptop.corp.example /home/jdoe\n";
+
+/// Repro 1: a data file or git attributes elsewhere under bench/ is refused
+/// by the hook and CI mode, on its name alone and without echoing it.
+#[test]
+fn data_files_outside_traces_are_refused() {
+    for name in [
+        "bench/NOTES.jsonl",
+        "bench/sub/x.json",
+        "bench/.gitattributes",
+        "bench/notes.private.txt",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = hook_repo(tmp.path());
+        let path = repo.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, LEAKY_PROSE).unwrap();
+        git(&repo, &["add", "."]);
+        let out = hook(&repo);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("names withheld"),
+            "{name}: {}",
+            stderr(&out)
+        );
+        assert_name_withheld(&stderr(&out));
+
+        let out = Command::new(repo.join("bench/check-trace"))
+            .env("HOME", tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("1 file(s) outside traces/"),
+            "{name}: {}",
+            stderr(&out)
+        );
+        assert_name_withheld(&stderr(&out));
+    }
+}
+
+/// Human-written prose under bench/ is reviewed like code, not scanned
+/// (bench/README.md "Threat model"): the hook and CI mode pass it.
+#[test]
+fn prose_outside_traces_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = hook_repo(tmp.path());
+    fs::write(repo.join("bench/README.md"), LEAKY_PROSE).unwrap();
+    fs::write(repo.join("bench/NOTES.txt"), "see the spec, D40\n").unwrap();
+    git(&repo, &["add", "."]);
+    let out = hook(&repo);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let out = Command::new(repo.join("bench/check-trace"))
+        .env("HOME", tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+/// Repro 2: a comment in allowed-labels.txt is published too, so the hook
+/// and CI mode scan it, and never echo the match.
+#[test]
+fn identifiers_in_label_comments_are_refused() {
+    let token = format!("ghp_{}", "x".repeat(36));
+    for comment in [
+        "# contact jane.doe@example.com".to_string(),
+        "# see /home/jdoe".into(),
+        "# host otherhost.example".into(),
+        format!("# {token}"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = hook_repo(tmp.path());
+        let labels = repo.join("bench/allowed-labels.txt");
+        let mut text = fs::read_to_string(&labels).unwrap();
+        text.push_str(&comment);
+        text.push('\n');
+        fs::write(&labels, text).unwrap();
+        git(&repo, &["add", "."]);
+        let out = hook(&repo);
+        assert_eq!(out.status.code(), Some(1), "{comment}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("in the labels file"), "{comment}: {err}");
+        assert_name_withheld(&err);
+        assert!(!err.contains("jdoe"), "{comment}: {err}");
+
+        let out = Command::new(repo.join("bench/check-trace"))
+            .env("HOME", tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{comment}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("in the labels file"), "{comment}: {err}");
+        assert_name_withheld(&err);
+        assert!(!err.contains("jdoe"), "{comment}: {err}");
+    }
+}
+
+/// Repro 3: a name or alias as a trace filename suffix. Only a counter may
+/// follow the date, so the hook, CI mode and from-museum --out refuse it
+/// whoever the local user is.
+#[test]
+fn a_free_text_trace_suffix_is_refused_everywhere() {
+    let good = fixture("good.jsonl");
+    for name in ["2026-01-01-jdoe.jsonl", "2026-01-01-janedoe.jsonl"] {
+        let out = check_default(&[(name, &good)]);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("doe"), "{}", stderr(&out));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = hook_repo(tmp.path());
+        fs::copy(&good, repo.join("bench/traces").join(name)).unwrap();
+        git(&repo, &["add", "."]);
+        let out = hook(&repo);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("doe"), "{}", stderr(&out));
+
+        let out_path = tmp.path().join("traces").join(name);
+        let calls = fixture("museum-calls.json");
+        let out = script(
+            tmp.path(),
+            "from-museum",
+            &[
+                "--date",
+                "2026-10-21",
+                "--calls",
+                calls.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--muzzle",
+                env!("CARGO_BIN_EXE_muzzle"),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("--out must be named"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!out_path.exists());
+    }
 }

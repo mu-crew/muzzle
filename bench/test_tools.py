@@ -108,7 +108,7 @@ class TraceNames(unittest.TestCase):
     """D40: git publishes the name, so only dated names are allowed."""
 
     def test_allowed(self):
-        for rel in [".gitkeep", "2026-10-08.jsonl", "2026-10-08-tier2.jsonl", "2026-10-08-" + "a" * 16 + ".jsonl"]:
+        for rel in [".gitkeep", "2026-10-08.jsonl", "2026-10-08-1.jsonl", "2026-10-08-99.jsonl"]:
             with self.subTest(rel=rel):
                 self.assertTrue(ct.trace_path_ok(rel))
 
@@ -121,7 +121,11 @@ class TraceNames(unittest.TestCase):
             "2026-10-08.json",
             "2026-02-30.jsonl",
             "2026-10-08-.jsonl",
-            "2026-10-08-" + "a" * 17 + ".jsonl",
+            "2026-10-08-0.jsonl",
+            "2026-10-08-01.jsonl",
+            "2026-10-08-100.jsonl",
+            "2026-10-08-tier2.jsonl",
+            "2026-10-08-jdoe.jsonl",
             "2026-10-08-a_b.jsonl",
             "2026-10-08.jsonl.bak",
             "x/../2026-10-08.jsonl",
@@ -129,14 +133,40 @@ class TraceNames(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertFalse(ct.trace_path_ok(rel))
 
-    def test_a_suffix_naming_the_user_is_refused(self):
-        real = ct.user_names
-        ct.user_names = lambda: {"someone"}
-        try:
-            self.assertFalse(ct.trace_file_ok("2026-10-08-someone.jsonl"))
-            self.assertTrue(ct.trace_file_ok("2026-10-08-tier2.jsonl"))
-        finally:
-            ct.user_names = real
+
+
+class BenchFiles(unittest.TestCase):
+    """D40: outside traces/, bench/ holds no generated data."""
+
+    def test_allowed(self):
+        for rel in ["README.md", "NOTES.txt", "check-trace", "allowed-labels.txt", "docs/x.md"]:
+            with self.subTest(rel=rel):
+                self.assertTrue(ct.bench_file_ok(rel))
+
+    def test_refused(self):
+        for rel in ["x.json", "x.jsonl", "sub/y.jsonl", ".gitattributes", "sub/.gitattributes",
+                    "x.private.txt", "sub/x.private.md"]:  # fmt: skip
+            with self.subTest(rel=rel):
+                self.assertFalse(ct.bench_file_ok(rel))
+
+
+class LabelsLines(unittest.TestCase):
+    def test_leaks_in_comments(self):
+        for line, kind in [
+            ("# contact jane.doe@example.com", "email"),
+            ("# see /home/jdoe", "home dir"),
+            ("# ~/notes", "home dir"),
+            ("# ghp_" + "A" * 30, "token"),
+            ("# on jdoe-laptop.corp.example", "hostname"),
+            ("# on jdoe-laptop.local", "hostname"),
+        ]:
+            with self.subTest(line=line):
+                self.assertEqual(ct.labels_line_leak(line), kind)
+
+    def test_committed_prose_is_clean(self):
+        for line in (ct.BENCH / "allowed-labels.txt").read_text().splitlines():
+            with self.subTest(line=line):
+                self.assertIsNone(ct.labels_line_leak(line))
 
 
 if __name__ == "__main__":
