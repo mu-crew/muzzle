@@ -429,14 +429,15 @@ fn nested_run_through_ancestry_starts_at_once() {
     assert_eq!(env.runs().len(), 1, "nested runs are not logged");
 }
 
-/// The inner muzzle is started by a double fork plus `setsid`, so by the
+/// The inner muzzle is started by a double fork plus setsid(2), so by the
 /// time it looks, its parent chain is init (or a subreaper) and its group
 /// is its own: only `MUZZLE_HOLD` can tell it is nested.
 fn detached_inner(env: &Env, hold: &str) -> String {
     let me = env!("CARGO_BIN_EXE_muzzle");
     let mark = env.file("inner-ran");
     format!(
-        "{hold} (setsid sh -c 'sleep 0.3; exec {me} run --slots 4 --timeout 2 -- touch {m}' &); \
+        // macOS has no setsid(1); perl's POSIX::setsid is on both platforms.
+        "{hold} (perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' sh -c 'sleep 0.3; exec {me} run --slots 4 --timeout 2 -- touch {m}' &); \
          for i in $(seq 40); do [ -e {m} ] && exit 0; sleep 0.1; done; exit 9",
         m = mark.display()
     )
