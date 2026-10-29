@@ -61,7 +61,10 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
     // Pruning: a holder goes once its muzzle (or keeper) is dead *and* its
     // group is empty. A dead muzzle with a live group keeps its slots: the
     // job is still using the machine (D16).
-    let budget = state.budget.map(|b| b.budget);
+    // D7 gives cores − reserve, which is 0 on a 2-core host or a small
+    // container (D17a). Floor it once here so `cap` and `free` agree and a
+    // job still runs alone (D8) instead of every waiter blocking forever.
+    let budget = state.budget.map(|b| b.budget.max(1));
     let (kept, dead): (Vec<Holder>, Vec<Holder>) = std::mem::take(&mut state.holders)
         .into_iter()
         .partition(|h| live.alive(h.pid, h.start) || h.pgid.is_some_and(|g| live.group_alive(g)));
@@ -289,6 +292,23 @@ mod tests {
         assert_eq!(out.state.holders[0].claim.slots, 4);
         assert_eq!(out.state.held(), 4);
         assert_eq!(cap(0, 4), 1);
+    }
+
+    #[test]
+    fn budget_zero_or_one_runs_one_job_at_a_time() {
+        for b in [0, 1] {
+            let mut s = state(b);
+            let first = push(&mut s, 1, Class::Normal, 0);
+            let second = push(&mut s, 3, Class::Normal, 0);
+            let out = run(s, 1);
+            assert_eq!(out.admitted, vec![first], "budget {b}");
+            assert_eq!(out.state.held(), 1, "budget {b}");
+            let mut s = out.state;
+            s.holders.clear();
+            let out = run(s, 2);
+            assert_eq!(out.admitted, vec![second], "budget {b}");
+            assert_eq!(out.state.holders[0].claim.slots, 1, "budget {b}");
+        }
     }
 
     #[test]

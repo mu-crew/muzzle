@@ -288,16 +288,39 @@ impl Store {
 
     fn load(&self) -> anyhow::Result<State> {
         let path = self.state_path();
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
+        // Bytes, not a String: a crash-torn file can hold invalid UTF-8,
+        // which must take the corrupt branch below rather than fail every
+        // update.
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(State::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        if text.trim().is_empty() {
+        if bytes.trim_ascii().is_empty() {
             return Ok(State::default());
         }
-        let state: State = match serde_json::from_str(&text) {
-            Ok(state) => state,
+        // Probe `v` before the full parse: a newer schema may have changed
+        // shape so it fails to parse as ours, and it must be refused, not
+        // treated as corrupt and overwritten, or its live holders' slots are
+        // dropped and an older muzzle admits over budget (D17a: host and
+        // container can run different versions on one state.json).
+        #[derive(Deserialize)]
+        struct Probe {
+            v: u32,
+        }
+        let parsed = serde_json::from_slice::<Probe>(&bytes).and_then(|probe| {
+            if probe.v > SCHEMA_VERSION {
+                Ok(Err(probe.v))
+            } else {
+                serde_json::from_slice::<State>(&bytes).map(Ok)
+            }
+        });
+        let state: State = match parsed {
+            Ok(Ok(state)) => state,
+            Ok(Err(v)) => bail!(
+                "{} has schema v{v}, this muzzle reads up to v{SCHEMA_VERSION}",
+                path.display()
+            ),
             // A file nobody can parse would fail every update and wedge the
             // queue until a human deletes it. It can only come from a host
             // crash (or a hand edit), after which every pid in it is dead,
@@ -317,13 +340,6 @@ impl Store {
                 return Ok(State::default());
             }
         };
-        if state.v > SCHEMA_VERSION {
-            bail!(
-                "{} has schema v{}, this muzzle reads up to v{SCHEMA_VERSION}",
-                path.display(),
-                state.v
-            );
-        }
         Ok(state)
     }
 
@@ -401,9 +417,25 @@ mod tests {
     }
 
     #[test]
+    fn newer_schema_with_an_incompatible_shape_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let newer = r#"{"v":2,"next_ticket":"t-9","holders":[{"ticket":"t-1"}]}"#;
+        fs::write(store.state_path(), newer).unwrap();
+        let err = store
+            .update(1, |s| Ok(s.enqueue(1, 1, None, claim(1), 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("schema v2"), "{err}");
+        assert_eq!(fs::read_to_string(store.state_path()).unwrap(), newer);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2); // state.json + lock
+    }
+
+    #[test]
     fn corrupt_file_is_moved_aside_and_the_queue_starts_over() {
         let zeros = [0u8; 64];
-        for bad in [&zeros[..], br#"{"v":1,"next_tic"#] {
+        let not_utf8 = [0xffu8, 0xfe, 0x00, 0x80, 0xc3];
+        for bad in [&zeros[..], br#"{"v":1,"next_tic"#, &not_utf8[..]] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path()).unwrap();
             fs::write(store.state_path(), bad).unwrap();
