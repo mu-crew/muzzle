@@ -1,7 +1,8 @@
 # Stored `PreToolUse` payloads
 
 `muzzle hook claude|codex` is tested against these payloads
-(`src/rules/hook.rs`, and the CLI tests in `tests/rules.rs`). The harnesses
+(`src/rules/hook.rs`, the CLI tests in `tests/rules.rs`, and the
+snippets in `docs/harnesses/` through `tests/harnesses.rs`). The harnesses
 document the format and may change it, so a release re-checks it against
 the sources below (spec §Integrations, Claude Code and Codex).
 
