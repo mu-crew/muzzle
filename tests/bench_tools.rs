@@ -153,28 +153,72 @@ fn check_default(files: &[(&str, &Path)]) -> Output {
         .unwrap()
 }
 
+/// Path names that would publish an identity through git (D40, the
+/// trace_filename_leak repro): an email, a token and a foreign host's
+/// directory. Obviously fake; the token is built so no scanner flags it.
+fn leaky_names() -> Vec<String> {
+    vec![
+        "jane.doe@example.com.jsonl".into(),
+        format!("ghp_{}.jsonl", "x".repeat(36)),
+        "otherhost.example/.gitkeep".into(),
+    ]
+}
+
+/// What a refused name must never leak into a log.
+fn assert_name_withheld(err: &str) {
+    for part in ["jane", "example", "ghp_", "otherhost"] {
+        assert!(!err.contains(part), "{part} echoed: {err}");
+    }
+}
+
 #[test]
-fn default_mode_checks_nested_traces_and_refuses_other_files() {
+fn default_mode_checks_traces_and_refuses_other_paths() {
     let good = fixture("good.jsonl");
     let bad = fixture("bad-path.jsonl");
-    let out = check_default(&[("a.jsonl", &good), (".gitkeep", &good)]);
+    let out = check_default(&[
+        ("2026-10-08.jsonl", &good),
+        ("2026-10-08-tier2.jsonl", &good),
+        (".gitkeep", &good),
+    ]);
     assert!(out.status.success(), "{}", stderr(&out));
 
-    let out = check_default(&[("a.jsonl", &good), ("2026/x.jsonl", &bad)]);
-    assert_eq!(out.status.code(), Some(1), "nested trace skipped");
+    let out = check_default(&[("2026-10-08.jsonl", &bad)]);
+    assert_eq!(out.status.code(), Some(1), "bad trace passed");
     assert!(
-        stderr(&out).contains("2026/x.jsonl:4: path"),
+        stderr(&out).contains("2026-10-08.jsonl:4: path"),
         "{}",
         stderr(&out)
     );
 
-    let out = check_default(&[("x.json", &good)]);
-    assert_eq!(out.status.code(), Some(1), "non-.jsonl file passed");
-    assert!(
-        stderr(&out).contains("not a .jsonl trace"),
-        "{}",
-        stderr(&out)
-    );
+    // A good trace under a bad name, a nested dir or a misnamed file.
+    for name in [
+        "x.json",
+        "a.jsonl",
+        "2026/2026-10-08.jsonl",
+        "2026-13-08.jsonl",
+        "2026-10-08-Tier2.jsonl",
+        "sub/.gitkeep",
+    ] {
+        let out = check_default(&[("2026-10-08.jsonl", &good), (name, &good)]);
+        assert_eq!(out.status.code(), Some(1), "{name} passed");
+        assert!(
+            stderr(&out).contains("names withheld"),
+            "{name}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn default_mode_refuses_identifying_names_without_echoing_them() {
+    let good = fixture("good.jsonl");
+    for name in leaky_names() {
+        let out = check_default(&[(&name, &good)]);
+        assert_eq!(out.status.code(), Some(1), "{name} passed CI mode");
+        let err = stderr(&out);
+        assert!(err.contains("path(s) not named"), "{name}: {err}");
+        assert_name_withheld(&err);
+    }
 }
 
 #[test]
@@ -343,7 +387,7 @@ fn from_museum_writes_an_allowlisted_trace_and_a_private_sidecar() {
 #[test]
 fn from_museum_refuses_other_hosts() {
     let tmp = tempfile::tempdir().unwrap();
-    let trace = tmp.path().join("t.jsonl");
+    let trace = tmp.path().join("2026-10-21.jsonl");
     let calls = fixture("museum-other-host.json");
     let out = script(
         tmp.path(),
@@ -370,6 +414,40 @@ fn from_museum_refuses_other_hosts() {
     );
     assert!(!trace.exists());
     assert!(!tmp.path().join("muzzleuser/state/muzzle/bench").exists());
+}
+
+#[test]
+fn from_museum_refuses_an_identifying_out_name() {
+    let mut names = leaky_names();
+    names.push("t.jsonl".into());
+    for name in names {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("traces").join(&name);
+        let calls = fixture("museum-calls.json");
+        let out = script(
+            tmp.path(),
+            "from-museum",
+            &[
+                "--date",
+                "2026-10-21",
+                "--calls",
+                calls.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+                "--muzzle",
+                env!("CARGO_BIN_EXE_muzzle"),
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("--out must be named"), "{name}: {err}");
+        assert_name_withheld(&err);
+        assert!(!tmp.path().join("traces").exists(), "{name} written");
+        assert!(
+            !tmp.path().join("muzzleuser/state/muzzle/bench").exists(),
+            "{name}: sidecar written"
+        );
+    }
 }
 
 #[test]
@@ -448,14 +526,14 @@ fn hook(repo: &Path) -> Output {
 fn pre_commit_checks_staged_traces_and_refuses_sidecars() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = hook_repo(tmp.path());
-    let trace = repo.join("bench/traces/d.jsonl");
+    let trace = repo.join("bench/traces/2026-10-08.jsonl");
 
     fs::copy(fixture("bad-path.jsonl"), &trace).unwrap();
-    git(&repo, &["add", "bench/traces/d.jsonl"]);
+    git(&repo, &["add", "bench/traces/2026-10-08.jsonl"]);
     let out = hook(&repo);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("bench/traces/d.jsonl:4: path"),
+        stderr(&out).contains("bench/traces/2026-10-08.jsonl:4: path"),
         "{}",
         stderr(&out)
     );
@@ -463,7 +541,7 @@ fn pre_commit_checks_staged_traces_and_refuses_sidecars() {
     // The staged blob is checked, not the working tree.
     fs::copy(fixture("good.jsonl"), &trace).unwrap();
     assert_eq!(hook(&repo).status.code(), Some(1));
-    git(&repo, &["add", "bench/traces/d.jsonl"]);
+    git(&repo, &["add", "bench/traces/2026-10-08.jsonl"]);
     let out = hook(&repo);
     assert!(out.status.success(), "{}", stderr(&out));
 
@@ -478,27 +556,49 @@ fn pre_commit_checks_staged_traces_and_refuses_sidecars() {
 }
 
 #[test]
-fn pre_commit_treats_any_path_under_traces_as_a_trace() {
-    // A space in the name, a nested dir, and a non-.jsonl name: each
-    // must be checked or refused, not skipped.
-    for name in ["a b.jsonl", "2026/x.jsonl", "x.json"] {
+fn pre_commit_refuses_any_path_under_traces_not_named_as_a_trace() {
+    // A space in the name, a nested dir, a non-.jsonl name and the
+    // identifying ones: each is refused on its name alone, and a refused
+    // name is never echoed.
+    let mut names = leaky_names();
+    names.extend(["a b.jsonl", "2026/2026-10-08.jsonl", "x.json"].map(String::from));
+    for name in names {
         let tmp = tempfile::tempdir().unwrap();
         let repo = hook_repo(tmp.path());
-        let path = repo.join("bench/traces").join(name);
+        let path = repo.join("bench/traces").join(&name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::copy(fixture("bad-path.jsonl"), &path).unwrap();
+        fs::copy(fixture("good.jsonl"), &path).unwrap();
         git(&repo, &["add", "."]);
         let out = hook(&repo);
         assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
-        assert!(stderr(&out).contains(name), "{name}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("names withheld"), "{name}: {err}");
+        assert_name_withheld(&err);
     }
+}
+
+#[test]
+fn pre_commit_allows_dated_traces_and_the_top_level_gitkeep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = hook_repo(tmp.path());
+    for name in ["2026-10-08.jsonl", "2026-10-21-tier2.jsonl"] {
+        fs::copy(fixture("good.jsonl"), repo.join("bench/traces").join(name)).unwrap();
+    }
+    fs::write(repo.join("bench/traces/.gitkeep"), "").unwrap();
+    git(&repo, &["add", "."]);
+    let out = hook(&repo);
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]
 fn pre_commit_rechecks_traces_when_labels_change() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = hook_repo(tmp.path());
-    fs::copy(fixture("good.jsonl"), repo.join("bench/traces/d.jsonl")).unwrap();
+    fs::copy(
+        fixture("good.jsonl"),
+        repo.join("bench/traces/2026-10-08.jsonl"),
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     assert!(hook(&repo).status.success());
     git(
@@ -514,16 +614,19 @@ fn pre_commit_rechecks_traces_when_labels_change() {
         ],
     );
 
-    // Dropping `gate` from the list strands the committed trace's label,
-    // even in a trace whose name has a space.
-    fs::copy(fixture("good.jsonl"), repo.join("bench/traces/a b.jsonl")).unwrap();
+    // Dropping `gate` from the list strands the committed trace's label.
+    fs::copy(
+        fixture("good.jsonl"),
+        repo.join("bench/traces/2026-10-21.jsonl"),
+    )
+    .unwrap();
     git(&repo, &["add", "."]);
     fs::write(repo.join("bench/allowed-labels.txt"), "rule cargo-test\n").unwrap();
     git(&repo, &["add", "bench/allowed-labels.txt"]);
     let out = hook(&repo);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("bench/traces/a b.jsonl:2: free text in 'rule'"),
+        stderr(&out).contains("bench/traces/2026-10-21.jsonl:2: free text in 'rule'"),
         "{}",
         stderr(&out)
     );

@@ -11,18 +11,17 @@ root=$(git rev-parse --show-toplevel)
 status=0
 labels_changed=0
 
-# A trace is anything staged under bench/traces/; check-trace refuses one
-# that isn't .jsonl, so a misnamed or nested file can't slip past.
+# A trace is anything staged under bench/traces/. Git publishes the path
+# too, so check-trace --paths first refuses any that isn't a dated .jsonl
+# name or the top-level .gitkeep, without echoing it: the name may be the
+# leak (D40). Only then is the content checked.
 check() { # check FILE [LABELS]
 	local f=$1
-	case $f in
-	*/.gitkeep | .gitkeep) return 0 ;;
-	esac
-	if [ "${f%.jsonl}" = "$f" ]; then
-		echo "pre-commit: $f: not a .jsonl trace; only traces belong in bench/traces/ (D40)" >&2
+	"$root/bench/check-trace" --paths -- "${f#bench/traces/}" || {
 		status=1
 		return 0
-	fi
+	}
+	[ "$f" = bench/traces/.gitkeep ] && return 0
 	git show ":$f" | "$root/bench/check-trace" ${2:+--labels "$2"} --name "$f" - >/dev/null || status=1
 }
 

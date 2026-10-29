@@ -52,9 +52,14 @@ header counts that don't add up; a duplicate key, or a line that isn't
 its own canonical `json.dumps(row, separators=(",", ":"))`; numbers out of
 bounds (cores 1–1024, ram_gb 1–4096, window_s ≤ 7 days, counts ≤ 10^7,
 `dur_s` ≤ window_s, `t`/`dur_s` at most 3 decimals). With no arguments it
-checks every file under `traces/`, recursively, and fails on any that isn't
-`.jsonl` (`.gitkeep` aside). Errors name the line, field and kind, never
-the value.
+checks every file under `traces/`, recursively. Errors name the line, field
+and kind, never the value.
+
+Git publishes file names too, so every path under `traces/` must be
+`YYYY-MM-DD(-[a-z0-9]{1,16})?.jsonl` (a real date; a suffix such as
+`-tier2`, not your user name) or the top-level `.gitkeep`, with no
+subdirectories. CI mode, the hook (`check-trace --paths`) and
+`from-museum --out` all refuse any other name, and the error never echoes it.
 
 Tests: `tests/bench_tools.rs` (run by `cargo test`) drives the scripts and
 `bench/test_tools.py`.

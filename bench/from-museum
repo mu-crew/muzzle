@@ -324,6 +324,10 @@ def main(argv: list[str]) -> int:
     except ValueError:
         sys.exit("from-museum: --date must be YYYY-MM-DD")
     out_path = ns.out or BENCH / "traces" / f"{ns.date}.jsonl"
+    # The basename is published with the trace and names the sidecar, so it
+    # follows the rule check-trace holds bench/traces/ to; not echoed (D40).
+    if not checker.trace_file_ok(out_path.name):
+        sys.exit(f"from-museum: --out must be named {checker.NAME_RULE}")
     trace = out_path.name.removesuffix(".jsonl")
 
     rows = read_calls(ns)

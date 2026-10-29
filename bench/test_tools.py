@@ -104,5 +104,40 @@ class Leaks(unittest.TestCase):
                 self.assertIsNone(ct.leak(s, {"someone"}))
 
 
+class TraceNames(unittest.TestCase):
+    """D40: git publishes the name, so only dated names are allowed."""
+
+    def test_allowed(self):
+        for rel in [".gitkeep", "2026-10-08.jsonl", "2026-10-08-tier2.jsonl", "2026-10-08-" + "a" * 16 + ".jsonl"]:
+            with self.subTest(rel=rel):
+                self.assertTrue(ct.trace_path_ok(rel))
+
+    def test_refused(self):
+        for rel in [
+            "jane.doe@example.com.jsonl",
+            "ghp_" + "x" * 36 + ".jsonl",
+            "otherhost.example/.gitkeep",
+            "2026/2026-10-08.jsonl",
+            "2026-10-08.json",
+            "2026-02-30.jsonl",
+            "2026-10-08-.jsonl",
+            "2026-10-08-" + "a" * 17 + ".jsonl",
+            "2026-10-08-a_b.jsonl",
+            "2026-10-08.jsonl.bak",
+            "x/../2026-10-08.jsonl",
+        ]:
+            with self.subTest(rel=rel):
+                self.assertFalse(ct.trace_path_ok(rel))
+
+    def test_a_suffix_naming_the_user_is_refused(self):
+        real = ct.user_names
+        ct.user_names = lambda: {"someone"}
+        try:
+            self.assertFalse(ct.trace_file_ok("2026-10-08-someone.jsonl"))
+            self.assertTrue(ct.trace_file_ok("2026-10-08-tier2.jsonl"))
+        finally:
+            ct.user_names = real
+
+
 if __name__ == "__main__":
     unittest.main()
