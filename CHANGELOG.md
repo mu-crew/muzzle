@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 (unreleased)
+## 0.1.1
 
 - Runs record `repo`, the canonical path of the repo's main checkout
   (git or jj; every worktree and workspace maps to the same path), or

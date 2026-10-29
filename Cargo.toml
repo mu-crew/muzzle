@@ -2,7 +2,7 @@
 # `muzzle` may be taken on crates.io; the package takes the `-cli` suffix as
 # mule does. The binary and library keep the short name.
 name = "muzzle-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Per-host admission for heavy commands, with a run log that tunes itself."
 license = "MIT"
