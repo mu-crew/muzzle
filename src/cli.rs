@@ -56,7 +56,7 @@ pub struct RunArgs {
     /// Kill the job after S seconds of running (exit 124).
     #[arg(long, value_name = "S")]
     pub run_timeout: Option<f64>,
-    /// Give up after S seconds queued (exit 3).
+    /// Give up after S seconds queued (exit 75).
     #[arg(long, value_name = "S")]
     pub timeout: Option<f64>,
     /// Write the run's figures as JSON to FILE on exit.

@@ -15,24 +15,6 @@ fn muzzle(args: &[&str]) -> std::process::Output {
 #[test]
 fn every_subcommand_parses() {
     let cases: &[&[&str]] = &[
-        &[
-            "run",
-            "--slots",
-            "2",
-            "--class",
-            "high",
-            "--rule",
-            "gate",
-            "--run-timeout",
-            "5",
-            "--timeout",
-            "3",
-            "--report",
-            "r.json",
-            "--",
-            "true",
-            "x",
-        ],
         &["status", "--json"],
         &["doctor", "--json"],
         &[

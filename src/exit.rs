@@ -5,8 +5,10 @@ use std::process::ExitCode;
 
 /// `--run-timeout` fired.
 pub const RUN_TIMEOUT: u8 = 124;
-/// `--timeout` fired while queued.
-pub const QUEUE_TIMEOUT: u8 = 3;
+/// `--timeout` fired while queued: 75, sysexits' EX_TEMPFAIL ("try again
+/// later"). Not 3: mu 4.2.0 reads exit 3 from a host template as a hand-back
+/// to the human, and mule uses 3 for "no control master".
+pub const QUEUE_TIMEOUT: u8 = 75;
 /// Bad usage or config. clap exits 2 for bad usage on its own.
 pub const USAGE: u8 = 2;
 /// muzzle itself failed.
