@@ -1,0 +1,4 @@
+{
+  "defaultProvider": "anthropic",
+  "packages": ["npm:@mu-crew/mu", "npm:@mu-crew/muzzle"]
+}

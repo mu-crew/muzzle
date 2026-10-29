@@ -1,0 +1,8 @@
+model = "gpt-5"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "muzzle hook codex"
