@@ -11,7 +11,7 @@
 // the call as it is. A throwing tool_call handler blocks the tool in pi, so
 // every path is caught.
 import { execFile } from "node:child_process";
-import { accessSync, constants, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -45,9 +45,30 @@ function isExecutable(file: string): boolean {
 }
 
 /**
+ * A script, not the binary: bin/muzzle from a global `npm i -g` is a node
+ * shim. On a Node without process.execve it runs muzzle as a child, so
+ * muzzle isn't the group leader and pi's group SIGKILL leaks the job and its
+ * slots (D16).
+ */
+function isScript(file: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, "r");
+    const head = Buffer.alloc(2);
+    return readSync(fd, head, 0, 2, 0) === 2 && head.toString("latin1") === "#!";
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
  * The binary from this package's platform dependency first, then `muzzle` on
  * PATH; null when neither exists. The platform binary is used directly,
- * not through bin/muzzle, so a wrapped call doesn't pay for a node start.
+ * not through bin/muzzle, so a wrapped call doesn't pay for a node start
+ * and muzzle leads the bash group (D16). PATH entries that are scripts are
+ * skipped for the same reason.
  */
 export function findMuzzle(opts: FindOptions = {}): string | null {
   const resolve = opts.resolve ?? createRequire(import.meta.url).resolve;
@@ -63,7 +84,7 @@ export function findMuzzle(opts: FindOptions = {}): string | null {
   for (const dir of (opts.path ?? process.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, "muzzle");
-    if (isExecutable(candidate)) return candidate;
+    if (isExecutable(candidate) && !isScript(candidate)) return candidate;
   }
   return null;
 }
@@ -124,8 +145,10 @@ export function createExtension(deps: Deps = {}) {
     let bin: string | null | undefined;
     let reportDir: string | undefined;
     const pending = new Map<string, string>();
+    // A wrap-failure warning is on the footer; the next good wrap clears it.
+    let wrapWarned = false;
 
-    const warn = (ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, text: string) => {
+    const warn = (ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, text: string | undefined) => {
       try {
         ctx.ui.setStatus("muzzle", text);
       } catch {
@@ -146,6 +169,10 @@ export function createExtension(deps: Deps = {}) {
         if (bin === null) return;
         const timeout = typeof input.timeout === "number" ? input.timeout : undefined;
         const wrapped = await wrap(bin, input.command, ctx.cwd, timeout);
+        if (wrapWarned) {
+          wrapWarned = false;
+          warn(ctx, undefined);
+        }
         if (wrapped === null || !wrapped.startsWith("muzzle run ")) return;
         reportDir ??= mkdtempSync(join(deps.tmpRoot ?? tmpdir(), "muzzle-pi-"));
         const report = join(reportDir, reportName(event.toolCallId));
@@ -154,6 +181,7 @@ export function createExtension(deps: Deps = {}) {
         delete input.timeout;
         pending.set(event.toolCallId, report);
       } catch (e) {
+        wrapWarned = true;
         warn(ctx, `muzzle wrap failed, calls run unwrapped: ${e instanceof Error ? e.message : String(e)}`);
       }
     });

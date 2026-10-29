@@ -27,6 +27,20 @@ try {
   process.exit(1);
 }
 
+// D16: muzzle must be the process pi (or a shell) put at the head of the
+// group, or it moves the job to a group of its own and a SIGKILL of the
+// original group leaks the job and its slots. execve replaces node with
+// muzzle in place, keeping the pid and the group. Node >= 22.15 / 23.11.
+if (typeof process.execve === "function") {
+  try {
+    process.execve(binary, [binary, ...process.argv.slice(2)], process.env);
+  } catch {
+    // fall through to spawn, which reports the error
+  }
+}
+
+// Older Node: run muzzle as a child and forward signals. A group SIGKILL
+// still leaks the job here.
 const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
 const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
 for (const signal of signals) {

@@ -2,8 +2,8 @@
 // muzzle binary: `MUZZLE_BIN`, or target/debug/muzzle from `cargo build`.
 // Each test gets a private XDG config and state.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { beforeEach, test } from "node:test";
@@ -209,6 +209,23 @@ test("a failing wrap never blocks: the call runs as it is", async () => {
   assert.match(status.at(-1) ?? "", /muzzle wrap failed/);
 });
 
+test("a good wrap after a failed one clears the footer warning", async () => {
+  writeFileSync(join(home, "config/muzzle/config.toml"), "nonsense = [");
+  const { emit, status } = load();
+  await emit("tool_call", call("a", { command: "fake-gate" }));
+  assert.match(status.at(-1) ?? "", /muzzle wrap failed/);
+  // Config fixed mid-session: the next wrap succeeds.
+  writeFileSync(join(home, "config/muzzle/config.toml"), CONFIG);
+  const input: Record<string, unknown> = { command: "fake-gate" };
+  await emit("tool_call", call("b", input));
+  assert.match(input.command as string, / run --report /);
+  assert.equal(status.at(-1), undefined, JSON.stringify(status));
+  // Nothing more to clear: later calls leave the footer alone.
+  const n = status.length;
+  await emit("tool_call", call("c", { command: "fake-gate" }));
+  assert.equal(status.length, n);
+});
+
 test("a wrap that answers garbage never blocks", async () => {
   const fake = join(home, "garbage-muzzle");
   writeFileSync(fake, "#!/bin/sh\necho not-json\n");
@@ -224,10 +241,9 @@ test("findMuzzle: the package's own platform binary first, then PATH", () => {
   const onPath = join(home, "path");
   mkdirSync(dirname(own), { recursive: true });
   mkdirSync(onPath);
-  for (const f of [own, join(onPath, "muzzle")]) {
-    writeFileSync(f, "#!/bin/sh\n");
-    chmodSync(f, 0o755);
-  }
+  writeFileSync(own, "#!/bin/sh\n");
+  writeFileSync(join(onPath, "muzzle"), "\x7fELF");
+  for (const f of [own, join(onPath, "muzzle")]) chmodSync(f, 0o755);
   const seen: string[] = [];
   const resolveOwn = (id: string) => {
     seen.push(id);
@@ -241,6 +257,14 @@ test("findMuzzle: the package's own platform binary first, then PATH", () => {
   assert.equal(findMuzzle({ resolve: missing, platform: "linux-x64", path: onPath }), join(onPath, "muzzle"));
   assert.equal(findMuzzle({ resolve: resolveOwn, platform: "sunos-x64", path: onPath }), join(onPath, "muzzle"));
   assert.equal(findMuzzle({ resolve: missing, platform: "linux-x64", path: join(home, "none") }), null);
+  // A script shim (bin/muzzle from `npm i -g`) is skipped for the next hit.
+  const shimDir = join(home, "shim");
+  mkdirSync(shimDir);
+  writeFileSync(join(shimDir, "muzzle"), "#!/usr/bin/env node\n");
+  chmodSync(join(shimDir, "muzzle"), 0o755);
+  const both = `${shimDir}:${onPath}`;
+  assert.equal(findMuzzle({ resolve: missing, platform: "linux-x64", path: both }), join(onPath, "muzzle"));
+  assert.equal(findMuzzle({ resolve: missing, platform: "linux-x64", path: shimDir }), null);
   // Not executable is not found.
   chmodSync(join(onPath, "muzzle"), 0o644);
   assert.equal(findMuzzle({ resolve: missing, platform: "linux-x64", path: onPath }), null);
@@ -265,3 +289,68 @@ test("a nested run (inside an outer muzzle run, D17) gets a line without slots",
   assert.match(r.content[0].text, /\n\nmuzzle: nested in an outer claim, ran \d+s$/);
   assert.equal(entries[0].data.slots, null);
 });
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function held(): number {
+  return JSON.parse(execFileSync(BIN, ["status", "--json"], { encoding: "utf8" })).held;
+}
+
+async function until(what: string, ok: () => boolean) {
+  for (let i = 0; i < 100; i++) {
+    if (ok()) return;
+    await sleep(50);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+test(
+  "bin/muzzle execs the binary, so a group SIGKILL leaves no job and no slots (D16)",
+  { skip: typeof (process as any).execve !== "function" && "this Node has no process.execve" },
+  async () => {
+    // An `npm i -g` layout: the shim finds its platform package by require.resolve.
+    const platform = `${process.platform}-${process.arch}`;
+    const modules = join(home, "lib/node_modules/@mu-crew");
+    const shim = join(modules, "muzzle/bin/muzzle");
+    mkdirSync(dirname(shim), { recursive: true });
+    copyFileSync(resolve(here, "../bin/muzzle"), shim);
+    chmodSync(shim, 0o755);
+    mkdirSync(join(modules, `muzzle-${platform}/bin`), { recursive: true });
+    symlinkSync(BIN, join(modules, `muzzle-${platform}/bin/muzzle`));
+
+    const jobPid = join(home, "job.pid");
+    // detached: a new session and group, as pi runs a bash call.
+    const group = spawn(
+      "bash",
+      ["-c", `'${shim}' run --slots 1 -- bash -c 'echo $$ > ${jobPid}; exec sleep 30'`],
+      { detached: true, stdio: "ignore" },
+    );
+    try {
+      await until("the job to start", () => existsSync(jobPid) && readFileSync(jobPid, "utf8").endsWith("\n"));
+      const job = Number(readFileSync(jobPid, "utf8"));
+      assert.equal(held(), 1);
+      process.kill(-group.pid!, "SIGKILL");
+      await until("the job to die", () => !alive(job));
+      await until("the slots to free", () => held() === 0);
+    } finally {
+      // On failure the job leaked into a group of its own: kill both.
+      const job = existsSync(jobPid) ? Number(readFileSync(jobPid, "utf8")) : 0;
+      for (const pgid of [group.pid!, job]) {
+        try {
+          if (pgid) process.kill(-pgid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
+  },
+);
