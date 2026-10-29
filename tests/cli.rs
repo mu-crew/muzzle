@@ -1,7 +1,6 @@
-//! Every subcommand from spec §Interface/CLI parses and, until its unit
-//! lands, exits 125 ("muzzle itself failed"). Landed units drop out of the
-//! list and test themselves (match, wrap, hook: `tests/rules.rs`;
-//! report: `tests/report.rs`; status, doctor: `tests/status_doctor.rs`).
+//! The CLI surface as a whole: every unit has landed and tests itself
+//! (match, wrap, hook: `tests/rules.rs`; report: `tests/report.rs`;
+//! status, doctor: `tests/status_doctor.rs`; bench: `tests/bench.rs`).
 
 use std::process::Command;
 
@@ -13,40 +12,29 @@ fn muzzle(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn every_subcommand_parses() {
-    let cases: &[&[&str]] = &[
-        &[
-            "bench",
-            "run",
-            "t.jsonl",
-            "--mode",
-            "none",
-            "--tier",
-            "synthetic",
-            "--speed",
-            "10",
-            "--window",
-            "busiest:3h",
-            "--out",
-            "out",
-        ],
-        &[
-            "bench",
-            "probe",
-            "--samples",
-            "3",
-            "--interval",
-            "1",
-            "--out",
-            "p.jsonl",
-        ],
+fn every_subcommand_is_implemented() {
+    // `bench run` on a missing trace parses, then fails reading it (125),
+    // which is muzzle failing, not a stub.
+    let args = [
+        "bench",
+        "run",
+        "/nonexistent/t.jsonl",
+        "--mode",
+        "none",
+        "--tier",
+        "synthetic",
+        "--speed",
+        "10",
+        "--window",
+        "busiest:3h",
+        "--out",
+        "/nonexistent/out",
     ];
-    for args in cases {
-        let out = muzzle(args);
-        assert_eq!(out.status.code(), Some(125), "{args:?}: {out:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("not implemented"), "{args:?}: {stderr}");
-    }
+    let out = muzzle(&args);
+    assert_eq!(out.status.code(), Some(125), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not implemented"), "{stderr}");
+    assert!(stderr.contains("reading"), "{stderr}");
 }
 
 #[test]

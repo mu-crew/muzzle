@@ -143,6 +143,9 @@ pub enum BenchCommand {
     Run(BenchRunArgs),
     /// Sample the interactive probe, one JSON line per sample (D35).
     Probe(BenchProbeArgs),
+    /// The synthetic CPU burner `bench run` replays (tier 1).
+    #[command(hide = true)]
+    Burn(BenchBurnArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -177,6 +180,19 @@ pub struct BenchRunArgs {
     pub window: Option<String>,
     #[arg(long, value_name = "DIR")]
     pub out: Option<PathBuf>,
+    /// Tier 2's rule commands; default `bench/real.toml`.
+    #[arg(long, value_name = "FILE")]
+    pub real: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct BenchBurnArgs {
+    /// CPU-seconds to burn, summed over the threads.
+    #[arg(long, value_name = "S")]
+    pub cpu_s: f64,
+    /// Busy threads; default `CARGO_BUILD_JOBS`, else 1.
+    #[arg(long, value_name = "N")]
+    pub threads: Option<u32>,
 }
 
 #[derive(Debug, Args)]

@@ -1,0 +1,18 @@
+# Tier 2 of `muzzle bench run --tier real` (spec D31, §Benchmark runner).
+# Copy to bench/real.toml, which is gitignored: it names your paths.
+#
+# Each replayed agent (a1, a2, …) gets its own worktree of `repo` at
+# `commit`, under `workdir/<agent>`, so each has its own target dir. `setup`
+# runs once in each before the replay, so both modes start equally warm.
+repo = "~/hacking/swayward-wm/swayward"
+commit = "0123abc"
+workdir = "~/.cache/muzzle-bench/worktrees"
+setup = "cargo build --locked --all-targets"
+
+# One command per rule label in the trace, run with `bash -c` in the
+# agent's worktree. `--mode muzzle` wraps it in `muzzle run --rule LABEL`;
+# `--mode none` sets today's role caps (C3). unmatched-heavy calls burn one
+# thread in both tiers; light calls are skipped.
+[rules]
+gate = "contrib/fast-gate"
+cargo-test = "cargo test --locked"

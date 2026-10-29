@@ -10,7 +10,7 @@ Benchmark traces and the tools that make and check them (spec D36–D40,
 | `pre-commit` | git hook: checks anything staged under `traces/` and the labels, refuses private sidecars and data files elsewhere |
 | `allowed-labels.txt` | the rule and kept-project labels a trace may carry |
 | `traces/` | committed traces (linuxpc only) |
-| `real.toml` | tier-2 commands per rule label; local, never committed |
+| `real.toml` | tier-2 commands per rule label; local, never committed (copy `real.toml.example`) |
 
 Install the hook once per clone:
 
@@ -78,3 +78,41 @@ design (D39).
 
 Tests: `tests/bench_tools.rs` (run by `cargo test`) drives the scripts and
 `bench/test_tools.py`.
+
+## Replaying a trace
+
+```sh
+muzzle bench run bench/traces/2026-10-21.jsonl --mode none   --tier synthetic --speed 10 --out /tmp/b-none
+muzzle bench run bench/traces/2026-10-21.jsonl --mode muzzle --tier synthetic --speed 10 --out /tmp/b-muzzle
+```
+
+- `--mode none` is today's practice (C3): every call starts at its offset
+  with the role cap as `CARGO_BUILD_JOBS` (worker 4, orchestrator 6, others
+  2). `--mode muzzle` runs each matched call through `muzzle run --rule`
+  with a private state dir under `--out` and your current config.
+- Tier 1 (`synthetic`) burns CPU: the rule's slots times `dur_s`, divided by
+  `--speed`, split over the threads the mode allows. `light` calls are
+  skipped; `unmatched-heavy` calls burn one thread, outside muzzle.
+- Tier 2 (`real`) runs the commands in `bench/real.toml` (copy
+  `real.toml.example`; `--real FILE` picks another). Each agent gets its own
+  worktree, pre-built once before the replay.
+- `--window busiest:3h` replays the 3 hours with the most matched
+  call-seconds.
+- The probe (below) samples throughout. `--out` gets `result.json` (the D35
+  figures), `summary.md`, and in muzzle mode `runs.jsonl`. `result.json`
+  and `summary.md` carry no paths or command text and go in `docs/bench/`
+  (D32). `runs.jsonl` is local state; never commit it.
+
+## The probe
+
+`muzzle bench probe` appends one JSON line per sample: `git status` p95 in
+a scratch repo (20 runs) and how late a 10 ms sleep wakes at p99 (100
+sleeps), plus the load averages (D35). The scratch repo lives in
+`$XDG_STATE_HOME/muzzle/bench/probe-repo`. Defaults: one sample, so cron
+runs one per tick; `--samples N --interval S` for more.
+
+For the rollout week, sample every 5 minutes:
+
+```crontab
+*/5 * * * * $HOME/.local/bin/muzzle bench probe --out $HOME/.local/state/muzzle/bench/probe.jsonl
+```

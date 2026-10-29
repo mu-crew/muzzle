@@ -17,6 +17,7 @@ fn main() -> ExitCode {
         Command::Bench(args) => match &args.command {
             BenchCommand::Run(args) => bench::run_main(args),
             BenchCommand::Probe(args) => bench::probe_main(args),
+            BenchCommand::Burn(args) => bench::burn_main(args),
         },
     };
     result.unwrap_or_else(|error| {
