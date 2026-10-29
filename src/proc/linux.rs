@@ -36,6 +36,10 @@ fn parse_stat(text: &str) -> Option<Stat> {
 }
 
 pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
+    // Kernel threads sit in pgid 0 (269 on linuxpc); no real group is <= 0.
+    if pgid <= 0 {
+        return Ok(Vec::new());
+    }
     let mut members = Vec::new();
     for entry in fs::read_dir("/proc")? {
         let Ok(entry) = entry else { continue };

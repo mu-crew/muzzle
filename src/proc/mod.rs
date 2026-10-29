@@ -42,8 +42,8 @@ pub struct CgroupFigures {
 pub type Pid = libc::pid_t;
 
 /// An opaque per-process start stamp. Linux: clock ticks since boot
-/// (`/proc/<pid>/stat` field 22). macOS: microseconds since the epoch
-/// (`pbi_start_tvsec`/`pbi_start_tvusec`). Only ever compared for equality
+/// (`/proc/<pid>/stat` field 22). macOS: the kernel's per-boot unique
+/// process id (`p_uniqueid`), not a time. Only ever compared for equality
 /// with a value read on the same host, so the units don't matter.
 pub type StartTime = u64;
 
@@ -173,6 +173,19 @@ pub fn wait_child(pid: Pid) -> io::Result<(ExitStatus, Rusage)> {
 pub fn systemd_user_reachable() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(imp::probe_systemd_user)
+}
+
+/// Whether a pid the kernel listed in group `pgid` counts as a member, given
+/// the result of reading it (`Err(errno)` when unreadable). EPERM means the
+/// process exists but belongs to another user (`kill(pid, 0) == EPERM` reads
+/// the same way), so it counts: dropping it would let D16 release a claim
+/// while a `sudo` in the group still runs. Any other error means gone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // Linux /proc is world-readable
+fn listed_member(read: Result<Stat, i32>, pgid: Pid) -> bool {
+    match read {
+        Ok(s) => s.pgid == pgid,
+        Err(errno) => errno == libc::EPERM,
+    }
 }
 
 /// Whether `systemctl --user is-system-running` output means the manager
@@ -405,6 +418,29 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert!(!first);
         }
+    }
+
+    #[test]
+    fn listed_member_counts_eperm_as_alive() {
+        let s = Stat {
+            ppid: 1,
+            pgid: 9,
+            start: 5,
+        };
+        assert!(listed_member(Ok(s), 9));
+        assert!(!listed_member(Ok(s), 8));
+        // Another user's process (a setuid sudo) in the listed group.
+        assert!(listed_member(Err(libc::EPERM), 9));
+        assert!(!listed_member(Err(libc::ESRCH), 9));
+        assert!(!listed_member(Err(0), 9));
+    }
+
+    #[test]
+    fn group_members_of_pgid_zero_or_negative_is_empty() {
+        // Linux kernel threads have pgid 0; a default-initialised holder
+        // record must not see them as a live group (D16).
+        assert!(group_members(0).unwrap().is_empty());
+        assert!(group_members(-1).unwrap().is_empty());
     }
 
     #[test]

@@ -16,31 +16,70 @@ pub(super) const MAXRSS_UNIT: u64 = 1;
 /// `<sys/proc_info.h>`; libc doesn't export it.
 const PROC_PGRP_ONLY: u32 = 2;
 
-pub(super) fn stat(pid: Pid) -> Option<Stat> {
-    if pid <= 0 {
-        return None;
-    }
-    // SAFETY: a zeroed proc_bsdinfo is a valid plain C struct.
-    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
-    let size = mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+/// xnu `bsd/sys/proc_info_private.h` (flavor 17, `struct
+/// proc_uniqidentifierinfo`, 56 bytes); private, so libc doesn't export it.
+const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+
+#[repr(C)]
+struct ProcUniqIdentifierInfo {
+    p_uuid: [u8; 16],
+    p_uniqueid: u64,
+    p_puniqueid: u64,
+    p_idversion: i32,
+    p_reserve2: u32,
+    p_reserve3: u64,
+    p_reserve4: u64,
+}
+
+const _: () = assert!(mem::size_of::<ProcUniqIdentifierInfo>() == 56);
+
+/// One `proc_pidinfo` call into a plain C struct; `Err(errno)` on failure.
+/// libproc returns 0 (not -1) with errno set; a short read means the flavor
+/// isn't there, which reads as gone (errno 0).
+fn pidinfo<T>(pid: Pid, flavor: libc::c_int) -> Result<T, i32> {
+    // SAFETY: only called with plain C structs, for which zeroed is valid.
+    let mut info: T = unsafe { mem::zeroed() };
+    let size = mem::size_of::<T>() as libc::c_int;
     // SAFETY: the buffer is exactly `size` bytes.
-    let n = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        )
-    };
-    if n != size || info.pbi_status == libc::SZOMB {
-        return None;
+    let n = unsafe { libc::proc_pidinfo(pid, flavor, 0, (&mut info as *mut T).cast(), size) };
+    if n <= 0 {
+        return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
     }
-    Some(Stat {
-        ppid: info.pbi_ppid as Pid,
-        pgid: info.pbi_pgid as Pid,
-        start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+    if n != size {
+        return Err(0);
+    }
+    Ok(info)
+}
+
+/// ppid, pgid and status come from `PROC_PIDT_SHORTBSDINFO` and the start
+/// stamp from `PROC_PIDUNIQIDENTIFIERINFO` `p_uniqueid` (64-bit, never reused
+/// within a boot). xnu `bsd/kern/proc_info.c` `proc_pidinfo_internal` exempts
+/// exactly these flavors (with PATH, COALITION and PLATFORM info) from the
+/// same-user check; `PROC_PIDTBSDINFO` returns EPERM for another euid unless
+/// the caller is root, which hid a setuid `sudo` in the job's group.
+///
+/// `Err(errno)` when unreadable. EPERM still means the process exists (as
+/// `kill(pid, 0) == EPERM` does): `group_members` keeps such a listed pid
+/// (see `super::listed_member`), while `stat` reads it as `None`, because
+/// without a start stamp it can't be told apart from a recycled pid.
+fn read_stat(pid: Pid) -> Result<Stat, i32> {
+    if pid <= 0 {
+        return Err(libc::ESRCH);
+    }
+    let short: libc::proc_bsdshortinfo = pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO)?;
+    if short.pbsi_status == libc::SZOMB {
+        return Err(libc::ESRCH);
+    }
+    let uniq: ProcUniqIdentifierInfo = pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO)?;
+    Ok(Stat {
+        ppid: short.pbsi_ppid as Pid,
+        pgid: short.pbsi_pgid as Pid,
+        start: uniq.p_uniqueid,
     })
+}
+
+pub(super) fn stat(pid: Pid) -> Option<Stat> {
+    read_stat(pid).ok()
 }
 
 pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
@@ -66,7 +105,7 @@ pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
         }
         buf.truncate(n as usize / mem::size_of::<libc::c_int>());
         // The kernel lists zombies too, and the group can change mid-call.
-        buf.retain(|&pid| pid > 0 && stat(pid).is_some_and(|s| s.pgid == pgid));
+        buf.retain(|&pid| pid > 0 && super::listed_member(read_stat(pid), pgid));
         return Ok(buf);
     }
 }
