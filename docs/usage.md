@@ -109,8 +109,11 @@ snippets in [docs/harnesses/](harnesses/README.md).
 need `permissionDecision: "allow"` to rewrite a command, so `muzzle hook
 codex` approves every matched call, compound commands included:
 `cargo build && curl … | sh` matches a cargo rule. `muzzle hook claude`
-sends `allow` only for one simple command and leaves anything compound to
-Claude's own permission check. Keep `Bash(muzzle run:*)` out of Claude's
+sends `allow` only for one simple command whose matched pattern starts at
+its command word (after assignments and `env`, `time`, `timeout [opts] N`
+or `nice`). A compound command, or a pattern found only in an argument or
+a comment (`echo cargo test`, `rm -rf ~/x # cargo test`), goes to Claude's
+own permission check. Keep `Bash(muzzle run:*)` out of Claude's
 allow rules, which would approve every wrapped string.
 
 ## Limits
@@ -120,14 +123,17 @@ allow rules, which would approve every wrapped string.
 A claim belongs to the process group the job runs in, and lasts until that
 group has no members left.
 
-- **muzzle leads its group** when a harness, a hook or a shell runs it as
-  the first command: pi's `bash -c 'muzzle run …'` execs muzzle. The job
+- **muzzle leads its group** when it is the only, or the last, simple
+  command bash execs: pi's `bash -c 'muzzle run …'` and
+  `bash -c 'cd repo && muzzle run …'` both exec muzzle. The job
   then runs in muzzle's own group, so a harness that kills the group (pi
   on Esc or timeout) kills the job too, and the next waiter frees the
   slots.
-- **muzzle is not the leader** in, for example, `foo; muzzle run …` typed
-  into an interactive shell, or under a wrapper that spawns muzzle as a
-  child. It then starts the job in a new group of its own. **Killing the
+- **muzzle is not the leader** when it is piped (`muzzle run … | tail`),
+  followed by another command (`muzzle run …; true`), typed into an
+  interactive shell after another command, or spawned as a child by a
+  wrapper. Put the pipe inside instead:
+  `muzzle run --rule gate -- bash -c 'contrib/fast-gate 2>&1 | tail -50'`. It then starts the job in a new group of its own. **Killing the
   caller may leave the job running**, still holding its slots until it
   exits. The npm `bin/muzzle` shim execs the binary for this reason (Node
   22.15 or later), and the pi extension calls the platform binary

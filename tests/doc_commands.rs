@@ -253,6 +253,28 @@ fn every_command_in_the_skill_and_docs_resolves() {
 fn the_guard_is_looking_at_the_skill() {
     let cmds = all_commands();
     let in_skill = |name: &str| cmds.iter().filter(|c| c.file.ends_with(name)).count();
+    // rv_skill_doccmd_floor: every file in doc_files() shows at least one
+    // command, so dropping one from the list (or emptying it) fails.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for f in doc_files() {
+        let rel = f.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+        assert!(
+            cmds.iter().any(|c| c.file == rel),
+            "{rel}: no muzzle command found"
+        );
+    }
+    for f in [
+        "README.md",
+        "docs/why.md",
+        "docs/usage.md",
+        "docs/harnesses/README.md",
+        "bench/README.md",
+    ] {
+        assert!(
+            cmds.iter().any(|c| c.file == f),
+            "{f} is not in doc_files()"
+        );
+    }
     // Floors, not targets: a broken extractor finds about 0.
     assert!(in_skill("SKILL.md") >= 5, "{cmds:#?}");
     for r in ["tune.md", "bench.md", "harnesses.md"] {

@@ -37,9 +37,19 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 ```
 
 - `--rule NAME` alone takes the weight from the config, so a later tuning
-  applies. `--slots N` pins the weight and overrides the config.
-- `CMD` runs as argv, not through a shell. For pipes or `&&`, wrap a shell:
-  `muzzle run --rule gate -- bash -c 'cd repo && contrib/gate'`.
+  applies. `--slots N` pins the weight and overrides the config. A name the
+  config doesn't have prints `rule NAME is not in the config; claiming 1
+  slot(s)` and runs: fix the name from the `name =` lines in the config.
+- **muzzle is the whole command.** Start the call with `muzzle`, and put
+  pipes, `cd` and `&&` inside `bash -c`:
+  `muzzle run --rule gate -- bash -c 'cd repo && contrib/fast-gate 2>&1 | tail -50'`.
+  `CMD` runs as argv, not through a shell, so a bare pipe can't go there.
+- Piped or followed by another command (`muzzle run … | tail`), muzzle no
+  longer leads the shell's process group. Esc or a pi timeout then kills
+  muzzle but leaves the job running, holding its slots.
+- In pi, a call that doesn't start with `muzzle` (`cd repo && muzzle run
+  --class high …`) is wrapped again by the extension. The inner run is
+  nested, so its `--class`, `--slots` and `--run-timeout` are ignored.
 - **`timeout` goes inside `muzzle run`, never outside it.** An outer
   `timeout` counts the queue wait and kills the gate before it starts. Use
   `--run-timeout S`, which counts from admission and exits 124.

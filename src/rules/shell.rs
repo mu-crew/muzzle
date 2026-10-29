@@ -11,22 +11,51 @@
 /// Split `text` into simple commands, each a list of unquoted words.
 /// Command substitutions come out as commands of their own.
 pub fn commands(text: &str) -> Vec<Vec<String>> {
+    lex(text).out
+}
+
+/// [`commands`] with the byte offset in `text` where each word starts
+/// (its first character, which may be a quote).
+pub fn command_spans(text: &str) -> Vec<Vec<(String, usize)>> {
+    let lx = lex(text);
+    // The lexer counts chars; callers slice `text` by bytes.
+    let bytes: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+    lx.out
+        .into_iter()
+        .zip(lx.starts)
+        .map(|(ws, ss)| {
+            ws.into_iter()
+                .zip(
+                    ss.into_iter()
+                        .map(|c| bytes.get(c).copied().unwrap_or(text.len())),
+                )
+                .collect()
+        })
+        .collect()
+}
+
+fn lex(text: &str) -> Lexer {
     let mut lx = Lexer {
         chars: text.chars().collect(),
         at: 0,
         out: Vec::new(),
+        starts: Vec::new(),
         words: Vec::new(),
+        word_starts: Vec::new(),
         heredocs: Vec::new(),
     };
     lx.run();
-    lx.out
+    lx
 }
 
 struct Lexer {
     chars: Vec<char>,
     at: usize,
     out: Vec<Vec<String>>,
+    /// Char index in the text where each word of `out` starts.
+    starts: Vec<Vec<usize>>,
     words: Vec<String>,
+    word_starts: Vec<usize>,
     /// Heredoc delimiters waiting for the next newline, with `<<-`.
     heredocs: Vec<(String, bool)>,
 }
@@ -39,6 +68,7 @@ impl Lexer {
     fn end_command(&mut self) {
         if !self.words.is_empty() {
             self.out.push(std::mem::take(&mut self.words));
+            self.starts.push(std::mem::take(&mut self.word_starts));
         }
     }
 
@@ -62,6 +92,7 @@ impl Lexer {
                 }
                 '<' | '>' => self.redirect(),
                 _ => {
+                    let start = self.at;
                     let w = self.word();
                     // `2>file`: a word of digits glued to a redirect is its fd.
                     if matches!(self.peek(0), Some('<' | '>'))
@@ -72,6 +103,7 @@ impl Lexer {
                         // Empty after a substitution was lifted out; an
                         // empty `''` word never names a command either.
                         self.words.push(w);
+                        self.word_starts.push(start);
                     }
                 }
             }
@@ -222,7 +254,7 @@ impl Lexer {
             .iter()
             .collect();
         self.at += 1;
-        self.out.extend(commands(&inner));
+        self.lift(&inner, start);
     }
 
     fn backticks(&mut self) {
@@ -234,7 +266,18 @@ impl Lexer {
         let end = self.at.min(self.chars.len());
         let inner: String = self.chars[start..end].iter().collect();
         self.at += 1;
-        self.out.extend(commands(&inner));
+        self.lift(&inner, start);
+    }
+
+    /// Add the commands of a substitution whose text starts at `offset`.
+    fn lift(&mut self, inner: &str, offset: usize) {
+        let lx = lex(inner);
+        self.out.extend(lx.out);
+        self.starts.extend(
+            lx.starts
+                .into_iter()
+                .map(|s| s.into_iter().map(|i| i + offset).collect()),
+        );
     }
 }
 
@@ -409,35 +452,106 @@ fn strip_prefix(mut words: &[String]) -> &[String] {
         let Some(wr) = WRAPPERS.iter().find(|wr| wr.name == base(w)) else {
             return words;
         };
-        words = &words[1..];
-        let mut positional = wr.positional;
-        while let Some(next) = words.first() {
-            let n = next.as_str();
-            if n == "--" {
-                words = &words[1..];
-                break;
-            }
-            if let Some(long) = n.strip_prefix("--") {
-                let takes = !long.contains('=') && wr.long_args.contains(&n);
-                words = &words[if takes { 2 } else { 1 }.min(words.len())..];
-            } else if n.len() > 1 && n.starts_with('-') {
-                // `-s KILL`, but `-sKILL` carries its own argument.
-                let opts = &n[1..];
-                let takes = opts
-                    .char_indices()
-                    .find(|&(_, c)| wr.short_args.contains(c))
-                    .is_some_and(|(i, c)| i + c.len_utf8() == opts.len());
-                words = &words[if takes { 2 } else { 1 }.min(words.len())..];
-            } else if base(w) == "env" && is_assignment(n) {
-                words = &words[1..];
-            } else if positional > 0 {
-                positional -= 1;
-                words = &words[1..];
-            } else {
-                break;
-            }
+        words = strip_options(wr, base(w) == "env", &words[1..]);
+    }
+}
+
+/// The words after wrapper `wr`'s name, past its options, `--`, its
+/// positional words and (for `env`) assignments.
+fn strip_options<'a>(wr: &Wrapper, env: bool, mut words: &'a [String]) -> &'a [String] {
+    let mut positional = wr.positional;
+    while let Some(next) = words.first() {
+        let n = next.as_str();
+        if n == "--" {
+            words = &words[1..];
+            break;
+        }
+        if let Some(long) = n.strip_prefix("--") {
+            let takes = !long.contains('=') && wr.long_args.contains(&n);
+            words = &words[if takes { 2 } else { 1 }.min(words.len())..];
+        } else if n.len() > 1 && n.starts_with('-') {
+            // `-s KILL`, but `-sKILL` carries its own argument.
+            let opts = &n[1..];
+            let takes = opts
+                .char_indices()
+                .find(|&(_, c)| wr.short_args.contains(c))
+                .is_some_and(|(i, c)| i + c.len_utf8() == opts.len());
+            words = &words[if takes { 2 } else { 1 }.min(words.len())..];
+        } else if env && is_assignment(n) {
+            words = &words[1..];
+        } else if positional > 0 {
+            positional -= 1;
+            words = &words[1..];
+        } else {
+            break;
         }
     }
+    words
+}
+
+/// The prefixes `hook claude` steps over before the command word (spec
+/// §Integrations "Claude Code and Codex"): a narrower list than
+/// [`WRAPPERS`], because here a wrong step approves a call unprompted.
+const ALLOW_PREFIXES: [&str; 4] = ["env", "time", "timeout", "nice"];
+
+/// The byte offset in `text` of the command word, when `text` lexes to one
+/// simple command: past assignments and leading `env`, `time`,
+/// `timeout [opts] N` and `nice` with their options. `None` for anything
+/// else, including `env -S`/`--split-string`, which would run a command
+/// hidden in its argument.
+pub fn command_word(text: &str) -> Option<usize> {
+    let mut spans = command_spans(text);
+    if spans.len() != 1 {
+        return None;
+    }
+    let spans = spans.remove(0);
+    let words: Vec<String> = spans.iter().map(|(w, _)| w.clone()).collect();
+    let mut at = 0;
+    loop {
+        let w = words.get(at)?.as_str();
+        if is_assignment(w) {
+            at += 1;
+            continue;
+        }
+        if !ALLOW_PREFIXES.contains(&base(w)) {
+            break;
+        }
+        if base(w) == "env"
+            && words[at + 1..].iter().take_while(|n| *n != "--").any(|n| {
+                n.starts_with("--split-string")
+                    || (n.starts_with('-') && !n.starts_with("--") && n.contains('S'))
+            })
+        {
+            return None;
+        }
+        // strip_prefix steps over exactly this wrapper and stops at the
+        // next word (which the loop above then looks at).
+        let rest = strip_one(&words[at..]);
+        at = words.len() - rest.len();
+    }
+    // A shell, another wrapper (`exec`, `sudo`, `xargs`) or a `*.sh`
+    // script as the command word runs some other program, yet an anchored
+    // pattern's own prefix group can match from it (`bash -x evil.sh cargo
+    // test`, `evil.sh cargo build` under bench/linuxpc-config.toml).
+    let w = base(&words[at]);
+    if WRAPPERS.iter().any(|wr| wr.name == w) || SHELLS.contains(&w) || w.ends_with(".sh") {
+        return None;
+    }
+    Some(spans[at].1)
+}
+
+const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
+
+/// `words` past its first word, a known wrapper, and that wrapper's
+/// options and positional words.
+fn strip_one(words: &[String]) -> &[String] {
+    let Some(wr) = words
+        .first()
+        .and_then(|w| WRAPPERS.iter().find(|wr| wr.name == base(w)))
+    else {
+        return words;
+    };
+    strip_options(wr, base(&words[0]) == "env", &words[1..])
 }
 
 fn is_assignment(w: &str) -> bool {
@@ -452,7 +566,7 @@ fn is_assignment(w: &str) -> bool {
 /// is one.
 fn shell_script(words: &[String]) -> Option<&str> {
     let (sh, rest) = words.split_first()?;
-    if !matches!(base(sh), "bash" | "sh" | "dash" | "zsh" | "ksh" | "ash") {
+    if !SHELLS.contains(&base(sh)) {
         return None;
     }
     let mut c = false;

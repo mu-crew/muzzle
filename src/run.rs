@@ -264,6 +264,12 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         }
     };
     let rule = args.rule.as_deref().and_then(|n| config.rule(n));
+    // rv_skill_unknown_rule: a renamed rule (rust-gate -> cargo-test) would
+    // otherwise quietly under-claim every hand-wrapped call that names it.
+    if let (Some(name), None) = (args.rule.as_deref(), rule) {
+        let n = args.slots.unwrap_or(1);
+        eprintln!("muzzle: rule {name} is not in the config; claiming {n} slot(s)");
+    }
     let class = match resolve_class(
         args.class,
         std::env::var("MUZZLE_CLASS").ok().as_deref(),

@@ -20,7 +20,7 @@ muzzle doctor
 | harness | how | timeout | `allow` | tested |
 | --- | --- | --- | --- | --- |
 | pi | extension rewrites the bash call | moved to `--run-timeout`: the wait never trips it | n/a: pi has no permission prompt | yes |
-| Claude Code | `PreToolUse` hook, `muzzle hook claude` | passed on as `--run-timeout`, but Claude's own Bash timeout still counts the wait | only for one simple command | yes, stored payloads |
+| Claude Code | `PreToolUse` hook, `muzzle hook claude` | passed on as `--run-timeout`, but Claude's own Bash timeout still counts the wait | only for one simple command whose rule matches at the command word | yes, stored payloads |
 | Codex | `PreToolUse` hook, `muzzle hook codex` | the payload has none; Codex's shell timeout counts the wait | always, compound commands too | yes, stored payloads |
 | opencode | example plugin calling `muzzle wrap` | passed on, still counts the wait | n/a | **no** |
 | Cursor, aider, cron, humans | wrap by hand | use `--run-timeout` | n/a | n/a |
@@ -92,9 +92,13 @@ harness doesn't ask you. muzzle's rules match anywhere in the string, so
   A matched call is approved by muzzle, compound commands included. Use
   the Codex hook only where you would approve those calls anyway, or keep
   the rules narrow.
-- **Claude Code gets `allow` only for one simple command**: no `;`, `&`,
-  `&&`, `|`, `||`, newline, `$(…)`, backticks, process substitution or
-  subshell outside quotes. Anything else is rewritten with no decision, so
+- **Claude Code gets `allow` only when the rule names the program**: one
+  simple command (no `;`, `&`, `&&`, `|`, `||`, newline, `$(…)`, backticks,
+  process substitution or subshell outside quotes) whose matched pattern
+  starts at the command word, after assignments and `env`, `time`,
+  `timeout [opts] N` or `nice`. A match in an argument or a comment
+  (`echo cargo test`, `rm -rf ~/x # cargo test`) doesn't count. Anything
+  else is rewritten with no decision, so
   Claude's own check runs on `muzzle run … -- bash -c '…'`, and since your
   `Bash(cargo build:*)` rules don't match that form, it prompts.
 - **Keep `Bash(muzzle run:*)` out of Claude's allow rules.** It would

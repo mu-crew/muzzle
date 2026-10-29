@@ -691,6 +691,40 @@ fn sigterm_while_queued_prints_d19_and_drops_the_ticket() {
     hog.wait().unwrap();
 }
 
+/// rv_skill_unknown_rule: a name the config lacks warns, and otherwise
+/// runs as before (1 slot, or `--slots`, exit passed through).
+#[test]
+fn an_unknown_rule_warns_and_still_runs() {
+    let env = Env::new();
+    for (args, n) in [
+        (
+            &["--rule", "no-such-rule", "--", "sh", "-c", "exit 3"][..],
+            1,
+        ),
+        (
+            &["--rule", "nope", "--slots", "2", "--", "sh", "-c", "exit 3"][..],
+            2,
+        ),
+    ] {
+        let out = env.cmd(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        let name = args[1];
+        assert!(
+            err.contains(&format!(
+                "muzzle: rule {name} is not in the config; claiming {n} slot(s)"
+            )),
+            "{err}"
+        );
+        assert_eq!(env.runs().pop().unwrap()["slots"], n);
+    }
+    let out = env.cmd(&["--rule", "gate", "--", "true"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("not in the config"),
+        "{out:?}"
+    );
+}
+
 #[test]
 fn a_run_appends_its_line_to_runs_jsonl() {
     let env = Env::new();

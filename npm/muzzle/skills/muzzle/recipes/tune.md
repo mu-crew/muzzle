@@ -89,7 +89,9 @@ A bad config exits 2 and names the key.
 `muzzle run` overrides the config, so editing the config changes nothing for briefs,
 scripts or cron lines that pass `--slots`. Update those too, or change them
 to `--rule NAME` alone, which reads the weight from the config. The pi
-extension and the harness hooks read the config on every call.
+extension and the harness hooks read the config on every call. Renaming a
+rule breaks every `--rule OLD`: those calls warn `rule OLD is not in the
+config; claiming 1 slot(s)` and under-claim until they are updated.
 
 ## 4. Check it on a replay
 

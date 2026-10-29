@@ -36,10 +36,16 @@ with no prompt.
   and doesn't support `ask`. A matched call is therefore approved by muzzle,
   compound commands included. Use the Codex hook only where you would
   approve those shell calls anyway, or keep your rules narrow.
-- **Claude Code gets `allow` only for one simple command:** no `;`, `&`,
-  `&&`, `|`, `||`, newline, `$(…)`, backticks, `<(…)`/`>(…)` or subshell
-  parens outside quotes. Anything else is rewritten without a decision, and
-  Claude's normal permission check runs on the wrapped string,
+- **Claude Code gets `allow` only when the rule names the program that
+  runs:** one simple command (no `;`, `&`, `&&`, `|`, `||`, newline,
+  `$(…)`, backticks, `<(…)`/`>(…)` or subshell parens outside quotes) whose
+  matched pattern starts at its command word, after any leading
+  assignments and `env`, `time`, `timeout [opts] N` or `nice`. So
+  `cargo test` and `timeout 600 contrib/fast-gate` are approved, but a
+  pattern found in an argument or a comment (`echo cargo test`,
+  `rm -rf ~/x # cargo test`, `curl … -- cargo build`) is not. Anything else
+  is rewritten without a decision, and Claude's normal permission check
+  runs on the wrapped string,
   `muzzle run … -- bash -c '…'`. Your `Bash(cargo build:*)` allow rules
   don't match that form, so Claude prompts.
 - **Don't add a `Bash(muzzle run:*)` allow rule** in Claude Code to silence
@@ -136,22 +142,24 @@ Cursor's `beforeShellExecution` can only allow or deny, so it can't rewrite
 a call (D23). For Cursor, aider, cron and humans, wrap by hand:
 
 ```sh
-muzzle run --rule gate --slots 6 -- contrib/fast-gate
+muzzle run --rule gate -- contrib/fast-gate
 ```
 
-Never put `timeout` outside `muzzle run`: it counts the queue wait. Use
+`--rule NAME` alone reads the weight from the config, so a later tuning
+applies; `--slots N` would pin it. A name the config doesn't have warns
+and claims 1 slot. Never put `timeout` outside `muzzle run`: it counts the queue wait. Use
 `--run-timeout S`. A repo's gate script can opt in at its top, and stays
 usable without muzzle (D20). The variable stops the re-exec from looping:
 
 ```sh
 if [ -z "$IN_MUZZLE" ] && command -v muzzle >/dev/null; then
-  IN_MUZZLE=1 exec muzzle run --rule gate --slots 6 -- "$0" "$@"
+  IN_MUZZLE=1 exec muzzle run --rule gate -- "$0" "$@"
 fi
 ```
 
 There are no PATH shims in v1 (D25). If you want every `cargo` to go
 through muzzle, a shim earlier in `PATH` that runs
-`exec muzzle run -- /usr/bin/cargo "$@"` works. It also catches interactive
+`exec muzzle run --rule cargo-test -- /usr/bin/cargo "$@"` works. It also catches interactive
 use and nested cargo calls, which is why muzzle doesn't ship one.
 
 ## Checking

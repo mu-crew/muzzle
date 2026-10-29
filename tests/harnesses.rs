@@ -198,7 +198,8 @@ fn docs_carry_the_allow_warning_and_the_snippets() {
     for needle in [
         "## Warning: `allow` skips the harness's permission prompt",
         "Codex always gets `allow`",
-        "Claude Code gets `allow` only for one simple command",
+        "Claude Code gets `allow` only when the rule names the program",
+        "starts at its command word",
         "Don't add a `Bash(muzzle run:*)` allow rule",
         "BASH_MAX_TIMEOUT_MS",
         "Never put `timeout` outside `muzzle run`",
