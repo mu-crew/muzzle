@@ -118,9 +118,30 @@ pub struct Holder {
     /// not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Where to look for that scope's processes (D16a), recorded at spawn
+    /// by the muzzle that owns it. Answered from the holder, never from
+    /// systemctl, so a waiter without a user bus (inside the container, ssh
+    /// without lingering) can't read "no answer" as "empty".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ScopeProbe>,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,
+}
+
+/// D16a: how a waiter tells whether a container run's scope is populated.
+/// `cgroup` is the scope's path as seen in `cgroup_ns`; a waiter in that
+/// namespace reads its `cgroup.events`. A waiter in another cgroup
+/// namespace but the same `pid_ns` (distrobox, toolbox) scans `/proc` for a
+/// process in the scope. Any other waiter can't see it and keeps the claim.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScopeProbe {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_ns: Option<u64>,
 }
 
 /// One `runs.jsonl` line (spec §Interface, `runs.jsonl`). Defined here so

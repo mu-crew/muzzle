@@ -3,14 +3,12 @@
 
 pub mod config;
 pub mod hook;
+pub mod shell;
 
+use serde_json::{Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::LazyLock;
-
-use regex::Regex;
-use serde_json::{Value, json};
 
 use crate::cli::{Class, HookArgs, MatchArgs, WrapArgs};
 use crate::exit;
@@ -54,35 +52,20 @@ pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) 
     })
 }
 
-/// D16a: a container entry in command position. The anchor is the one
-/// bench/linuxpc-config.toml uses (start of the string, after `; & | (` or a
-/// newline, right inside a `-c '…'` quote, after ` -- `, with env
-/// assignments and time/timeout/env/nice before it), so a poll such as
-/// `pgrep -f 'distrobox enter'` or `echo podman exec` doesn't count.
-static CONTAINER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|sudo)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+)*(\S*/)?(distrobox\s+enter|distrobox-enter|podman\s+exec|toolbox\s+run|docker\s+exec)(\s|['"]|$)"#,
-    )
-    .expect("container pattern compiles")
-});
-
-/// D16a: `command` enters a container (`distrobox enter`, `podman exec`,
-/// `toolbox run`, `docker exec`). The job then runs in the container's own
-/// cgroup, so muzzle's scope admits it but neither caps nor measures it.
+/// D16a: `command` (shell text) enters a container (`distrobox enter`,
+/// `podman exec`, `toolbox run`, `docker exec` and their long forms) in
+/// command position. The job then runs in the container's own cgroup, so
+/// muzzle's scope admits it but neither caps nor measures it. See
+/// [`shell`] for what counts as command position.
 pub fn enters_container(command: &str) -> bool {
-    CONTAINER.is_match(command)
+    shell::text_enters(command)
 }
 
-/// The shell text of a `muzzle run` argv, for [`enters_container`]: the
-/// script of `bash -c '<text>'` (what [`wrap`] produces), else the words
-/// joined by spaces.
-pub fn command_text(argv: &[String]) -> String {
-    let shell = |w: &str| matches!(w.rsplit('/').next(), Some("bash" | "sh" | "dash" | "zsh"));
-    let c_flag = |w: &str| w.len() > 1 && w.starts_with('-') && w.ends_with('c');
-    match argv {
-        [sh, flag, script, ..] if shell(sh) && c_flag(flag) => script.clone(),
-        _ => argv.join(" "),
-    }
+/// [`enters_container`] for a `muzzle run` argv: `bash -c '<script>'`
+/// (what [`wrap`] produces) is read as a script, other argvs word by word,
+/// so an argument that merely contains `podman exec` doesn't count.
+pub fn argv_enters_container(argv: &[String]) -> bool {
+    shell::argv_enters(argv)
 }
 
 /// POSIX single-quoting: everything inside '…' is literal, including `$`,
@@ -395,8 +378,35 @@ mod tests {
             "distrobox-enter x -- true",
             "env A=1 distrobox enter x",
             "true; podman exec c sh",
+            // rv_cg_detection_false_negatives: long forms and wrappers.
+            "podman container exec c make",
+            "docker container exec c make",
+            "docker compose exec app make",
+            "docker compose -f dev.yml exec app make",
+            "docker-compose exec app make",
+            "podman-compose exec app make",
+            "toolbox enter",
+            "toolbox enter fedora-toolbox-44",
+            "timeout -s KILL 600 distrobox enter x -- make",
+            "timeout --signal=KILL -k 5 600 distrobox enter x -- make",
+            "command distrobox enter x",
+            "! distrobox enter x -- make",
+            "echo c | xargs podman exec c",
+            "xargs -n1 podman exec c",
+            "flatpak-spawn --host distrobox enter x -- make",
+            "systemd-inhibit distrobox enter x -- make",
+            "systemd-inhibit --why=build distrobox enter x",
+            "sudo -u me podman exec c make",
+            "if true; then distrobox enter x -- make; fi",
+            "for i in 1; do podman exec c make; done",
+            "(cd /w && podman exec c make)",
+            "x=$(podman exec c make)",
+            "sh -c \"docker exec c make\"",
+            "docker -H tcp://h exec c make",
+            "cat <<EOF\nbody\nEOF\npodman exec c make",
+            "cd x\\\n && distrobox enter x -- make",
         ] {
-            assert!(enters_container(cmd), "{cmd}");
+            assert!(enters_container(cmd), "{cmd:?}");
         }
         for cmd in [
             "grep 'podman exec' log",
@@ -407,30 +417,60 @@ mod tests {
             "distrobox list",
             "contrib/fast-gate",
             "toolbox runner",
+            // rv_cg_detection_false_positives: quotes, heredocs, -c, --.
+            "echo \"x; podman exec c make\"",
+            "echo 'a | podman exec c make'",
+            "git commit -m 'fix; distrobox enter box'",
+            "cat <<EOF\npodman exec c make\nEOF",
+            "cat <<'EOF' > notes\ndistrobox enter box -- make\nEOF\nls",
+            "grep -c 'podman exec' log",
+            "rg -c \"distrobox enter\" .",
+            "git log -- distrobox enter",
+            "echo podman exec # distrobox enter",
+            "docker build .",
+            "podman compose up",
+            "printf '%s\\n' \"$(echo 'podman exec')\"",
         ] {
-            assert!(!enters_container(cmd), "{cmd}");
+            assert!(!enters_container(cmd), "{cmd:?}");
         }
     }
 
     #[test]
-    fn command_text_unwraps_bash_c() {
+    fn argv_detection_reads_bash_c_as_a_script_and_others_as_words() {
         let v = |ws: &[&str]| ws.iter().map(|w| w.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            command_text(&v(&["bash", "-c", "distrobox enter x -- make"])),
+        assert!(argv_enters_container(&v(&[
+            "bash",
+            "-c",
             "distrobox enter x -- make"
-        );
-        assert_eq!(command_text(&v(&["/bin/sh", "-lc", "a b"])), "a b");
-        assert_eq!(
-            command_text(&v(&["distrobox", "enter", "x", "--", "make"])),
-            "distrobox enter x -- make"
-        );
-        assert!(enters_container(&command_text(&v(&[
-            "podman", "exec", "c", "make"
-        ]))));
-        assert!(!enters_container(&command_text(&v(&[
-            "echo",
-            "podman exec"
-        ]))));
+        ])));
+        assert!(argv_enters_container(&v(&[
+            "/bin/sh",
+            "-lc",
+            "cd w; podman exec c make"
+        ])));
+        assert!(argv_enters_container(&v(&[
+            "distrobox",
+            "enter",
+            "x",
+            "--",
+            "make"
+        ])));
+        assert!(argv_enters_container(&v(&["podman", "exec", "c", "make"])));
+        assert!(argv_enters_container(&v(&[
+            "timeout", "-s", "KILL", "9", "toolbox", "enter"
+        ])));
+        assert!(!argv_enters_container(&v(&["echo", "podman exec"])));
+        assert!(!argv_enters_container(&v(&[
+            "grep",
+            "-c",
+            "podman exec c",
+            "log"
+        ])));
+        assert!(!argv_enters_container(&v(&[
+            "bash",
+            "-c",
+            "echo 'podman exec c make'"
+        ])));
     }
 
     #[test]

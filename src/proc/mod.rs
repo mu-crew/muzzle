@@ -214,6 +214,31 @@ pub fn cgroup_figures(dir: &std::path::Path) -> Option<CgroupFigures> {
     imp::cgroup_figures(dir)
 }
 
+/// The inode of this process's `kind` namespace (`cgroup`, `pid`), which
+/// identifies it: two processes in one namespace read the same number.
+/// `None` on macOS.
+pub fn namespace(kind: &str) -> Option<u64> {
+    imp::namespace(kind)
+}
+
+/// D16a: whether the cgroup at `rel` (under `/sys/fs/cgroup`, as this
+/// process's cgroup namespace sees it) has processes, from `cgroup.events`,
+/// which counts descendants too. A missing directory is `Some(false)`:
+/// systemd removes an emptied scope. `None` when unanswerable, and always
+/// on macOS.
+pub fn cgroup_populated(rel: &str) -> Option<bool> {
+    imp::cgroup_populated(rel)
+}
+
+/// D16a: whether any process visible in `/proc` sits in a cgroup with the
+/// path segment `leaf` (a unique `….scope` name). Works across a cgroup
+/// namespace boundary, where paths read `/../../app.slice/x.scope`, as long
+/// as the pid namespace is shared (distrobox, toolbox). `None` when
+/// unanswerable, and always on macOS.
+pub fn cgroup_has_process(leaf: &str) -> Option<bool> {
+    imp::cgroup_has_process(leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

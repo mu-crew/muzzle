@@ -70,8 +70,8 @@ impl Liveness for ProcLive {
     fn group_alive(&self, pgid: u32) -> bool {
         proc::group_members(pgid as Pid).map_or(true, |m| !m.is_empty())
     }
-    fn scope_alive(&self, unit: &str) -> bool {
-        crate::run::scope_populated(unit)
+    fn scope_alive(&self, unit: &str, probe: Option<&crate::state::ScopeProbe>) -> bool {
+        crate::run::scope_populated(unit, probe)
     }
 }
 
@@ -262,7 +262,7 @@ mod tests {
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
         }
-        fn scope_alive(&self, unit: &str) -> bool {
+        fn scope_alive(&self, unit: &str, _probe: Option<&crate::state::ScopeProbe>) -> bool {
             unit == "live.scope"
         }
     }
@@ -296,6 +296,7 @@ mod tests {
             kept: false,
             enforced_reason: None,
             scope: None,
+            probe: None,
             claim: claim(slots, Class::High, agent),
         }
     }

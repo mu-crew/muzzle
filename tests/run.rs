@@ -1004,3 +1004,89 @@ fn muzzle_status(env: &Env) -> Value {
         .unwrap();
     serde_json::from_slice(&out.stdout).unwrap()
 }
+
+/// rv_cg_graceful_stop_frees_container: muzzle exits through its own
+/// release path (SIGTERM, Ctrl-C, --run-timeout), but conmon's job lives on
+/// in the scope. The slots stay held until it ends.
+fn container_job_outlives_a_graceful_stop(stop: &str) {
+    if cfg!(not(target_os = "linux")) || !muzzle::proc::systemd_user_reachable() {
+        eprintln!("skipped: needs a systemd user manager (D15, D16a)");
+        return;
+    }
+    let env = Env::new();
+    let path = fake_podman(&env);
+    let report = env.file("r.json");
+    let mut args = vec!["--slots", "4", "--report", report.to_str().unwrap()];
+    if stop == "timeout" {
+        args.extend(["--run-timeout", "0.5"]);
+    }
+    args.extend(["--", "podman", "exec", "box", "sleep", "3"]);
+    let mut gate = env.leader(&args).env("PATH", &path).spawn().unwrap();
+    assert!(eventually(Duration::from_secs(5), || env
+        .file("entered")
+        .exists()));
+    let started = Instant::now();
+    let h = &env.state().holders[0];
+    // The probe is recorded at spawn: path, and the namespaces it's valid in.
+    let probe = h.probe.as_ref().expect("probe recorded");
+    assert!(
+        probe
+            .cgroup
+            .as_deref()
+            .is_some_and(|c| c.ends_with(".scope")),
+        "{probe:?}"
+    );
+    match stop {
+        "term" => kill(gate.id() as i32, libc::SIGTERM),
+        // Ctrl-C in a terminal: the whole group.
+        "int" => kill(-(gate.id() as i32), libc::SIGINT),
+        _ => {}
+    }
+    let code = wait_for(&mut gate, Duration::from_secs(5)).expect("muzzle exits");
+    let want = match stop {
+        "timeout" => Some(124),
+        "term" => Some(143),
+        _ => Some(130),
+    };
+    assert_eq!(code.code(), want, "{code:?}");
+
+    let mut next = env.cmd(&["--slots", "1", "--", "true"]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        next.try_wait().unwrap().is_none(),
+        "admitted while the container job ran: {:?}",
+        env.runs()
+    );
+    let status = muzzle_status(&env);
+    assert_eq!(status["held"], 4, "{status}");
+    let rep: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(rep["kept"], true, "{rep}");
+
+    assert!(
+        wait_for(&mut next, Duration::from_secs(6))
+            .unwrap()
+            .success()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(2000));
+    let r = &env.runs()[0];
+    assert_eq!(r["enforced_reason"], "container", "{r}");
+    assert_eq!(r["kept"], true, "{r}");
+    if stop == "timeout" {
+        assert_eq!(r["killed"], "timeout", "{r}");
+    }
+}
+
+#[test]
+fn sigterm_to_a_container_gate_keeps_the_slots_until_its_scope_empties() {
+    container_job_outlives_a_graceful_stop("term");
+}
+
+#[test]
+fn ctrl_c_to_a_container_gate_keeps_the_slots_until_its_scope_empties() {
+    container_job_outlives_a_graceful_stop("int");
+}
+
+#[test]
+fn run_timeout_of_a_container_gate_keeps_the_slots_until_its_scope_empties() {
+    container_job_outlives_a_graceful_stop("timeout");
+}

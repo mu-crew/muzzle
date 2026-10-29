@@ -18,7 +18,9 @@ use crate::cli::{self, RunArgs};
 use crate::exit;
 use crate::proc::{self, CgroupFigures, Pid, StartTime};
 use crate::rules::config::{Config, ConfigError};
-use crate::state::{Budget, Claim, EnforcedReason, Holder, Killed, RunRecord, State, Store};
+use crate::state::{
+    Budget, Claim, EnforcedReason, Holder, Killed, RunRecord, ScopeProbe, State, Store,
+};
 
 /// Spec §Architecture 4.2: each waiter polls `admit` every 250 ms.
 const POLL: Duration = Duration::from_millis(250);
@@ -79,36 +81,74 @@ impl Liveness for ProcLive {
         // job still uses is the worse error.
         proc::group_members(pgid as Pid).map_or(true, |m| !m.is_empty())
     }
-    fn scope_alive(&self, unit: &str) -> bool {
-        scope_populated(unit)
+    fn scope_alive(&self, unit: &str, probe: Option<&ScopeProbe>) -> bool {
+        scope_populated(unit, probe)
     }
 }
 
-/// D16a: the scope unit still has processes. Asks systemd for its cgroup
-/// and reads `cgroup.events`, which counts descendants too. Only consulted
-/// for a container run whose muzzle and group are gone, so the systemctl
-/// call is rare. As for groups, an unanswerable question keeps the claim.
-pub(crate) fn scope_populated(unit: &str) -> bool {
-    let Ok(out) = Command::new("systemctl")
-        .args(["--user", "show", "-p", "ControlGroup", "--value"])
-        .arg(unit)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return true;
-    };
-    let cgroup = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if cgroup.is_empty() {
-        // Not loaded: systemd removes a scope once it empties.
-        return false;
-    }
-    fs::read_to_string(
-        Path::new("/sys/fs/cgroup")
-            .join(cgroup.trim_start_matches('/'))
-            .join("cgroup.events"),
+/// D16a: the scope unit still has processes, answered as `probe` (written
+/// at spawn) says. Never from systemctl: inside a container, or on a host
+/// without a user bus, it prints nothing and exits 0 or 1, and that read
+/// as "empty" and freed a live 12-slot claim (rv_cg_scope_probe_fails_open).
+/// An unanswerable question keeps the claim.
+pub(crate) fn scope_populated(unit: &str, probe: Option<&ScopeProbe>) -> bool {
+    scope_answer(
+        unit,
+        probe,
+        Here {
+            cgroup_ns: proc::namespace("cgroup"),
+            pid_ns: proc::namespace("pid"),
+        },
+        proc::cgroup_populated,
+        proc::cgroup_has_process,
     )
-    .is_ok_and(|t| t.lines().any(|l| l == "populated 1"))
+    .unwrap_or(true)
+}
+
+/// The namespaces a waiter reads from.
+#[derive(Clone, Copy)]
+struct Here {
+    cgroup_ns: Option<u64>,
+    pid_ns: Option<u64>,
+}
+
+/// The decision behind [`scope_populated`], with the reads passed in.
+/// - Same cgroup namespace and a recorded path: that path's `cgroup.events`
+///   (a missing directory is empty: systemd removes an emptied scope).
+/// - Same pid namespace (distrobox and toolbox share the host's): a `/proc`
+///   scan for a process in a cgroup named for the unit. Also how a holder
+///   is answered before its path is recorded, a few ms after spawn.
+/// - A holder written before probes existed: the scan, as best effort.
+/// - Otherwise the waiter can't see the scope: `None`, so it keeps the
+///   claim. That bounds itself: the scope ends when conmon exits, and the
+///   next waiter that can see it (any host run, `muzzle status`) prunes it.
+fn scope_answer(
+    unit: &str,
+    probe: Option<&ScopeProbe>,
+    here: Here,
+    populated: impl Fn(&str) -> Option<bool>,
+    has_process: impl Fn(&str) -> Option<bool>,
+) -> Option<bool> {
+    let same = |a: Option<u64>, b: Option<u64>| a.is_some() && a == b;
+    let Some(p) = probe else {
+        return has_process(unit);
+    };
+    if let Some(path) = p
+        .cgroup
+        .as_deref()
+        .filter(|_| same(p.cgroup_ns, here.cgroup_ns))
+    {
+        return populated(path);
+    }
+    if same(p.pid_ns, here.pid_ns) {
+        return has_process(unit);
+    }
+    None
+}
+
+/// For stopping a leftover scope: empty only when known to be.
+fn scope_known_empty(unit: &str) -> bool {
+    proc::cgroup_has_process(unit) == Some(false)
 }
 
 fn now_ms() -> u64 {
@@ -386,7 +426,7 @@ impl Queue<'_> {
         // units had piled up). Stop it, but only if empty: a populated scope
         // holds a job that outlived its group.
         for unit in &pruned {
-            if scope_loaded(unit) && !scope_populated(unit) {
+            if scope_loaded(unit) && scope_known_empty(unit) {
                 stop_unit(unit);
             }
             reset_failed(unit);
@@ -620,6 +660,20 @@ impl Sampler {
     }
 }
 
+/// The scope's cgroup directory once `pid` (systemd-run, then the command)
+/// has moved into it; `None` if it exits first or `within` passes.
+fn scope_dir(pid: Pid, unit: &str, within: Duration) -> Option<PathBuf> {
+    let scope = format!("{unit}.scope");
+    let deadline = Instant::now() + within;
+    loop {
+        let dir = proc::cgroup_of(pid).filter(|d| d.file_name().is_some_and(|n| *n == *scope));
+        if dir.is_some() || exited(pid) || Instant::now() >= deadline {
+            return dir;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// `systemctl --user show` fields for a scope that's gone or going.
 #[derive(Debug, Default, PartialEq)]
 struct Show {
@@ -676,7 +730,7 @@ fn scope_outcome(unit: &str) -> Show {
             // was signalled mid-setup stays `active` with an empty cgroup
             // forever (see `poll`); stop it, only here at the deadline so an
             // OOM-killed scope has had time to record `oom-kill`.
-            if !settled && scope_loaded(&name) && !scope_populated(&name) {
+            if !settled && scope_loaded(&name) && scope_known_empty(&name) {
                 stop_unit(&name);
             }
             if show.active != "inactive" {
@@ -947,7 +1001,7 @@ impl Job<'_> {
         // scope's MemoryMax and CPUWeight don't reach. Still run it under the
         // scope: it holds podman exec and conmon, and is how a pruner sees
         // the job outlive a group kill.
-        let container = crate::rules::enters_container(&crate::rules::command_text(&args.command));
+        let container = crate::rules::argv_enters_container(&args.command);
         let enforced = scoped && !container;
         let reason = container.then_some(EnforcedReason::Container);
         let unit = unit_name(self.me, self.my_start, self.ticket);
@@ -1011,26 +1065,35 @@ impl Job<'_> {
             Target::Group(pid)
         };
         let pgid = if self.leader { self.me } else { pid as u32 };
-        self.store.update(now_ms(), |s| {
-            if let Some(h) = s.holder_mut(self.ticket) {
-                h.pgid = Some(pgid);
-                h.enforced = enforced;
-                h.enforced_reason = reason;
-                h.scope = scope.clone();
-            }
-            Ok(())
-        })?;
-        self.holder.pgid = Some(pgid);
-        self.holder.enforced = enforced;
-        self.holder.enforced_reason = reason;
-        self.holder.scope = scope;
-
+        // D16a: until the path is known, a waiter in this pid namespace
+        // finds the scope by scanning /proc, so the probe goes in at once.
+        let mut probe = scope.as_ref().map(|_| ScopeProbe {
+            cgroup: None,
+            cgroup_ns: proc::namespace("cgroup"),
+            pid_ns: proc::namespace("pid"),
+        });
+        self.set_spawned(pgid, enforced, reason, &scope, &probe)?;
         let mut sampler = scoped.then(|| Sampler {
             unit: unit.clone(),
             dir: None,
             last: None,
             next: Instant::now(),
         });
+        if let (Some(p), Some(s)) = (probe.as_mut(), sampler.as_mut()) {
+            // systemd-run moves itself into the scope before it execs the
+            // command, within a few ms on linuxpc; until then the child
+            // sits in muzzle's cgroup. A caught signal stays pending for
+            // `supervise`.
+            s.dir = scope_dir(pid, &unit, Duration::from_secs(2));
+            p.cgroup = s.dir.as_deref().and_then(|d| {
+                d.strip_prefix("/sys/fs/cgroup")
+                    .ok()
+                    .map(|r| format!("/{}", r.display()))
+            });
+            if p.cgroup.is_some() {
+                self.set_spawned(pgid, enforced, reason, &scope, &probe)?;
+            }
+        }
         let mut deadline = Deadline {
             after: run_timeout,
             termed: None,
@@ -1052,7 +1115,12 @@ impl Job<'_> {
             ending.killed = Some(Killed::Signal);
         }
 
-        let kept = !deadline.fired() && !target.others().is_empty();
+        // D16a: a container job outlives its group on every exit path, not
+        // only a group SIGKILL: Ctrl-C, SIGTERM to muzzle and --run-timeout
+        // all end the top command and leave conmon and the job running in
+        // the scope (rv_cg_graceful_stop_frees_container). Hand off rather
+        // than release, so a leaked build still holds its slots.
+        let kept = (!deadline.fired() && !target.others().is_empty()) || self.scope_busy();
         let mut released_ms = None;
         if kept {
             self.hand_off(target, sampler, unit, started, &ending)?;
@@ -1083,6 +1151,41 @@ impl Job<'_> {
         }
         self.finish(args, ran_s, released_ms, &ending, enforced, kept)?;
         Ok(ending.code)
+    }
+
+    /// Store what spawn learnt in the holder entry and in `self.holder`.
+    fn set_spawned(
+        &mut self,
+        pgid: u32,
+        enforced: bool,
+        reason: Option<EnforcedReason>,
+        scope: &Option<String>,
+        probe: &Option<ScopeProbe>,
+    ) -> anyhow::Result<()> {
+        let apply = |h: &mut Holder| {
+            h.pgid = Some(pgid);
+            h.enforced = enforced;
+            h.enforced_reason = reason;
+            h.scope = scope.clone();
+            h.probe = probe.clone();
+        };
+        self.store.update(now_ms(), |s| {
+            if let Some(h) = s.holder_mut(self.ticket) {
+                apply(h);
+            }
+            Ok(())
+        })?;
+        apply(&mut self.holder);
+        Ok(())
+    }
+
+    /// D16a: a container run's scope still has processes (conmon and the
+    /// job). False for a host run, which the group already covers.
+    fn scope_busy(&self) -> bool {
+        self.holder
+            .scope
+            .as_deref()
+            .is_some_and(|u| scope_populated(u, self.holder.probe.as_ref()))
     }
 
     fn record(
@@ -1270,10 +1373,16 @@ impl Job<'_> {
         }
         loop {
             let others = target.others();
-            let Some(&member) = others.first() else { break };
-            if let Some(s) = sampler.as_mut() {
-                // The top command is gone; find the scope through any member.
-                s.sample(member);
+            match others.first() {
+                Some(&member) => {
+                    if let Some(s) = sampler.as_mut() {
+                        // The top command is gone; find the scope through
+                        // any member.
+                        s.sample(member);
+                    }
+                }
+                None if self.scope_busy() => {}
+                None => break,
             }
             std::thread::sleep(POLL);
         }
@@ -1388,7 +1497,7 @@ mod tests {
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
         }
-        fn scope_alive(&self, _unit: &str) -> bool {
+        fn scope_alive(&self, _unit: &str, _probe: Option<&ScopeProbe>) -> bool {
             false
         }
     }
@@ -1405,6 +1514,7 @@ mod tests {
             kept: false,
             enforced_reason: None,
             scope: None,
+            probe: None,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,
@@ -1427,6 +1537,90 @@ mod tests {
         live.procs.insert((100, 55));
         live.groups.insert(200);
         (s, live)
+    }
+
+    fn probe(cgroup: Option<&str>, cgroup_ns: u64, pid_ns: u64) -> ScopeProbe {
+        ScopeProbe {
+            cgroup: cgroup.map(String::from),
+            cgroup_ns: Some(cgroup_ns),
+            pid_ns: Some(pid_ns),
+        }
+    }
+
+    const HOST: Here = Here {
+        cgroup_ns: Some(1),
+        pid_ns: Some(2),
+    };
+
+    /// rv_cg_scope_probe_fails_open: no answer is never "empty".
+    #[test]
+    fn a_waiter_that_cannot_see_the_scope_keeps_the_claim() {
+        let p = probe(Some("/app.slice/u.scope"), 1, 2);
+        let nothing = |_: &str| None;
+        let empty = |_: &str| Some(false);
+        // A container with its own cgroup and pid namespaces: no read.
+        let other = Here {
+            cgroup_ns: Some(9),
+            pid_ns: Some(8),
+        };
+        assert_eq!(scope_answer("u.scope", Some(&p), other, empty, empty), None);
+        // A platform that reads no namespaces at all.
+        let blind = Here {
+            cgroup_ns: None,
+            pid_ns: None,
+        };
+        assert_eq!(scope_answer("u.scope", Some(&p), blind, empty, empty), None);
+        // The reads themselves can't answer (no cgroup v2, /proc unreadable).
+        assert_eq!(
+            scope_answer("u.scope", Some(&p), HOST, nothing, empty),
+            None
+        );
+        let distrobox = Here {
+            cgroup_ns: Some(9),
+            pid_ns: Some(2),
+        };
+        assert_eq!(
+            scope_answer("u.scope", Some(&p), distrobox, empty, nothing),
+            None
+        );
+        // And None keeps the claim.
+        assert!(scope_answer("u.scope", Some(&p), other, empty, empty).unwrap_or(true));
+    }
+
+    #[test]
+    fn the_recorded_path_answers_in_its_namespace_and_proc_elsewhere() {
+        let p = probe(Some("/app.slice/u.scope"), 1, 2);
+        let populated = |path: &str| Some(path == "/app.slice/u.scope");
+        let scan = |leaf: &str| Some(leaf == "v.scope");
+        // On the host: cgroup.events of the recorded path, not a scan.
+        assert_eq!(
+            scope_answer("u.scope", Some(&p), HOST, populated, scan),
+            Some(true)
+        );
+        // Inside distrobox (own cgroup ns, host pid ns): the scan.
+        let distrobox = Here {
+            cgroup_ns: Some(9),
+            pid_ns: Some(2),
+        };
+        assert_eq!(
+            scope_answer("u.scope", Some(&p), distrobox, populated, scan),
+            Some(false)
+        );
+        assert_eq!(
+            scope_answer("v.scope", Some(&p), distrobox, populated, scan),
+            Some(true)
+        );
+        // Path not recorded yet: the scan, on the host too.
+        let early = probe(None, 1, 2);
+        assert_eq!(
+            scope_answer("v.scope", Some(&early), HOST, populated, scan),
+            Some(true)
+        );
+        // A holder from before probes existed: best effort, the scan.
+        assert_eq!(
+            scope_answer("v.scope", None, HOST, populated, scan),
+            Some(true)
+        );
     }
 
     #[test]

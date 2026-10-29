@@ -106,6 +106,9 @@ pub struct Report {
     /// Added field (D16a): rules whose jobs enter a container, so muzzle
     /// admits them but can't cap or measure them. Empty when none.
     pub container_rules: Vec<String>,
+    /// Added field (D16a): catch-all rules that match a container entry as
+    /// well as host commands. Their host runs are enforced.
+    pub container_maybe: Vec<String>,
     pub pi_extension: &'static str,
     pub claude_hook: &'static str,
     pub codex_hook: &'static str,
@@ -145,39 +148,53 @@ fn enforcement(os: &str, systemd: bool) -> String {
     }
 }
 
-/// D16a: what a rule's pattern is probed with. A command in a container
-/// is the whole string, so a rule that matches one of these, or names a
-/// container tool in its pattern, is taken to wrap container entries.
-const CONTAINER_PROBES: [&str; 4] = [
+/// D16a: what a rule's pattern is probed with. A rule that matches one of
+/// these, or that `runs.jsonl` shows entering a container, is flagged.
+/// Not a substring test on the pattern: `^docker build` names docker but
+/// never enters a container (rv_cg_doctor_flags_by_substring).
+const CONTAINER_PROBES: [&str; 6] = [
     "distrobox enter box -- true",
     "podman exec box true",
     "toolbox run true",
+    "toolbox enter",
     "docker exec box true",
+    "docker compose exec app true",
 ];
-const CONTAINER_TOOLS: [&str; 4] = ["distrobox", "podman", "toolbox", "docker"];
 
-/// Rules that enter a container: by pattern (above) or because
-/// `runs.jsonl` recorded such a run for them. Sorted, no duplicates.
-fn container_rules(config: Option<&Config>, seen: &[String]) -> Vec<String> {
-    let mut out: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+/// A pattern that also matches these is a catch-all: it may wrap a
+/// container entry, but most of what it matches runs on the host.
+const HOST_PROBES: [&str; 2] = ["make", "cargo test"];
+
+/// Rules that enter a container, by probe match or because `runs.jsonl`
+/// recorded such a run for them, split into those that do and catch-alls
+/// that may. Each sorted, no duplicates.
+fn container_rules(config: Option<&Config>, seen: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut sure: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+    let mut maybe = std::collections::BTreeSet::new();
     if let Some(c) = config {
         let rules = c
             .rules
             .iter()
             .chain(c.projects.iter().flat_map(|p| &p.rules));
         for r in rules {
-            let src = r.pattern.as_str();
-            if CONTAINER_TOOLS.iter().any(|t| src.contains(t))
-                || CONTAINER_PROBES.iter().any(|p| r.pattern.is_match(p))
-            {
-                out.insert(r.name.clone());
+            if !CONTAINER_PROBES.iter().any(|p| r.pattern.is_match(p)) {
+                continue;
+            }
+            if HOST_PROBES.iter().any(|p| r.pattern.is_match(p)) {
+                maybe.insert(r.name.clone());
+            } else {
+                sure.insert(r.name.clone());
             }
         }
     }
-    out.into_iter().collect()
+    // A catch-all with recorded container runs does enter one.
+    maybe.retain(|n| !sure.contains(n));
+    (sure.into_iter().collect(), maybe.into_iter().collect())
 }
 
 pub fn check(f: &Facts) -> Report {
+    let (container_rules, container_maybe) =
+        container_rules(f.config.as_ref().ok(), &f.container_runs);
     let mut warnings = Vec::new();
     let (reserve, config_slots, rules, hash, config_error) = match &f.config {
         Ok(c) => (
@@ -278,7 +295,8 @@ pub fn check(f: &Facts) -> Report {
         rules,
         config_hash: hash,
         runs: f.runs.clone(),
-        container_rules: container_rules(f.config.as_ref().ok(), &f.container_runs),
+        container_rules,
+        container_maybe,
         pi_extension: found(&f.harnesses.pi_extension, "loaded", "not installed"),
         claude_hook: found(&f.harnesses.claude_hook, "installed", "not found"),
         codex_hook: found(&f.harnesses.codex_hook, "installed", "not found"),
@@ -339,15 +357,22 @@ pub fn render_text(r: &Report) -> String {
             ),
         },
     );
+    let mut containers = Vec::new();
     if !r.container_rules.is_empty() {
-        line(
-            "containers",
-            format!(
-                "admission only for {} (D16a): the job runs in the container's cgroup, \
-                 so MemoryMax, CPUWeight and the cpu/mem figures don't reach it",
-                r.container_rules.join(", ")
-            ),
-        );
+        containers.push(format!(
+            "admission only for {} (D16a): the job runs in the container's cgroup, \
+             so MemoryMax, CPUWeight and the cpu/mem figures don't reach it",
+            r.container_rules.join(", ")
+        ));
+    }
+    if !r.container_maybe.is_empty() {
+        containers.push(format!(
+            "{} may enter containers; those runs are admission only (D16a)",
+            r.container_maybe.join(", ")
+        ));
+    }
+    if !containers.is_empty() {
+        line("containers", containers.join("; "));
     }
     line("pi extension", r.pi_extension.into());
     line("claude hook", r.claude_hook.into());
@@ -733,16 +758,30 @@ mod tests {
             "[[rule]]\nname='any'\nmatch='.'\n",
             "[[rule]]\nname='gate'\nmatch='^contrib/gate'\n",
             "[[rule]]\nname='plain'\nmatch='^make'\n",
+            "[[rule]]\nname='dockbuild'\nmatch='^docker build'\n",
+            "[[rule]]\nname='boxgate'\nmatch='(^|&&\\s*)distrobox enter \\S+ -- contrib/'\n",
+            "[[rule]]\nname='compose'\nmatch='compose exec'\n",
         ));
         f.container_runs = vec!["gate".into(), "gate".into()];
         let r = check(&f);
-        assert_eq!(r.container_rules, ["any", "box", "gate"]);
+        // boxgate needs a `contrib/` job, which no probe has: only the log
+        // can name it. dockbuild names docker but never enters a container.
+        assert_eq!(r.container_rules, ["box", "compose", "gate"]);
+        assert_eq!(r.container_maybe, ["any"]);
         let t = render_text(&r);
         assert!(
-            t.contains("containers     admission only for any, box, gate (D16a)"),
+            t.contains("containers     admission only for box, compose, gate (D16a)"),
             "{t}"
         );
         assert!(t.contains("MemoryMax, CPUWeight"), "{t}");
+        assert!(t.contains("; any may enter containers"), "{t}");
+        assert!(!t.contains("dockbuild"), "{t}");
+
+        // Seen in the log, a catch-all does enter one.
+        f.container_runs = vec!["any".into()];
+        let r = check(&f);
+        assert_eq!(r.container_rules, ["any", "box", "compose"]);
+        assert!(r.container_maybe.is_empty());
     }
 
     #[test]

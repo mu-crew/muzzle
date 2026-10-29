@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Holder, Killed, RunRecord, State, Waiter};
+use crate::state::{Holder, Killed, RunRecord, ScopeProbe, State, Waiter};
 
 /// D10. Declaration order is queue order: `High` sorts first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -25,8 +25,10 @@ pub trait Liveness {
     fn alive(&self, pid: u32, start: u64) -> bool;
     /// The group has at least one live, non-zombie member.
     fn group_alive(&self, pgid: u32) -> bool;
-    /// The systemd scope unit (`muzzle-….scope`) still has processes.
-    fn scope_alive(&self, unit: &str) -> bool;
+    /// The systemd scope unit (`muzzle-….scope`) still has processes, as
+    /// `probe` (recorded at spawn) says to look. Unanswerable is `true`:
+    /// freeing slots a live container job uses is the worse error (D16a).
+    fn scope_alive(&self, unit: &str, probe: Option<&ScopeProbe>) -> bool;
 }
 
 /// The holder's claim is still in use: its muzzle (or keeper) lives, its
@@ -36,7 +38,9 @@ pub trait Liveness {
 pub fn holds(h: &Holder, live: &impl Liveness) -> bool {
     live.alive(h.pid, h.start)
         || h.pgid.is_some_and(|g| live.group_alive(g))
-        || h.scope.as_deref().is_some_and(|u| live.scope_alive(u))
+        || h.scope
+            .as_deref()
+            .is_some_and(|u| live.scope_alive(u, h.probe.as_ref()))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +134,7 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         kept: false,
         enforced_reason: None,
         scope: None,
+        probe: None,
         claim,
     }
 }
@@ -191,7 +196,7 @@ mod tests {
         fn group_alive(&self, pgid: u32) -> bool {
             self.groups.contains(&pgid)
         }
-        fn scope_alive(&self, unit: &str) -> bool {
+        fn scope_alive(&self, unit: &str, _probe: Option<&ScopeProbe>) -> bool {
             self.scopes.contains(unit)
         }
     }

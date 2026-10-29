@@ -158,3 +158,15 @@ pub(super) fn cgroup_of(_pid: Pid) -> Option<PathBuf> {
 pub(super) fn cgroup_figures(_dir: &Path) -> Option<CgroupFigures> {
     None
 }
+
+pub(super) fn namespace(_kind: &str) -> Option<u64> {
+    None
+}
+
+pub(super) fn cgroup_populated(_rel: &str) -> Option<bool> {
+    None
+}
+
+pub(super) fn cgroup_has_process(_leaf: &str) -> Option<bool> {
+    None
+}

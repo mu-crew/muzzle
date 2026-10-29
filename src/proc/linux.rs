@@ -85,6 +85,55 @@ pub(super) fn cgroup_of(pid: Pid) -> Option<PathBuf> {
     Some(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
+pub(super) fn namespace(kind: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(format!("/proc/self/ns/{kind}"))
+        .ok()
+        .map(|m| m.ino())
+}
+
+pub(super) fn cgroup_populated(rel: &str) -> Option<bool> {
+    let root = Path::new("/sys/fs/cgroup");
+    // Not a cgroup v2 mount here (a sandbox, or v1): unanswerable.
+    if !root.join("cgroup.controllers").exists() {
+        return None;
+    }
+    match fs::read_to_string(root.join(rel.trim_start_matches('/')).join("cgroup.events")) {
+        Ok(t) => Some(t.lines().any(|l| l == "populated 1")),
+        // systemd removes a scope's cgroup once it empties.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
+pub(super) fn cgroup_has_process(leaf: &str) -> Option<bool> {
+    // This process must read as cgroup v2, or "nobody found" means nothing.
+    let me = fs::read_to_string("/proc/self/cgroup").ok()?;
+    me.lines().find(|l| l.starts_with("0::"))?;
+    for entry in fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        // A process can exit mid-scan; its read just fails.
+        let Ok(text) = fs::read_to_string(entry.path().join("cgroup")) else {
+            continue;
+        };
+        if text
+            .lines()
+            .filter_map(|l| l.strip_prefix("0::"))
+            .any(|path| path.split('/').any(|seg| seg == leaf))
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// Read the cgroup files directly rather than `systemctl --user show`:
 /// systemd collects a finished scope at once, and on systemd 259 `show`
 /// then reports `CPUUsageNSec=[not set]` (checked on linuxpc).
