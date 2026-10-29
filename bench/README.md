@@ -28,7 +28,7 @@ bench/check-trace
 
 - Only calls from `linuxpc/` session files are read; others are refused and
   not counted (D37).
-- Rules come from your config through `muzzle match --cwd`, run locally, so
+- Rules come from your config through `muzzle match --cwd DIR`, run locally, so
   command text never leaves the machine. Waits and polls (`mu wait`,
   `mu agent wait`, `mu task wait`, `sleep`, `tail -f`, `museum-search`, and
   segments that only read logs) are `light` however long they take. An
@@ -89,7 +89,7 @@ muzzle bench run bench/traces/2026-10-21.jsonl --mode muzzle --tier synthetic --
 
 - `--mode none` is today's practice (C3): every call starts at its offset
   with the role cap as `CARGO_BUILD_JOBS` (worker 4, orchestrator 6, others
-  2). `--mode muzzle` runs each matched call through `muzzle run --rule`
+  2). `--mode muzzle` runs each matched call through `muzzle run --rule LABEL`
   with a private state dir under `--out` and your current config.
 - Tier 1 (`synthetic`) burns CPU: the rule's slots times `dur_s`, divided by
   `--speed`, split over the threads the mode allows. `light` calls are
