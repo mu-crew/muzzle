@@ -670,6 +670,11 @@ pub fn command_word(text: &str) -> Option<usize> {
     // program they exec (`nice RUST_LOG=x/y cargo test` runs
     // `./RUST_LOG=x/y` if it exists), so it stops the allow.
     let mut assignments = true;
+    // R5 (fix-bare-time): a bare `time` where bash reads a reserved word
+    // (first word, or right after the keyword) is bash's keyword, which
+    // knows only `-p`: `time -f X cargo test` runs a program named `-f`.
+    // After an assignment or another prefix it is GNU time, as is a path.
+    let mut keyword = true;
     loop {
         let w = words.get(at)?.as_str();
         if is_assignment(w) {
@@ -680,8 +685,18 @@ pub fn command_word(text: &str) -> Option<usize> {
                 return None;
             }
             at += 1;
+            keyword = false;
             continue;
         }
+        if keyword && w == "time" {
+            at += 1 + usize::from(words.get(at + 1).map(String::as_str) == Some("-p"));
+            if words.get(at).is_some_and(|n| n.starts_with('-')) {
+                return None;
+            }
+            assignments = false;
+            continue;
+        }
+        keyword = false;
         let Some(o) = ALLOW_PREFIXES.iter().find(|o| o.name == base(w)) else {
             break;
         };
@@ -1099,6 +1114,14 @@ mod tests {
             ("env -- cargo test", "cargo"),
             ("CI=1 nice env RUST_LOG=x cargo test", "cargo"),
             ("CI='x y' cargo test", "cargo"),
+            // fix-bare-time: the keyword takes `-p`; GNU time, by path or
+            // past a prefix or assignment, keeps its options.
+            ("time cargo test", "cargo"),
+            ("time -p cargo test", "cargo"),
+            ("time time -p cargo test", "cargo"),
+            ("/bin/time -f %e cargo test", "cargo"),
+            ("nice time -v cargo test", "cargo"),
+            ("CI=1 time -v cargo test", "cargo"),
         ] {
             let at = command_word(cmd).unwrap_or_else(|| panic!("{cmd}"));
             assert!(cmd[at..].starts_with(word), "{cmd}");
@@ -1132,6 +1155,15 @@ mod tests {
             "env -iP/tmp/evil cargo test",
             // Unknown or file-writing options of the other prefixes.
             "time -o /home/u/.bashrc cargo test",
+            // fix-bare-time: bash's keyword `time` knows only `-p`, so
+            // these run a program named `-f`, `-v`, `-pv` or `-p`.
+            "time -f /bin/echo cargo test",
+            "time -v cargo clippy",
+            "time -pv cargo test",
+            "time -p -p cargo test",
+            "time --verbose cargo test",
+            "time -- cargo test",
+            "time time -f x cargo test",
             "timeout --foo 5 cargo test",
             "nice --adj=5 cargo test",
             // high_env_assignments_name_other_code: only SAFE_VARS.

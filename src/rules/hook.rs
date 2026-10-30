@@ -470,6 +470,10 @@ mod tests {
             "vitest",
             "vitest run",
             "/usr/bin/time -v cargo test",
+            // fix-bare-time: bash's keyword `time` with no option or `-p`.
+            "time cargo test",
+            "time -p cargo test",
+            "/usr/bin/time -v cargo clippy",
             "cargo +nightly test",
             "npm run test",
             "cargo test -pCore",
@@ -498,6 +502,9 @@ mod tests {
             "/tmp/evil/env cargo test",
             "./time cargo test",
             "/tmp/x/timeout 5 contrib/gate",
+            // fix-bare-time: the keyword runs a program named `-f`/`-v`.
+            "time -f /bin/echo cargo test",
+            "time -v cargo clippy",
             "cargo -C/tmp/evil test",
             "cargo --config=x.runner=/e test",
             "npm --prefix=/e run test",
