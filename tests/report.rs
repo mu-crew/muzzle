@@ -5,13 +5,19 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 /// Runs `muzzle report ARGS` over `tests/fixtures/runs/basic.jsonl`. The
 /// state.json budget fixes memory per slot at 2 GiB, so the result doesn't
 /// depend on the test machine. It is stamped now: report ignores a budget
 /// the next run would expire (D17a).
 fn report(args: &[&str]) -> Output {
-    let home = tempfile::tempdir().unwrap();
+    report_in(&tempfile::tempdir().unwrap(), None, 2147483648, args)
+}
+
+/// [`report`] in `home`, which is both XDG homes, with `config` as
+/// `muzzle/config.toml` if given and `ram_per_slot` in the stored budget.
+fn report_in(home: &TempDir, config: Option<&str>, ram_per_slot: u64, args: &[&str]) -> Output {
     let dir = home.path().join("muzzle");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(
@@ -19,11 +25,14 @@ fn report(args: &[&str]) -> Output {
         dir.join("runs.jsonl"),
     )
     .unwrap();
+    if let Some(config) = config {
+        std::fs::write(dir.join("config.toml"), config).unwrap();
+    }
     std::fs::write(
         dir.join("state.json"),
         format!(
             r#"{{"v":1,"next_ticket":1,"updated_ms":{},
-                "budget":{{"budget":8,"cores":8,"ram_per_slot":2147483648}}}}"#,
+                "budget":{{"budget":8,"cores":8,"ram_per_slot":{ram_per_slot}}}}}"#,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -306,4 +315,41 @@ fn by_repo_rows_carry_the_current_config_per_repo() {
 
     let out = run(&["--by", "repo", "--compare", "..2026-11-01", "2026-11-02.."]);
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+/// D17a: under a config `slots =`, report sizes as the next run does. RAM
+/// per slot is this host's reading, not a container-written 1 MB/slot in
+/// state.json, and the cap is the slots value, not the runs' budget 8.
+#[test]
+fn config_slots_sizes_and_caps_suggestions() {
+    let home = tempfile::tempdir().unwrap();
+    let out = report_in(&home, Some("slots = 2\n"), 1024 * 1024, &["--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    for r in v["rules"].as_array().unwrap() {
+        assert!(r["suggest"]["slots"].as_u64().is_none_or(|s| s <= 2), "{r}");
+    }
+    let per = muzzle::proc::total_ram().unwrap() as f64
+        / muzzle::proc::logical_cores().unwrap() as f64
+        / (1024.0 * 1024.0 * 1024.0);
+    // gate's cores alone ask for 6 (8 as an experiment).
+    assert_eq!(rule(&v, "gate")["suggest"]["slots"], 2, "{v}");
+    let js = rule(&v, "js-test");
+    assert_eq!(js["suggest"]["tag"], "oom", "{js}");
+    let evidence = js["suggest"]["evidence"].as_str().unwrap();
+    assert!(
+        evidence.ends_with(&format!("at {per:.1} GB per slot")),
+        "{evidence}"
+    );
+}
+
+/// D29: plain report reads the config only if it exists, so with none it
+/// writes no template.
+#[test]
+fn no_config_writes_no_template() {
+    let home = tempfile::tempdir().unwrap();
+    let out = report_in(&home, None, 2147483648, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert!(!home.path().join("muzzle/config.toml").exists());
 }

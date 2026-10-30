@@ -47,13 +47,18 @@ pub const UNMATCHED_HINT: &str = "museum-search calls --min-secs 30 --tool bash"
 pub struct Host {
     /// D9 memory per slot, in MB. `None` disables memory suggestions.
     pub mem_per_slot_mb: Option<f64>,
-    /// Cap for suggestions when the runs don't carry a budget.
+    /// Cap for suggestions when there is no `config_slots` and the latest
+    /// run doesn't carry a budget.
     pub budget: Option<u32>,
+    /// A config `slots =` (D17a): the next run's budget whatever the runs
+    /// recorded, so it caps suggestions over every run's own budget.
+    pub config_slots: Option<u32>,
 }
 
 /// D9 memory per slot and the budget the next run at `now_ms` would use,
 /// as state.rs `resolve_budget` picks it (D17a): with a config `slots =`,
-/// that slot count and this host's own cores and RAM; otherwise the stored
+/// that slot count, which then caps every suggestion, and this host's own
+/// cores and RAM; otherwise the stored
 /// budget, read through `live_budget` as `status` and `doctor` do (an idle
 /// state file past `BUDGET_TTL_MS`, which the next run ignores, sizes
 /// nothing); else this host's reading with no cap.
@@ -81,14 +86,17 @@ fn resolve_host(
         (Some(slots), _) => Host {
             mem_per_slot_mb: measured.or(stored),
             budget: Some(slots),
+            config_slots: Some(slots),
         },
         (None, Some(b)) => Host {
             mem_per_slot_mb: stored,
             budget: Some(b.budget),
+            config_slots: None,
         },
         (None, None) => Host {
             mem_per_slot_mb: measured,
             budget: None,
+            config_slots: None,
         },
     }
 }
@@ -124,9 +132,10 @@ fn read_span(args: &ReportArgs, now: f64) -> Option<(f64, f64)> {
     (since > f64::NEG_INFINITY || until < f64::INFINITY).then_some((since, until))
 }
 
-/// `--by repo` needs the current config (B6), which plain `report` never
-/// reads; a config error exits as everywhere else: 2 for a bad file, 125
-/// for one that can't be read.
+/// `--by repo` needs the whole current config (B6) and loads it, so a
+/// config error exits as everywhere else: 2 for a bad file, 125 for one
+/// that can't be read. Plain `report` reads only `slots =`, silently and
+/// only from an existing file (see [`main`]).
 fn render_by_repo(
     runs: &[Run],
     args: &ReportArgs,
@@ -195,6 +204,7 @@ mod tests {
     pub(super) const HOST: Host = Host {
         mem_per_slot_mb: Some(2048.0),
         budget: None,
+        config_slots: None,
     };
 
     #[test]

@@ -65,7 +65,14 @@ pub fn row(rule: Option<String>, runs: &[&Run], host: Host) -> Row {
         .collect();
     let latest = runs.last().expect("a row has runs");
     let slots = latest.rec.slots;
-    let budget = latest.rec.budget.or(host.budget).unwrap_or(u32::MAX).max(1);
+    // D17a: under `slots =` the next run's budget is that value, so it
+    // beats the budget the latest run recorded (an older slots value).
+    let budget = host
+        .config_slots
+        .or(latest.rec.budget)
+        .or(host.budget)
+        .unwrap_or(u32::MAX)
+        .max(1);
     let waits: Vec<f64> = runs.iter().map(|r| r.rec.waited_s).collect();
     let rans: Vec<f64> = clean.iter().map(|r| r.rec.ran_s).collect();
     let cores: Vec<f64> = clean.iter().filter_map(|r| r.cores()).collect();
@@ -484,6 +491,25 @@ mod tests {
         let (slots, tag, evidence) = slots_tag(&r.suggest);
         assert_eq!((slots, tag), (6, Tag::Experiment));
         assert_eq!(evidence, "saturated at 4: cores p50 3.8 over 5 clean runs");
+    }
+
+    #[test]
+    fn config_slots_caps_over_the_recorded_budget() {
+        // D17a: under `slots =` the next run's budget is that value, so a
+        // recorded budget of 8 from before the change neither caps a
+        // raise to 10 nor lets a suggestion past a lowered 2.
+        let mut runs = with_cores(T0, 4, &[3.0; 5]);
+        runs.iter_mut()
+            .for_each(|r| r.rec.mem_peak_mb = Some(100_000));
+        let at = |slots| {
+            let refs: Vec<&Run> = runs.iter().collect();
+            let host = Host {
+                config_slots: Some(slots),
+                ..HOST
+            };
+            slots_tag(&row(Some("gate".into()), &refs, host).suggest).0
+        };
+        assert_eq!((at(2), at(10)), (2, 10));
     }
 
     #[test]
