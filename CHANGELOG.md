@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1
 
 Rules that match command words (spec
 `docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`). Additive: every
