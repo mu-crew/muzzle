@@ -77,7 +77,9 @@ pub struct Facts {
 pub struct RunsLog {
     /// Size of `runs.jsonl` itself.
     pub bytes: u64,
-    /// Runs in the live file plus the newest archive (rv020r_doctor_live_only).
+    /// Parseable runs in the live file plus the newest archive
+    /// (rv020r_doctor_live_only); torn lines are not counted. The JSON name
+    /// stays `lines`: doctor fields are only added.
     pub lines: usize,
     /// The oldest and newest `end`, RFC 3339 strings compare in time order.
     pub oldest: Option<String>,

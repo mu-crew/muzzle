@@ -14,9 +14,11 @@ use serde::Serialize;
 use crate::proc::loadavg;
 use crate::report::percentile;
 
-/// `git status` runs per burst: enough for a p95 to mean the slowest one.
+/// `git status` runs per burst. `percentile` is nearest-rank, so p95 of 20
+/// is the 19th value, the second slowest: one outlier run doesn't set it.
 const GIT_RUNS: usize = 20;
-/// 10 ms sleeps per burst: 100 so p99 is the single latest wake (~1 s).
+/// 10 ms sleeps per burst (~1 s). Nearest-rank p99 of 100 is the 99th
+/// value, the second-latest wake.
 const SLEEPS: usize = 100;
 const SLEEP: Duration = Duration::from_millis(10);
 /// Files in the scratch repo: `git status` must stat something.

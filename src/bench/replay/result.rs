@@ -33,8 +33,16 @@ pub(super) struct Figures<'a> {
 /// paths or command text: results are committed to `docs/bench/` (D32).
 pub(super) fn result_json(f: &Figures) -> Value {
     let o = f.outcomes;
-    let waits: Vec<f64> = o.iter().map(|c| c.admitted - c.start).collect();
-    let runs: Vec<f64> = o.iter().map(|c| c.end - c.admitted).collect();
+    // D35 (amended 2026-10-30): `wait_s`/`run_s` cover every call, as in
+    // 0.1 results. An unmatched-heavy call never queues (wait 0), so they
+    // understate muzzle's wait by the trace's unmatched share; the
+    // `matched_` figures leave those calls out. Fields are only added.
+    let wait = |c: &Outcome| c.admitted - c.start;
+    let run = |c: &Outcome| c.end - c.admitted;
+    let waits: Vec<f64> = o.iter().map(wait).collect();
+    let runs: Vec<f64> = o.iter().map(run).collect();
+    let matched_waits: Vec<f64> = o.iter().filter(|c| c.matched).map(wait).collect();
+    let matched_runs: Vec<f64> = o.iter().filter(|c| c.matched).map(run).collect();
     let held: Vec<(f64, f64, u32)> = o
         .iter()
         .filter(|c| c.matched)
@@ -96,6 +104,8 @@ pub(super) fn result_json(f: &Figures) -> Value {
         "jobs_per_hour": jobs_per_hour,
         "wait_s": p5090(&waits),
         "run_s": p5090(&runs),
+        "matched_wait_s": p5090(&matched_waits),
+        "matched_run_s": p5090(&matched_runs),
         "max_slots_held": max_held(&held),
         "probe": {
             "bursts": f.bursts.len(),
@@ -125,8 +135,10 @@ pub(super) fn summary(r: &Value) -> String {
          | failed | {failed} |\n\
          | makespan | {makespan} s |\n\
          | throughput | {jph} jobs/h |\n\
-         | wait p50/p90 | {w50}/{w90} s |\n\
-         | run p50/p90 | {r50}/{r90} s |\n\
+         | wait p50/p90, matched calls | {mw50}/{mw90} s |\n\
+         | run p50/p90, matched calls | {mr50}/{mr90} s |\n\
+         | wait p50/p90, all calls | {w50}/{w90} s |\n\
+         | run p50/p90, all calls | {r50}/{r90} s |\n\
          | most slots held | {held} (budget {budget}) |\n\
          | git status p95 | {git} ms |\n\
          | 10 ms sleep late p99 | {late} ms |\n\
@@ -143,6 +155,10 @@ pub(super) fn summary(r: &Value) -> String {
         failed = s(&r["calls"]["failed"]),
         makespan = s(&r["makespan_s"]),
         jph = s(&r["jobs_per_hour"]),
+        mw50 = s(&r["matched_wait_s"]["p50"]),
+        mw90 = s(&r["matched_wait_s"]["p90"]),
+        mr50 = s(&r["matched_run_s"]["p50"]),
+        mr90 = s(&r["matched_run_s"]["p90"]),
         w50 = s(&r["wait_s"]["p50"]),
         w90 = s(&r["wait_s"]["p90"]),
         r50 = s(&r["run_s"]["p50"]),
@@ -253,5 +269,54 @@ mod tests {
         assert_eq!(r["oom_kills"], 1);
         assert_eq!(r["calls"]["failed"], 2);
         assert!(summary(&r).contains("| makespan | 3.0 s |"));
+    }
+
+    /// f-replay-wait: an unmatched-heavy call never queues, so its wait is
+    /// always 0 and drags the all-call wait toward it. The matched figures
+    /// leave it out (D35, amended 2026-10-30).
+    #[test]
+    fn matched_wait_leaves_out_unmatched_calls() {
+        let header = Header {
+            host: "linuxpc".into(),
+            cores: 16,
+            ram_gb: 31,
+            date: "2026-10-08".into(),
+            window_s: 10.0,
+            calls_kept: 3,
+        };
+        let o = |matched, admitted: f64, end: f64| Outcome {
+            matched,
+            slots: 1,
+            start: 0.0,
+            admitted,
+            end,
+            held: None,
+            status: None,
+        };
+        let outcomes = [o(true, 4.0, 5.0), o(false, 0.0, 9.0), o(false, 0.0, 9.0)];
+        let r = result_json(&Figures {
+            mode: BenchMode::Muzzle,
+            tier: BenchTier::Synthetic,
+            speed: 1.0,
+            window: None,
+            window_start: None,
+            header: &header,
+            light: 0,
+            outcomes: &outcomes,
+            makespan: 9.0,
+            bursts: &[],
+            runs: "",
+            budget: Some(4),
+            cfg: "abc".into(),
+        });
+        assert_eq!(r["wait_s"]["p50"], 0.0, "all calls, as before");
+        assert_eq!(r["matched_wait_s"]["p50"], 4.0);
+        assert_eq!(r["matched_run_s"]["p50"], 1.0);
+        let s = summary(&r);
+        assert!(
+            s.contains("| wait p50/p90, matched calls | 4.0/4.0 s |"),
+            "{s}"
+        );
+        assert!(s.contains("| wait p50/p90, all calls | 0.0/4.0 s |"), "{s}");
     }
 }

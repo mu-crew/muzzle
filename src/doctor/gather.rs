@@ -36,7 +36,8 @@ fn runs_log(dir: &Path, recent: &str) -> Option<RunsLog> {
         .collect();
     Some(RunsLog {
         bytes: bytes.unwrap_or(0),
-        lines: recent.lines().filter(|l| !l.trim().is_empty()).count(),
+        // Runs, not lines: a torn or unparseable line is no run.
+        lines: ends.len(),
         oldest: ends.iter().min().cloned(),
         newest: ends.iter().max().cloned(),
     })
@@ -252,7 +253,7 @@ mod tests {
         )
         .unwrap();
         let l = runs_log(dir.path(), &recent_runs(dir.path())).unwrap();
-        assert_eq!((l.lines, l.bytes), (3, 66));
+        assert_eq!((l.lines, l.bytes), (2, 66), "`bad` is not a run");
         assert_eq!(l.oldest.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(l.newest.as_deref(), Some("2026-10-05T00:00:00Z"));
     }

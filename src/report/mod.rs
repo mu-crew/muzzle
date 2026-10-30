@@ -49,10 +49,12 @@ pub struct Host {
     pub budget: Option<u32>,
 }
 
-/// D9 memory per slot and the budget, from the stored state (D17a) when
-/// there is one, else this host's reading.
-fn host(store: &crate::state::Store) -> Host {
-    if let Ok(Some(b)) = store.read().map(|s| s.budget) {
+/// D9 memory per slot and the budget, from the stored budget (D17a) the
+/// next run at `now_ms` would use, else this host's reading. It reads
+/// through `live_budget` as `status` and `doctor` do, so an idle state file
+/// past `BUDGET_TTL_MS`, which the next run ignores, sizes nothing.
+fn host(store: &crate::state::Store, now_ms: u64) -> Host {
+    if let Ok(Some(b)) = store.read().map(|s| s.live_budget(now_ms)) {
         return Host {
             mem_per_slot_mb: Some(b.ram_per_slot as f64 / (1024.0 * 1024.0)),
             budget: Some(b.budget),
@@ -124,14 +126,15 @@ fn render_by_repo(
 
 pub fn main(args: &ReportArgs) -> anyhow::Result<ExitCode> {
     let store = crate::state::Store::open_default()?;
-    let now = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
+    let now_ms = crate::status::now_ms();
+    let now = now_ms as f64 / 1000.0;
     let (runs, skipped) = parse(&crate::runlog::read(store.dir(), read_span(args, now))?);
     if skipped > 0 {
         eprintln!("muzzle: report: skipped {skipped} unreadable runs.jsonl lines");
     }
     let out = match args.by {
-        Some(crate::cli::By::Repo) => render_by_repo(&runs, args, now, host(&store)),
-        None => Ok(render(&runs, args, now, host(&store))),
+        Some(crate::cli::By::Repo) => render_by_repo(&runs, args, now, host(&store, now_ms)),
+        None => Ok(render(&runs, args, now, host(&store, now_ms))),
     };
     let out = match out {
         Ok(out) => out,
@@ -160,6 +163,25 @@ mod tests {
         mem_per_slot_mb: Some(2048.0),
         budget: None,
     };
+
+    #[test]
+    fn host_ignores_an_expired_stored_budget() {
+        // D17a: the next run drops a budget stored over an hour ago in an
+        // idle file, so report must not size memory from it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::state::Store::open(dir.path()).unwrap();
+        std::fs::write(
+            store.state_path(),
+            r#"{"v":1,"next_ticket":1,"updated_ms":1000,
+               "budget":{"budget":3,"cores":3,"ram_per_slot":1048576}}"#,
+        )
+        .unwrap();
+        let fresh = host(&store, 1000 + crate::state::BUDGET_TTL_MS);
+        assert_eq!((fresh.budget, fresh.mem_per_slot_mb), (Some(3), Some(1.0)));
+        let stale = host(&store, 1001 + crate::state::BUDGET_TTL_MS);
+        assert_eq!(stale.budget, None, "{stale:?}");
+        assert_ne!(stale.mem_per_slot_mb, Some(1.0));
+    }
 
     /// A clean `gate` run on 2 slots under cfg `c1`, budget 8.
     pub(super) fn run(end: f64, ran_s: f64) -> Run {

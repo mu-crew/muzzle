@@ -103,24 +103,22 @@ pub fn check(f: &Facts) -> Report {
             ram_per_slot: ram / u64::from(cores),
         }
     });
-    // D17a: the stored values win until the file goes idle, except that a
-    // config `slots =` replaces them on the next run.
+    // D17a, as state.rs `resolve_budget`: the stored values win until the
+    // file goes idle, except that a config `slots =` replaces them on the
+    // next run with the slot count and this host's own cores and RAM.
     let (effective, budget_source) = match (f.stored, config_slots) {
-        (Some(s), Some(slots)) => (Some(Budget { budget: slots, ..s }), "config"),
-        (Some(s), None) => (Some(s), "stored"),
-        (None, _) => (
-            measured,
-            if config_slots.is_some() {
-                "config"
-            } else {
-                "measured"
-            },
+        (_, Some(slots)) => (
+            // No reading here means the run would fail to read too; show
+            // the stored cores and RAM rather than nothing.
+            measured.or(f.stored.map(|s| Budget { budget: slots, ..s })),
+            "config",
         ),
+        (Some(s), None) => (Some(s), "stored"),
+        (None, None) => (measured, "measured"),
     };
-    if let (Some(s), Some(m)) = (f.stored, measured)
-        && (s.cores != m.cores
-            || s.ram_per_slot != m.ram_per_slot
-            || (config_slots.is_none() && s.budget != m.budget))
+    // With `slots =` nothing stored applies, so there is nothing to warn of.
+    if let (Some(s), Some(m), None) = (f.stored, measured, config_slots)
+        && (s.cores != m.cores || s.ram_per_slot != m.ram_per_slot || s.budget != m.budget)
     {
         warnings.push(format!(
             "stored budget differs from this reading (D17a): stored {} slots, {} cores, \
@@ -304,6 +302,26 @@ mod tests {
         let r = check(&f);
         assert_eq!((r.budget, r.budget_source), (Some(5), "config"));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn config_slots_takes_cores_and_ram_from_this_reading() {
+        // D17a, state.rs resolve_budget: with `slots =` the next run keeps
+        // only the slot count and reads cores and RAM per slot itself, so
+        // a container's stored 8 cores / 1 GiB must not reach MemoryMax.
+        let mut f = facts();
+        f.config = cfg("slots = 5\n");
+        f.stored = stored(6, 8, GIB);
+        let r = check(&f);
+        assert_eq!(
+            (r.budget, r.cores, r.ram_per_slot_mb, r.budget_source),
+            (Some(5), Some(16), Some(2048), "config")
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "nothing stored applies: {:?}",
+            r.warnings
+        );
     }
 
     #[test]

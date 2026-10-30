@@ -8,7 +8,8 @@ use serde_json::Value;
 
 /// Runs `muzzle report ARGS` over `tests/fixtures/runs/basic.jsonl`. The
 /// state.json budget fixes memory per slot at 2 GiB, so the result doesn't
-/// depend on the test machine.
+/// depend on the test machine. It is stamped now: report ignores a budget
+/// the next run would expire (D17a).
 fn report(args: &[&str]) -> Output {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path().join("muzzle");
@@ -20,7 +21,14 @@ fn report(args: &[&str]) -> Output {
     .unwrap();
     std::fs::write(
         dir.join("state.json"),
-        r#"{"v":1,"next_ticket":1,"budget":{"budget":8,"cores":8,"ram_per_slot":2147483648}}"#,
+        format!(
+            r#"{{"v":1,"next_ticket":1,"updated_ms":{},
+                "budget":{{"budget":8,"cores":8,"ram_per_slot":2147483648}}}}"#,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ),
     )
     .unwrap();
     Command::new(env!("CARGO_BIN_EXE_muzzle"))
