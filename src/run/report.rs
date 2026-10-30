@@ -207,6 +207,7 @@ mod tests {
             },
             leader: true,
             spawned: false,
+            ended: None,
         };
         let ending = Ending {
             code: 0,

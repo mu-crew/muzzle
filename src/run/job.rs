@@ -27,6 +27,10 @@ pub(super) struct Job<'a> {
     /// or a pruning waiter, judging liveness, may free the entry: a keeper
     /// may own it, or the job may still run (D16, f-keeper-handoff).
     pub(super) spawned: bool,
+    /// The top command's code, set once it has ended. An error after that
+    /// (a keeper handoff or the release save) is muzzle's, said on stderr,
+    /// and the exit is still this code (spec §Exit codes, 2026-10-30 note).
+    pub(super) ended: Option<u8>,
 }
 
 /// How the top command ended, before anything was released.
@@ -186,6 +190,7 @@ impl Job<'_> {
         } else if status.signal().is_some() {
             ending.killed = Some(Killed::Signal);
         }
+        self.ended = Some(ending.code);
 
         // D16a: a container job outlives its group on every exit path, not
         // only a group SIGKILL: Ctrl-C, SIGTERM to muzzle and --run-timeout

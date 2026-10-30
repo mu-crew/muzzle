@@ -416,6 +416,7 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         budget,
         leader,
         spawned: false,
+        ended: None,
     };
     match job.run(args, run_timeout) {
         Ok(code) => Ok(ExitCode::from(code)),
@@ -426,6 +427,12 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
             // f-keeper-handoff).
             if !job.spawned {
                 let _ = store.update(now_ms(), |s| Ok(s.remove(ticket)));
+            }
+            // The command ran to its end, so its code stands over muzzle's
+            // own failure (spec §Exit codes, 2026-10-30 note).
+            if let Some(code) = job.ended {
+                eprintln!("muzzle: {e:#}");
+                return Ok(ExitCode::from(code));
             }
             Err(e)
         }

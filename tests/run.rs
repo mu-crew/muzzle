@@ -492,6 +492,44 @@ fn a_failing_report_after_the_handoff_leaves_the_keeper_its_claim() {
     assert_eq!(runs[0]["exit"], 3);
 }
 
+/// f-keeper-handoff: a post-spawn error other than `--report` (here the
+/// keeper's fork, refused by an RLIMIT_NPROC of 1 set on muzzle) leaves the
+/// holder to liveness while the background job runs, and the command's code
+/// stands (spec §Exit codes, 2026-10-30 note). `prlimit` is util-linux.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_handoff_leaves_the_claim_to_liveness_and_keeps_the_code() {
+    let env = Env::new();
+    let out = env
+        .leader(&[
+            "--slots",
+            "2",
+            "--",
+            "sh",
+            "-c",
+            "sleep 3 >/dev/null 2>&1 & prlimit --pid $PPID --nproc=1:1; exit 3",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("fork:"), "the handoff failed: {err}");
+    let s = env.state();
+    assert_eq!(
+        s.held(),
+        2,
+        "the background job still holds the slots: {s:?}"
+    );
+    assert!(!s.holders[0].kept, "no keeper took it");
+    // Once the sleep ends, a waiter prunes the entry and is admitted.
+    let out = env
+        .cmd(&["--slots", "4", "--timeout", "10", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(env.state().holders.is_empty());
+}
+
 /// f-append-wedge: with runs.jsonl unwritable, a waiter warns and still
 /// prunes a dead holder and is admitted, and a finished job keeps its own
 /// exit code.
