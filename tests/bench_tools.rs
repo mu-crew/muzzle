@@ -97,7 +97,7 @@ fn every_bad_fixture_fails_for_its_reason() {
         ("bad-duplicate-host", "duplicate key 'host'"),
         ("bad-duplicate-key", "duplicate key 'project'"),
         ("bad-email", "email in 'project'"),
-        ("bad-extra-field", "field 'task' not allowed"),
+        ("bad-extra-field", "an unknown field in a call"),
         ("bad-foreign-host", "foreign host in 'host'"),
         ("bad-free-text", "free text in 'rule'"),
         ("bad-home-dir", "home dir in 'project'"),
@@ -229,6 +229,40 @@ fn errors_never_echo_the_offending_value() {
     let path = fixture("bad-token.jsonl");
     let out = script(tmp.path(), "check-trace", &[path.to_str().unwrap()]);
     assert!(!stderr(&out).contains("ghp_"), "{}", stderr(&out));
+}
+
+/// The trace_followup repro: an unknown key, in the header and in a call,
+/// and a file name that fails the name check are free text, so none of them
+/// reaches the log (D40). The error says where by line number instead.
+#[test]
+fn unknown_keys_and_bad_file_names_are_withheld() {
+    let tmp = tempfile::tempdir().unwrap();
+    let good = fs::read_to_string(fixture("good.jsonl")).unwrap();
+    let mut rows: Vec<Value> = good
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for row in [0, 1] {
+        rows[row]["Martin Trojer secret"] = Value::from("p1");
+    }
+    let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    let path = tmp.path().join("Martin Trojer secret.jsonl");
+    fs::write(&path, text).unwrap();
+    let out = script(tmp.path(), "check-trace", &[path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains(":1: an unknown field in the header"), "{err}");
+    assert!(err.contains(":2: an unknown field in a call"), "{err}");
+    for part in ["Martin", "Trojer", "secret"] {
+        assert!(!err.contains(part), "{part} echoed: {err}");
+    }
+
+    // An unreadable trace: the OS error would carry the path.
+    let missing = tmp.path().join("Martin Trojer secret 2.jsonl");
+    let out = script(tmp.path(), "check-trace", &[missing.to_str().unwrap()]);
+    let err = stderr(&out);
+    assert!(err.contains("trace argument 1: cannot read"), "{err}");
+    assert!(!err.contains("secret"), "{err}");
 }
 
 #[test]
@@ -535,7 +569,7 @@ fn pre_commit_checks_staged_traces_and_refuses_sidecars() {
     let out = hook(&repo);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("bench/traces/2026-10-08.jsonl:4: path"),
+        stderr(&out).contains("2026-10-08.jsonl:4: path"),
         "{}",
         stderr(&out)
     );
@@ -628,7 +662,7 @@ fn pre_commit_rechecks_traces_when_labels_change() {
     let out = hook(&repo);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("bench/traces/2026-10-21.jsonl:2: free text in 'rule'"),
+        stderr(&out).contains("2026-10-21.jsonl:2: free text in 'rule'"),
         "{}",
         stderr(&out)
     );

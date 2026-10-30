@@ -30,8 +30,14 @@ jobs:
       # too (tests/bench_tools.rs); this step names it in the CI log.
       - run: bench/check-trace
 
+  # Both platforms: the D16 execve test (bin/muzzle keeps the group
+  # leader) is only proved on macOS here.
   package:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

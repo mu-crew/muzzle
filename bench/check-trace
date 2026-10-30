@@ -201,7 +201,8 @@ def strings(v: object, where: str = "a value"):
     if isinstance(v, dict):
         for k, x in v.items():
             yield "a key", k
-            yield from strings(x, repr(k))
+            # Only a schema key is named: any other may be the leak (D40).
+            yield from strings(x, repr(k) if k in HEADER_KEYS | CALL_KEYS else "an unknown field")
     elif isinstance(v, list):
         for x in v:
             yield from strings(x, where)
@@ -227,8 +228,9 @@ def int_in(v: object, lo: int, hi: int) -> bool:
 
 
 def check_header(h: dict, err) -> None:
-    for k in sorted(set(h) - HEADER_KEYS):
-        err(f"field {k!r} not allowed in the header")
+    # Counted, not named: an unknown key is free text (D40).
+    if set(h) - HEADER_KEYS:
+        err("an unknown field in the header; name withheld (D40)")
     for k in sorted(HEADER_KEYS - set(h)):
         err(f"header misses {k!r}")
     if h.get("v") != 1:
@@ -261,8 +263,8 @@ def check_header(h: dict, err) -> None:
 
 
 def check_call(c: dict, window: object, rules: set[str], projects: set[str], err) -> None:
-    for k in sorted(set(c) - CALL_KEYS):
-        err(f"field {k!r} not allowed in a call")
+    if set(c) - CALL_KEYS:
+        err("an unknown field in a call; name withheld (D40)")
     for k in sorted(CALL_KEYS - set(c)):
         err(f"call misses {k!r}")
     if c.get("v") != 1:
@@ -285,6 +287,18 @@ def check_call(c: dict, window: object, rules: set[str], projects: set[str], err
         p = c["project"]
         if not (isinstance(p, str) and (PROJECT.fullmatch(p) or p in projects)):
             err("free text in 'project': want p<digits> or a kept name")
+
+
+def display_name(path: str, i: int) -> str:
+    """How errors name trace argument I: its file name only when that
+    passed the name check, since any other name may be the leak (D40)."""
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if trace_file_ok(name):
+        return name
+    p = Path(path).resolve()
+    if BENCH / "traces" in p.parents:
+        return "a file under bench/traces"
+    return f"trace argument {i}"
 
 
 def reject_constant(name: str):
@@ -400,7 +414,8 @@ def main(argv: list[str]) -> int:
             elif f.is_file():
                 traces.append(str(f))
             else:
-                errors.append(f"{f}: not a regular file")
+                # rel passed trace_path_ok, so it carries no free text.
+                errors.append(f"{rel}: not a regular file")
         if bad:
             errors.append(bad_paths_error(bad))
         others = sum(
@@ -415,16 +430,22 @@ def main(argv: list[str]) -> int:
                 f"bench/traces/ has {links} symlink(s); git would publish the link "
                 "target, so only regular files are allowed; names withheld (D40)"
             )
-    for t in traces:
+    for i, t in enumerate(traces, 1):
         if t == "-":
-            errors += check(ns.name or "<stdin>", sys.stdin.read(), rules, projects)
+            name = display_name(ns.name, i) if ns.name else "<stdin>"
+            errors += check(name, sys.stdin.read(), rules, projects)
             continue
+        name = display_name(t, i)
         try:
             text = Path(t).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            errors.append(f"{t}: cannot read: {e}")
+        except OSError as e:
+            # Not str(e): it carries the path.
+            errors.append(f"{name}: cannot read: {e.strerror}")
             continue
-        errors += check(t, text, rules, projects)
+        except UnicodeDecodeError:
+            errors.append(f"{name}: cannot read: not UTF-8")
+            continue
+        errors += check(name, text, rules, projects)
     for e in errors:
         print(f"check-trace: {e}", file=sys.stderr)
     if not errors:

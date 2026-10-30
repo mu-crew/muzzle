@@ -34,8 +34,12 @@ try {
 if (typeof process.execve === "function") {
   try {
     process.execve(binary, [binary, ...process.argv.slice(2)], process.env);
-  } catch {
-    // fall through to spawn, which reports the error
+  } catch (error) {
+    // Say so: the spawn below brings back the group-kill leak (D16), and
+    // silently is how it went unnoticed. Spawn then reports any real error.
+    console.error(
+      `muzzle: execve failed (${error.code ?? error.message}), falling back to spawn: a group kill may leak the job`,
+    );
   }
 }
 

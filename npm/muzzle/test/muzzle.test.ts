@@ -2,7 +2,7 @@
 // muzzle binary: `MUZZLE_BIN`, or target/debug/muzzle from `cargo build`.
 // Each test gets a private XDG config and state.
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -349,19 +349,41 @@ async function until(what: string, ok: () => boolean) {
   assert.fail(`timed out waiting for ${what}`);
 }
 
+/** An `npm i -g` layout under home: the shim finds its platform package by require.resolve. */
+function installShim(): string {
+  const platform = `${process.platform}-${process.arch}`;
+  const modules = join(home, "lib/node_modules/@mu-crew");
+  const shim = join(modules, "muzzle/bin/muzzle");
+  mkdirSync(dirname(shim), { recursive: true });
+  copyFileSync(resolve(here, "../bin/muzzle"), shim);
+  chmodSync(shim, 0o755);
+  mkdirSync(join(modules, `muzzle-${platform}/bin`), { recursive: true });
+  symlinkSync(BIN, join(modules, `muzzle-${platform}/bin/muzzle`));
+  return shim;
+}
+
+test("bin/muzzle: an execve that throws is reported on stderr, then spawn still runs muzzle", () => {
+  const shim = installShim();
+  // Defined on every Node, so the branch runs even where execve is missing.
+  const stub = join(home, "stub-execve.cjs");
+  writeFileSync(
+    stub,
+    `process.execve = () => { const e = new Error("stubbed"); e.code = "EACCES"; throw e; };\n`,
+  );
+  const out = spawnSync(process.execPath, ["--require", stub, shim, "run", "--slots", "1", "--", "sh", "-c", "echo ran-$((6*7))"], {
+    encoding: "utf8",
+  });
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /ran-42/);
+  const lines = out.stderr.split("\n").filter((l) => l.includes("execve failed"));
+  assert.deepEqual(lines, ["muzzle: execve failed (EACCES), falling back to spawn: a group kill may leak the job"]);
+});
+
 test(
   "bin/muzzle execs the binary, so a group SIGKILL leaves no job and no slots (D16)",
   { skip: typeof (process as any).execve !== "function" && "this Node has no process.execve" },
   async () => {
-    // An `npm i -g` layout: the shim finds its platform package by require.resolve.
-    const platform = `${process.platform}-${process.arch}`;
-    const modules = join(home, "lib/node_modules/@mu-crew");
-    const shim = join(modules, "muzzle/bin/muzzle");
-    mkdirSync(dirname(shim), { recursive: true });
-    copyFileSync(resolve(here, "../bin/muzzle"), shim);
-    chmodSync(shim, 0o755);
-    mkdirSync(join(modules, `muzzle-${platform}/bin`), { recursive: true });
-    symlinkSync(BIN, join(modules, `muzzle-${platform}/bin/muzzle`));
+    const shim = installShim();
 
     const jobPid = join(home, "job.pid");
     // detached: a new session and group, as pi runs a bash call.
