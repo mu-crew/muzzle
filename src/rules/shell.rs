@@ -494,11 +494,16 @@ fn strip_options<'a>(wr: &Wrapper, env: bool, mut words: &'a [String]) -> &'a [S
 /// [`WRAPPERS`], because here a wrong step approves a call unprompted.
 const ALLOW_PREFIXES: [&str; 4] = ["env", "time", "timeout", "nice"];
 
+/// Where an [`ALLOW_PREFIXES`] word may live when written as a path
+/// (`/usr/bin/time -v cargo clippy`).
+const TRUSTED_DIRS: [&str; 2] = ["/usr/bin/", "/bin/"];
+
 /// The byte offset in `text` of the command word, when `text` lexes to one
 /// simple command: past assignments and leading `env`, `time`,
 /// `timeout [opts] N` and `nice` with their options. `None` for anything
 /// else, including `env -S`/`--split-string`, which would run a command
-/// hidden in its argument.
+/// hidden in its argument, `env -C`/`--chdir`, and a prefix at a path
+/// outside [`TRUSTED_DIRS`].
 pub fn command_word(text: &str) -> Option<usize> {
     let mut spans = command_spans(text);
     if spans.len() != 1 {
@@ -516,18 +521,34 @@ pub fn command_word(text: &str) -> Option<usize> {
         if !ALLOW_PREFIXES.contains(&base(w)) {
             break;
         }
-        if base(w) == "env"
-            && words[at + 1..].iter().take_while(|n| *n != "--").any(|n| {
-                n.starts_with("--split-string")
-                    || (n.starts_with('-') && !n.starts_with("--") && n.contains('S'))
-            })
+        // R5 (2026-10-30 amendment): a prefix counts by name or from the
+        // system directories only; `/tmp/evil/env` or `./time` is some
+        // other program, which could run anything.
+        if base(w) != w
+            && !TRUSTED_DIRS
+                .iter()
+                .any(|d| w.strip_prefix(d) == Some(base(w)))
         {
             return None;
         }
         // strip_prefix steps over exactly this wrapper and stops at the
         // next word (which the loop above then looks at).
         let rest = strip_one(&words[at..]);
-        at = words.len() - rest.len();
+        let next = words.len() - rest.len();
+        // `env -S` runs a command hidden in its argument; `env -C`/`--chdir`
+        // changes what a relative command word (`./contrib/gate`) and the
+        // program's own config (`.cargo/config.toml`) resolve to (R5).
+        if base(w) == "env"
+            && words[at + 1..next].iter().any(|n| {
+                ["--split-string", "--chdir"]
+                    .iter()
+                    .any(|o| n.starts_with(o))
+                    || (n.starts_with('-') && !n.starts_with("--") && n.contains(['S', 'C']))
+            })
+        {
+            return None;
+        }
+        at = next;
     }
     // A shell, another wrapper (`exec`, `sudo`, `xargs`) or a `*.sh`
     // script as the command word runs some other program, yet an anchored
@@ -702,6 +723,36 @@ mod tests {
         ] {
             let c = commands(cmd).remove(0);
             assert_eq!(strip_prefix(&c).join(" "), rest, "{cmd}");
+        }
+    }
+
+    /// 0.2.1 R5 (2026-10-30 amendment): a prefix counts only from a
+    /// trusted place, and `env` may not change directory.
+    #[test]
+    fn command_word_trusts_only_system_prefixes_and_no_chdir() {
+        for (cmd, word) in [
+            ("cargo test", "cargo"),
+            ("/usr/bin/time -v cargo clippy", "cargo"),
+            ("/bin/env A=1 cargo test", "cargo"),
+            ("A=1 env B=2 nice -n 5 timeout 9 cargo test", "cargo"),
+            ("env -u X cargo test", "cargo"),
+        ] {
+            let at = command_word(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert!(cmd[at..].starts_with(word), "{cmd}");
+        }
+        for cmd in [
+            "/tmp/evil/env cargo test",
+            "./time cargo test",
+            "/tmp/x/timeout 5 contrib/gate",
+            "/usr/local/bin/nice cargo test",
+            "env -C /e ./contrib/gate",
+            "env -C/e cargo test",
+            "env -iC /e cargo test",
+            "env --chdir=/e contrib/gate",
+            "env --chdir /e contrib/gate",
+            "env -S 'x' cargo test",
+        ] {
+            assert_eq!(command_word(cmd), None, "{cmd}");
         }
     }
 

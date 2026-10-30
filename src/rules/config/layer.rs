@@ -155,8 +155,11 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
                             return Err(bad("a command pattern is empty"));
                         }
                         // R2 prefixes are for subcommand words only: a `*`
-                        // program would match any program, and the hook
-                        // would auto-allow it (R5).
+                        // program would wrap any program it prefixes
+                        // (`cargo*` takes `cargo-evil`). The hook's R5
+                        // exact form compares the program literally, so it
+                        // would never auto-allow one: the rule just can't
+                        // mean what it says.
                         if pats.iter().any(|p| p[0].contains('*')) {
                             return Err(bad("a command's program can't contain '*'"));
                         }

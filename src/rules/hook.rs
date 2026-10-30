@@ -368,6 +368,8 @@ mod tests {
             "cargo +nightly test -p x",
             "timeout 600 cargo test",
             "A=1 env B=2 cargo test",
+            "/usr/bin/time -v cargo test",
+            "cargo +nightly test",
             "contrib/gate",
             "./contrib/gate --fast",
             "npm run test:fast",
@@ -388,6 +390,15 @@ mod tests {
             "sudo cargo test",
             "env -S 'x' cargo test",
             "flock /l cargo test",
+            // f-prefix-basename, f-glued-opts, f-env-chdir.
+            "/tmp/evil/env cargo test",
+            "./time cargo test",
+            "/tmp/x/timeout 5 contrib/gate",
+            "cargo -C/tmp/evil test",
+            "cargo --config=x.runner=/e test",
+            "npm --prefix=/e run test",
+            "env -C /e ./contrib/gate",
+            "env --chdir=/e contrib/gate",
         ] {
             undecided(&claude(cmd, &c));
         }

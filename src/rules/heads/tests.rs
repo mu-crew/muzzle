@@ -187,6 +187,16 @@ fn head_matching_rules() {
     assert!(!x("cargo --config runner=/tmp/e test", "cargo test"));
     assert!(!x("npm --prefix /tmp/evil test", "npm test"));
     assert!(x("cargo --locked test -p x", "cargo test"));
+    assert!(x("cargo +nightly test", "cargo test"));
+    assert!(x("cargo test -- -C --config=x", "cargo test"));
+    // f-glued-opts: glued, clustered or trailing, an R4 option still
+    // names other code to run.
+    assert!(!x("cargo -C/tmp/evil test", "cargo test"));
+    assert!(!x("cargo -qC/tmp/evil test", "cargo test"));
+    assert!(!x("cargo --config=x.runner=/e test", "cargo test"));
+    assert!(!x("cargo test --config=x.runner=/e", "cargo test"));
+    assert!(!x("cargo test --config x.runner=/e", "cargo test"));
+    assert!(!x("npm --prefix=/e run test", "npm run test"));
     // rv021_glob_program: a `*` in the pattern's program is literal here.
     assert!(!x("cargo-evil", "cargo*"));
 }

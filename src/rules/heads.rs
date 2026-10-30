@@ -97,8 +97,32 @@ pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
     let named = word == prog || word.strip_prefix("./") == Some(prog.as_str());
     // No R4 option arguments here: `cargo -C /x test` and
     // `cargo --config 'target.x.runner=…' test` name other code to run, so
-    // they are wrapped but left for the user to approve.
-    named && subcommands_match(&head[1..], pattern, false)
+    // they are wrapped but left for the user to approve, in any spelling
+    // (`-C/x`, `--config=…`) and on either side of the subcommand.
+    named && !names_other_code(&head[1..], prog) && subcommands_match(&head[1..], pattern, false)
+}
+
+/// R5: options that make `prog` run code from somewhere else (another
+/// directory, manifest or config). Short options match inside a cluster.
+fn code_opts(prog: &str) -> &'static [&'static str] {
+    match prog {
+        "cargo" => &["-C", "--config", "--manifest-path"],
+        "npm" => &["-C", "--prefix"],
+        _ => &[],
+    }
+}
+
+/// True when a word before `--` in `rest` is one of `prog`'s
+/// [`code_opts`]: `--opt`, `--opt=…`, `-o`, `-o…` or a cluster with `o`.
+/// Words after `--` go to the test binary or script, not to `prog`.
+fn names_other_code(rest: &[String], prog: &str) -> bool {
+    let opts = code_opts(prog);
+    rest.iter().take_while(|w| *w != "--").any(|w| {
+        opts.iter().any(|o| match o.strip_prefix("--") {
+            Some(_) => w == o || w.strip_prefix(o).is_some_and(|v| v.starts_with('=')),
+            None => !w.starts_with("--") && w.starts_with('-') && w[1..].contains(&o[1..]),
+        })
+    })
 }
 
 fn word_matches(word: &str, pat: &str) -> bool {
