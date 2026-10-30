@@ -71,7 +71,7 @@ pub struct RunArgs {
 pub struct MatchArgs {
     #[arg(long)]
     pub json: bool,
-    /// Select the project rules for DIR.
+    /// Resolve path tables for DIR (its repo, else DIR).
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<PathBuf>,
     #[arg(last = true, required = true, value_name = "SHELL STRING")]

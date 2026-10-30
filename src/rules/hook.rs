@@ -69,7 +69,8 @@ fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bo
     let Some(at) = super::shell::command_word(command) else {
         return false;
     };
-    let Some(m) = config.matches(command, cwd) else {
+    let eff = config.resolve(cwd);
+    let Some(m) = eff.matches(command) else {
         return false;
     };
     m.rule
@@ -414,10 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn project_rules_use_the_payload_cwd() {
+    fn path_rules_use_the_payload_cwd() {
         let dir = tempfile::tempdir().unwrap();
         let text = format!(
-            "[[project.\"{}\".rule]]\nname='p'\nmatch='make'\nslots=3",
+            "[[path.\"{}\".rule]]\nname='p'\nmatch='make'\nslots=3",
             dir.path().display()
         );
         let c = Config::parse(&text, Path::new("t.toml")).unwrap();

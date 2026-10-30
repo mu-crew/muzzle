@@ -83,7 +83,7 @@ fn git_main(root: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::process::Command;
 
     use super::*;
@@ -109,12 +109,12 @@ mod tests {
         }
     }
 
-    fn git(dir: &Path, args: &[&str]) {
+    pub(crate) fn git(dir: &Path, args: &[&str]) {
         assert!(sh(dir, "git", args), "git is needed for these tests");
     }
 
     /// False, with a note in the output, when jj is not installed.
-    fn jj(dir: &Path, args: &[&str]) -> bool {
+    pub(crate) fn jj(dir: &Path, args: &[&str]) -> bool {
         let ok = sh(dir, "jj", args);
         if !ok {
             eprintln!("jj not found: skipping a jj case");
@@ -122,13 +122,13 @@ mod tests {
         ok
     }
 
-    fn tmp() -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn tmp() -> (tempfile::TempDir, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().canonicalize().unwrap();
         (t, p)
     }
 
-    fn sub(p: &Path, name: &str) -> PathBuf {
+    pub(crate) fn sub(p: &Path, name: &str) -> PathBuf {
         let d = p.join(name);
         fs::create_dir_all(&d).unwrap();
         d

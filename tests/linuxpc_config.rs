@@ -148,8 +148,10 @@ fn polls_and_reads_stay_unclaimed() {
 
 /// D28: later tasks that change this file record the new hash. This pins
 /// the one in linuxpc_config's evidence, so a change can't go unnoticed.
+/// 0.2 P7: hash v2 over set fields only, so the unchanged file moved from
+/// b7e2bb to 101ca4 once on upgrade.
 #[test]
 fn config_hash_is_recorded() {
     let home = config_home();
-    assert_eq!(matched(home.path(), "cargo test")["cfg"], "b7e2bb");
+    assert_eq!(matched(home.path(), "cargo test")["cfg"], "101ca4");
 }

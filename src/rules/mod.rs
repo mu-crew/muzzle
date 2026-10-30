@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod hook;
+pub mod resolve;
 pub mod shell;
 
 use serde_json::{Value, json};
@@ -12,7 +13,8 @@ use std::process::ExitCode;
 
 use crate::cli::{Class, HookArgs, MatchArgs, WrapArgs};
 use crate::exit;
-use config::{Config, Source};
+use config::Config;
+use resolve::{Effective, Source};
 
 /// A rewrite produced by [`wrap`].
 #[derive(Debug, Clone, PartialEq)]
@@ -33,7 +35,8 @@ pub struct Wrapped {
 /// A harness timeout becomes `--run-timeout` so it stops counting the
 /// queue wait (D24).
 pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) -> Option<Wrapped> {
-    let m = matches(config, command, cwd)?;
+    let eff = config.resolve(cwd);
+    let m = matches(&eff, command)?;
     let mut out = format!(
         "muzzle run --rule={} --slots {}",
         quote_word(&m.rule.name),
@@ -51,13 +54,13 @@ pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) 
     })
 }
 
-/// [`Config::matches`], except that a command which already runs muzzle
+/// [`Effective::matches`], except that a command which already runs muzzle
 /// matches nothing (D22): `match`, `wrap` and `hook` all agree.
-fn matches<'a>(config: &'a Config, command: &str, cwd: &Path) -> Option<config::Match<'a>> {
+fn matches<'a>(eff: &'a Effective, command: &str) -> Option<resolve::Match<'a>> {
     if shell::runs_muzzle(command) {
         return None;
     }
-    config.matches(command, cwd)
+    eff.matches(command)
 }
 
 /// D16a: `command` (shell text) enters a container (`distrobox enter`,
@@ -126,9 +129,10 @@ fn class_str(c: Class) -> &'static str {
     }
 }
 
-/// The `match --json` object (spec §CLI).
+/// The `match --json` object (spec §CLI, 0.2 P8 and B4).
 pub fn match_json(config: &Config, command: &str, cwd: &Path) -> Value {
-    match matches(config, command, cwd) {
+    let eff = config.resolve(cwd);
+    match matches(&eff, command) {
         None => json!({ "slots": null }),
         Some(m) => {
             let mut v = json!({
@@ -137,14 +141,18 @@ pub fn match_json(config: &Config, command: &str, cwd: &Path) -> Value {
                 "class": m.rule.class.map(class_str),
                 "source": match m.source {
                     Source::Global => "global",
-                    Source::Project(_) => "project",
+                    Source::Path(_) => "path",
+                },
+                "slots_from": {
+                    "file": m.slots_from.file.to_string_lossy(),
+                    "path": m.slots_from.path,
                 },
                 // Added field: lets the importer and doctor see which
                 // config a label came from (D28).
                 "cfg": config.hash(),
             });
-            if let Source::Project(key) = m.source {
-                v["project"] = json!(key);
+            if let Source::Path(key) = m.source {
+                v["path"] = json!(key);
             }
             v
         }
@@ -162,8 +170,8 @@ pub fn match_main(args: &MatchArgs) -> anyhow::Result<ExitCode> {
     } else if v["slots"].is_null() {
         println!("no rule matches");
     } else {
-        let source = match v.get("project").and_then(Value::as_str) {
-            Some(p) => format!("project {p}"),
+        let source = match v.get("path").and_then(Value::as_str) {
+            Some(p) => format!("path {p}"),
             None => "global".into(),
         };
         let class = v["class"]
@@ -358,7 +366,7 @@ mod tests {
         use clap::Parser;
         for name in ["-x", "--slots", "odd label", "it's"] {
             let mut c = config();
-            c.rules[0].name = name.into();
+            c.global[0].name = name.into();
             let w = wrap(&c, "contrib/gate", Path::new("/"), None).unwrap();
             let out = Command::new("bash")
                 .arg("-c")
@@ -490,20 +498,30 @@ mod tests {
     #[test]
     fn match_json_shapes() {
         let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().display().to_string();
         let text = format!(
-            "[[rule]]\nname='gate'\nmatch='gate'\nslots=6\n[[project.\"{}\".rule]]\nname='p'\nmatch='sweep'\nslots=3\nclass='high'",
-            dir.path().display()
+            "[[rule]]\nname='gate'\nmatch='gate'\nslots=6\n[[rule]]\nname='t'\nmatch='cargo'\n\
+             [[path.\"{key}\".rule]]\nname='p'\nmatch='sweep'\nslots=3\nclass='high'\n\
+             [[path.\"{key}\".rule]]\nname='t'\nclass='high'"
         );
-        let c = Config::parse(&text, Path::new("t.toml")).unwrap();
+        let c = Config::parse(&text, Path::new("/x/t.toml")).unwrap();
         let v = match_json(&c, "contrib/gate", Path::new("/"));
         assert_eq!(
             v,
-            json!({"slots":6,"rule":"gate","class":null,"source":"global","cfg":c.hash()})
+            json!({"slots":6,"rule":"gate","class":null,"source":"global",
+                   "slots_from":{"file":"/x/t.toml","path":null},"cfg":c.hash()})
         );
         let v = match_json(&c, "oracle-sweep", dir.path());
-        assert_eq!(v["source"], "project");
-        assert_eq!(v["class"], "high");
-        assert_eq!(v["project"], dir.path().display().to_string());
+        assert_eq!(
+            v,
+            json!({"slots":3,"rule":"p","class":"high","source":"path","path":key,
+                   "slots_from":{"file":"/x/t.toml","path":key},"cfg":c.hash()})
+        );
+        // B4: a table that only touched the class still makes it "path",
+        // while slots still come from the global list.
+        let v = match_json(&c, "cargo test", dir.path());
+        assert_eq!((&v["source"], &v["path"]), (&json!("path"), &json!(key)));
+        assert_eq!(v["slots_from"], json!({"file":"/x/t.toml","path":null}));
         assert_eq!(match_json(&c, "ls", Path::new("/")), json!({"slots":null}));
     }
 }

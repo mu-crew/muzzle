@@ -3,8 +3,8 @@
 # Weights start from today's hand-set caps (D14) and report/tune moves them
 # (D29). A change here changes the config hash (D28): record the new one.
 #
-# Rules are global, not project rules: the gates run from mu workspaces and
-# worktrees as well as the repo checkouts, so a cwd glob would miss most.
+# Rules are global for now: per-repo weights go in [path."<repo>"] tables
+# (0.2 P1, P2) once report --by repo shows they differ.
 # D17b: agents type `distrobox enter … -- bash -lc '…'` themselves, so the
 # whole string is matched on the host and the job enters the container
 # inside the claim.

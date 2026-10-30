@@ -133,64 +133,94 @@ fn match_without_a_rule() {
 }
 
 #[test]
-fn match_uses_project_rules_for_cwd() {
+fn match_uses_path_tables_for_cwd() {
     let home = tempfile::tempdir().unwrap();
     let proj = tempfile::tempdir().unwrap();
+    let key = proj.path().display().to_string();
     write_config(
         home.path(),
         &format!(
-            "[[rule]]\nname='sweep'\nmatch='sweep'\n[[project.\"{}\".rule]]\nname='oracle'\nmatch='oracle-sweep'\nslots=999\n",
-            proj.path().display()
+            "include = ['machine.toml']\n[[rule]]\nname='sweep'\nmatch='sweep'\n\
+             [[path.\"{key}\".rule]]\nname='oracle'\nmatch='oracle-sweep'\nslots=999\n"
         ),
     );
+    std::fs::write(
+        home.path().join("muzzle/machine.toml"),
+        "[[rule]]\nname='sweep'\nslots=4\n",
+    )
+    .unwrap();
     let cwd = proj.path().to_str().unwrap();
     let v = json_out(&muzzle(
         home.path(),
         &["match", "--json", "--cwd", cwd, "--", "./oracle-sweep"],
         None,
     ));
+    let root = home.path().join("muzzle/config.toml");
     assert_eq!(
-        (v["rule"].clone(), v["slots"].clone()),
-        (json!("oracle"), json!(999))
+        v,
+        json!({"slots": 999, "rule": "oracle", "class": null, "source": "path", "path": key,
+               "slots_from": {"file": root, "path": key}, "cfg": v["cfg"]})
     );
-    assert_eq!(v["source"], "project");
     let v = json_out(&muzzle(
         home.path(),
         &["match", "--json", "--cwd", "/", "--", "./oracle-sweep"],
         None,
     ));
-    assert_eq!(v["rule"], "sweep");
+    assert_eq!(
+        (&v["rule"], &v["slots"], &v["source"]),
+        (&json!("sweep"), &json!(4), &json!("global"))
+    );
+    let machine = home.path().join("muzzle/machine.toml");
+    assert_eq!(v["slots_from"], json!({"file": machine, "path": null}));
+    assert!(v.get("path").is_none(), "{v}");
 }
 
 #[test]
-fn overlapping_projects_match_in_file_order() {
+fn bad_tables_and_includes_exit_2_naming_the_cause() {
     let home = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let b = root.path().join("b");
-    std::fs::create_dir_all(&b).unwrap();
-    let specific = format!(
-        "[[project.\"{}\".rule]]\nname='b'\nmatch='x'\n",
-        b.display()
-    );
-    let broad = format!(
-        "[[project.\"{}/*\".rule]]\nname='a'\nmatch='x'\n",
-        root.path().display()
-    );
-    let mut seen = Vec::new();
-    for (text, rule) in [
-        (format!("{specific}{broad}"), "b"),
-        (format!("{broad}{specific}"), "a"),
-    ] {
-        write_config(home.path(), &text);
-        let v = json_out(&muzzle(
-            home.path(),
-            &["match", "--json", "--cwd", b.to_str().unwrap(), "--", "x"],
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    for (text, include, needle) in [
+        // P1: no alias.
+        (
+            "[[project.\"/x\".rule]]\nname='a'\nmatch='a'\n",
             None,
-        ));
-        assert_eq!(v["rule"], rule, "{text}");
-        seen.push(v["cfg"].clone());
+            "project",
+        ),
+        // B1: two spellings of one directory in one file.
+        (
+            &*format!(
+                "[[path.\"{d}\".rule]]\nname='a'\nmatch='a'\n[[path.\"{d}/\".rule]]\nname='b'\nmatch='b'\n"
+            ),
+            None,
+            "same directory",
+        ),
+        // P5: one level of includes.
+        (
+            "include = ['m.toml']\n",
+            Some("include = ['n.toml']\n"),
+            "m.toml",
+        ),
+        // B2: reweights nothing.
+        (
+            "[[path.\"/x\".rule]]\nname='ghost'\nslots=2\n",
+            None,
+            "ghost",
+        ),
+    ] {
+        write_config(home.path(), text);
+        let m = home.path().join("muzzle/m.toml");
+        match include {
+            Some(t) => std::fs::write(&m, t).unwrap(),
+            None => drop(std::fs::remove_file(&m)),
+        }
+        let out = muzzle(home.path(), &["match", "--json", "--", "x"], None);
+        assert_eq!(out.status.code(), Some(2), "{text}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(needle),
+            "{text}: {out:?}"
+        );
     }
-    assert_ne!(seen[0], seen[1]);
 }
 
 #[test]

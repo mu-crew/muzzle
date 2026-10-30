@@ -35,9 +35,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
-# rules: patterns match the whole shell string; project keys are globs.
+# rules: patterns match the whole shell string.
 regex = "1"
-globset = "0.4"
 
 # Errors: anyhow at the boundary, thiserror for errors callers switch on
 # (exit 2 for bad config, 125 for muzzle's own failures).

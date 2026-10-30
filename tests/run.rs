@@ -725,6 +725,46 @@ fn an_unknown_rule_warns_and_still_runs() {
     );
 }
 
+/// 0.2 B3: `--rule` takes the class as resolved at the run's cwd, and
+/// falls back to the first definition anywhere when the rule isn't active
+/// there, without the unknown-rule warning.
+#[test]
+fn rule_class_resolves_at_the_cwd_then_anywhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let inside = dir.path().join("in");
+    let outside = dir.path().join("out");
+    for d in [&inside, &outside] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let env = Env::with_config(&format!(
+        "[[rule]]\nname='t'\nmatch='t'\nclass='high'\n\
+         [[path.\"{0}\".rule]]\nname='t'\nclass='normal'\n\
+         [[path.\"{0}\".rule]]\nname='only'\nmatch='o'\nclass='normal'\n",
+        inside.display()
+    ));
+    for (rule, cwd, class) in [
+        ("t", &inside, "normal"),
+        ("t", &outside, "high"),
+        ("only", &outside, "normal"),
+    ] {
+        let out = env
+            .cmd(&["--rule", rule, "--", "true"])
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("not in the config"),
+            "{out:?}"
+        );
+        assert_eq!(
+            env.runs().pop().unwrap()["class"],
+            class,
+            "{rule} in {cwd:?}"
+        );
+    }
+}
+
 #[test]
 fn a_run_appends_its_line_to_runs_jsonl() {
     let env = Env::new();

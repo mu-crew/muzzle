@@ -264,17 +264,25 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
             }));
         }
     };
-    let rule = args.rule.as_deref().and_then(|n| config.rule(n));
+    // B3: the rule as resolved at this cwd, else its first definition
+    // anywhere (disabled here, or in a table that doesn't apply): a
+    // pre-wrapped `--rule` is trusted for its class, as in v1.
+    let rule = args.rule.as_deref().and_then(|n| {
+        let here = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| config.resolve(&cwd).rule(n).map(|m| m.rule.clone()));
+        here.or_else(|| config.rule_anywhere(n))
+    });
     // rv_skill_unknown_rule: a renamed rule (rust-gate -> cargo-test) would
     // otherwise quietly under-claim every hand-wrapped call that names it.
-    if let (Some(name), None) = (args.rule.as_deref(), rule) {
+    if let (Some(name), None) = (args.rule.as_deref(), &rule) {
         let n = args.slots.unwrap_or(1);
         eprintln!("muzzle: rule {name} is not in the config; claiming {n} slot(s)");
     }
     let class = match resolve_class(
         args.class,
         std::env::var("MUZZLE_CLASS").ok().as_deref(),
-        rule.and_then(|r| r.class),
+        rule.as_ref().and_then(|r| r.class),
         std::env::var("MU_MANAGED_AGENT").is_ok_and(|v| v == "1"),
     ) {
         Ok(c) => c,

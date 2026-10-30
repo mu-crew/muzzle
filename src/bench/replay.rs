@@ -234,7 +234,8 @@ struct Plan {
 
 impl Plan {
     fn rule_slots(&self, call: &Call) -> u32 {
-        self.config.rule(&call.rule).map_or(1, |r| r.slots)
+        // B3: a trace may name a table-only or disabled rule.
+        self.config.rule_anywhere(&call.rule).map_or(1, |r| r.slots)
     }
 
     fn command(&self, i: usize, call: &Call) -> anyhow::Result<(Command, Option<PathBuf>)> {
@@ -450,7 +451,7 @@ pub fn run_main(args: &BenchRunArgs) -> anyhow::Result<ExitCode> {
     let config = Config::load().map_err(|e| anyhow::anyhow!("{e}"))?;
     let missing: BTreeSet<&str> = calls
         .iter()
-        .filter(|c| c.matched() && config.rule(&c.rule).is_none())
+        .filter(|c| c.matched() && config.rule_anywhere(&c.rule).is_none())
         .map(|c| c.rule.as_str())
         .collect();
     if !missing.is_empty() {

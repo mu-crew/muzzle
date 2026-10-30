@@ -172,18 +172,14 @@ fn container_rules(config: Option<&Config>, seen: &[String]) -> (Vec<String>, Ve
     let mut sure: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
     let mut maybe = std::collections::BTreeSet::new();
     if let Some(c) = config {
-        let rules = c
-            .rules
-            .iter()
-            .chain(c.projects.iter().flat_map(|p| &p.rules));
-        for r in rules {
-            if !CONTAINER_PROBES.iter().any(|p| r.pattern.is_match(p)) {
+        for (name, pattern) in c.patterns() {
+            if !CONTAINER_PROBES.iter().any(|p| pattern.is_match(p)) {
                 continue;
             }
-            if HOST_PROBES.iter().any(|p| r.pattern.is_match(p)) {
-                maybe.insert(r.name.clone());
+            if HOST_PROBES.iter().any(|p| pattern.is_match(p)) {
+                maybe.insert(name.to_string());
             } else {
-                sure.insert(r.name.clone());
+                sure.insert(name.to_string());
             }
         }
     }
