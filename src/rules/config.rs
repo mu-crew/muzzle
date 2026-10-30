@@ -257,7 +257,28 @@ pub(crate) fn canonical_key(key: &str) -> Option<PathBuf> {
     if !p.is_absolute() {
         return None;
     }
-    Some(p.canonicalize().unwrap_or_else(|_| normalise(&p)))
+    Some(canonical_prefix(&normalise(&p)))
+}
+
+/// Canonicalises the longest existing ancestor of an already normalised
+/// path and appends the rest, so a key's identity follows symlinks
+/// (`/home` -> `/var/home`, macOS `/var` -> `/private/var`) whether or not
+/// the directory exists yet, and doesn't change when it is created.
+fn canonical_prefix(p: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            return rest.iter().rev().fold(c, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 /// One file, parsed and checked on its own.
@@ -712,6 +733,26 @@ mod tests {
             msg.contains(&format!("\"{d}\"")) && msg.contains("/./x/.."),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn a_key_follows_symlinks_whether_or_not_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canon_real = real.canonicalize().unwrap();
+        // A missing tail under a symlinked prefix resolves through the link.
+        let missing = canonical_key(&format!("{}/later", link.display())).unwrap();
+        assert_eq!(missing, canon_real.join("later"));
+        // Creating the directory doesn't change the key (P7 hash stability).
+        std::fs::create_dir(real.join("later")).unwrap();
+        let existing = canonical_key(&format!("{}/later", link.display())).unwrap();
+        assert_eq!(existing, missing);
+        // `x/..` through a missing x is normalised before resolving.
+        let dotted = canonical_key(&format!("{}/./nope/..", link.display())).unwrap();
+        assert_eq!(dotted, canon_real);
     }
 
     #[test]
