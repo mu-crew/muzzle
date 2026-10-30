@@ -182,3 +182,85 @@ fn since_skips_archives_outside_the_period() {
         "{all:?}"
     );
 }
+
+/// 0.2 P9, B6: `--by repo` over runs in three repos plus none, with the
+/// current config's `[path]` override coming from an include, so the origin
+/// line names that file.
+#[test]
+fn by_repo_rows_carry_the_current_config_per_repo() {
+    let home = tempfile::tempdir().unwrap();
+    let (state, conf) = (home.path().join("state"), home.path().join("conf"));
+    std::fs::create_dir_all(state.join("muzzle")).unwrap();
+    std::fs::create_dir_all(conf.join("muzzle")).unwrap();
+    std::fs::write(
+        conf.join("muzzle/config.toml"),
+        "include = [\"machine.toml\"]\n\
+         [[rule]]\nname = \"gate\"\nmatch = 'gate'\nslots = 3\n\
+         [[path.\"/r/off\".rule]]\nname = \"gate\"\nenabled = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        conf.join("muzzle/machine.toml"),
+        "[[path.\"/r/crew\".rule]]\nname = \"gate\"\nslots = 2\n",
+    )
+    .unwrap();
+    let mut log = String::new();
+    for (repo, slots, n) in [
+        ("\"/r/crew\"", 4, 5),
+        ("\"/r/plain\"", 3, 5),
+        ("\"/r/off\"", 3, 5),
+        ("null", 3, 2),
+    ] {
+        for i in 0..n {
+            log.push_str(&format!(
+                "{{\"v\":1,\"end\":\"2026-11-01T1{i}:00:00Z\",\"rule\":\"gate\",\"slots\":{slots},\
+                 \"class\":\"normal\",\"cfg\":\"c1\",\"agent\":null,\"cwd\":\"/w\",\"repo\":{repo},\
+                 \"waited_s\":0.0,\"ran_s\":100.0,\"exit\":0,\"killed\":null,\"cpu_s\":200.0,\
+                 \"mem_peak_mb\":100,\"enforced\":true,\"nested\":false,\"kept\":false,\"budget\":8}}\n"
+            ));
+        }
+    }
+    std::fs::write(state.join("muzzle/runs.jsonl"), log).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_muzzle"))
+            .arg("report")
+            .args(args)
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", &conf)
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&["--by", "repo"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    for want in [
+        "now 2 (from [path.\"/r/crew\"] in machine.toml); runs used 4",
+        "now 3 (from [[rule]] in config.toml)\t",
+        "not in the current config here",
+        "gate\t(none)\t2\t",
+        "insufficient data (2 runs)",
+    ] {
+        assert!(text.contains(want), "{want:?} in\n{text}");
+    }
+
+    let out = run(&["--by", "repo", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["rules"].as_array().unwrap();
+    assert_eq!(rows.len(), 4, "{v}");
+    let crew = rows.iter().find(|r| r["repo"] == "/r/crew").unwrap();
+    assert_eq!(crew["now_slots"], 2);
+    assert_eq!(crew["runs_slots"], 4);
+    assert_eq!(crew["slots_from"]["path"], "/r/crew");
+    assert!(
+        crew["slots_from"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("machine.toml")
+    );
+    assert!(rows.iter().any(|r| r["repo"].is_null()));
+
+    let out = run(&["--by", "repo", "--compare", "..2026-11-01", "2026-11-02.."]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}

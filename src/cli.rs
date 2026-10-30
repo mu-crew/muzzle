@@ -116,6 +116,11 @@ pub struct DoctorArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum By {
+    Repo,
+}
+
 #[derive(Debug, Args)]
 pub struct ReportArgs {
     #[arg(long, value_name = "LABEL")]
@@ -127,6 +132,11 @@ pub struct ReportArgs {
     /// Two periods side by side: `--compare A..B C..D`.
     #[arg(long, num_args = 2, value_names = ["A..B", "C..D"])]
     pub compare: Option<Vec<String>>,
+    /// Rows per (rule, repo), each with the slots the current config gives
+    /// that repo (0.2 P9). Not with `--compare`: out of scope, so clap
+    /// exits 2.
+    #[arg(long, value_enum, conflicts_with = "compare")]
+    pub by: Option<By>,
     #[arg(long)]
     pub json: bool,
 }

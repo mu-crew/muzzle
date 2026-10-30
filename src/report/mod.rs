@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use crate::cli::ReportArgs;
 use crate::state::{Killed, RunRecord};
 
+mod by_repo;
+
 /// D30: a rule gets a measured or experiment suggestion only after this
 /// many clean runs.
 pub const MIN_CLEAN_RUNS: usize = 5;
@@ -781,6 +783,16 @@ fn moved(x: Option<(f64, f64)>, prec: usize) -> String {
     })
 }
 
+/// `--since`/`--until` as a period.
+fn period(args: &ReportArgs, now: f64) -> anyhow::Result<Period> {
+    let point =
+        |s: &Option<String>, upper| s.as_deref().map(|s| parse_point(s, now, upper)).transpose();
+    Ok(Period {
+        since: point(&args.since, false)?,
+        until: point(&args.until, true)?,
+    })
+}
+
 /// Everything `main` prints, from parsed runs; split out so tests check
 /// the text and JSON a user sees.
 pub fn render(runs: &[Run], args: &ReportArgs, now: f64, host: Host) -> anyhow::Result<String> {
@@ -842,18 +854,7 @@ pub fn render(runs: &[Run], args: &ReportArgs, now: f64, host: Host) -> anyhow::
         hint_text(&mut out);
         return Ok(out);
     }
-    let period = Period {
-        since: args
-            .since
-            .as_deref()
-            .map(|s| parse_point(s, now, false))
-            .transpose()?,
-        until: args
-            .until
-            .as_deref()
-            .map(|s| parse_point(s, now, true))
-            .transpose()?,
-    };
+    let period = period(args, now)?;
     // Machine figures are the whole machine's even under --rule: the
     // budget is shared, so one rule's share of it says little alone.
     let m = machine(runs, period);
@@ -926,6 +927,29 @@ fn read_span(args: &ReportArgs, now: f64) -> Option<(f64, f64)> {
     (since > f64::NEG_INFINITY || until < f64::INFINITY).then_some((since, until))
 }
 
+/// `--by repo` needs the current config (B6), which plain `report` never
+/// reads; a config error exits as everywhere else: 2 for a bad file, 125
+/// for one that can't be read.
+fn render_by_repo(
+    runs: &[Run],
+    args: &ReportArgs,
+    now: f64,
+    host: Host,
+) -> Result<anyhow::Result<String>, ExitCode> {
+    use crate::rules::config::{Config, ConfigError};
+    let config = Config::load().map_err(|e| {
+        eprintln!("muzzle: {e}");
+        ExitCode::from(match e {
+            ConfigError::Read { .. } => crate::exit::INTERNAL,
+            _ => crate::exit::USAGE,
+        })
+    })?;
+    Ok(period(args, now).map(|p| {
+        let rows = by_repo::rows(runs, p, args.rule.as_deref(), host, &config);
+        by_repo::render(&machine(runs, p), &rows, args.json)
+    }))
+}
+
 pub fn main(args: &ReportArgs) -> anyhow::Result<ExitCode> {
     let store = crate::state::Store::open_default()?;
     let now = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
@@ -933,7 +957,15 @@ pub fn main(args: &ReportArgs) -> anyhow::Result<ExitCode> {
     if skipped > 0 {
         eprintln!("muzzle: report: skipped {skipped} unreadable runs.jsonl lines");
     }
-    match render(&runs, args, now, host(&store)) {
+    let out = match args.by {
+        Some(crate::cli::By::Repo) => render_by_repo(&runs, args, now, host(&store)),
+        None => Ok(render(&runs, args, now, host(&store))),
+    };
+    let out = match out {
+        Ok(out) => out,
+        Err(code) => return Ok(code),
+    };
+    match out {
         Ok(out) => {
             print!("{out}");
             Ok(ExitCode::SUCCESS)
@@ -950,14 +982,14 @@ mod tests {
     use super::*;
     use crate::admit::Class;
 
-    const T0: f64 = 1_793_700_000.0; // 2026-11-03-ish, whole seconds.
-    const HOST: Host = Host {
+    pub(super) const T0: f64 = 1_793_700_000.0; // 2026-11-03-ish, whole seconds.
+    pub(super) const HOST: Host = Host {
         mem_per_slot_mb: Some(2048.0),
         budget: None,
     };
 
     /// A clean `gate` run on 2 slots under cfg `c1`, budget 8.
-    fn run(end: f64, ran_s: f64) -> Run {
+    pub(super) fn run(end: f64, ran_s: f64) -> Run {
         Run {
             end,
             rec: RunRecord {
@@ -1370,6 +1402,7 @@ mod tests {
             since: None,
             until: None,
             compare: None,
+            by: None,
             json,
         }
     }

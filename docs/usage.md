@@ -96,7 +96,9 @@ the wait.
   when only advisory.
 - `muzzle report` summarises `runs.jsonl`: machine figures, per-rule rows
   and a suggested weight per rule. `--compare A..B C..D` puts two periods
-  side by side. `runs.jsonl` rotates each month (and past 16 MB) into
+  side by side. `--by repo` gives a row per rule and repo, each with the
+  slots the current config gives that repo and where they come from
+  (`now 2 (from [path."~/hacking/crew"] in config.toml)`). `runs.jsonl` rotates each month (and past 16 MB) into
   `runs-YYYY-MM.jsonl.gz` beside it, kept forever; `zcat` reads them. It
   is local state and records working directories, so don't publish it.
 
