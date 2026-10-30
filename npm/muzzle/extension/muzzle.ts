@@ -7,6 +7,12 @@
 // tool_result: read the report, append `muzzle: waited Ws for N slots, ran
 // Rs` and a `muzzle` custom entry with the same numbers (D26).
 //
+// One copy per pi process: the pi package and `-e <path>` can both load this
+// file, and two copies would each wrap the call (the CLI also refuses to wrap
+// a command that already runs muzzle, D22). The first copy to load claims
+// GUARD on globalThis; later copies register nothing. The claim is released
+// on session_shutdown, so /reload and session replacement load it again.
+//
 // Nothing here may block a call: a missing binary or a failing wrap leaves
 // the call as it is. A throwing tool_call handler blocks the tool in pi, so
 // every path is caught.
@@ -134,6 +140,9 @@ function wrap(bin: string, command: string, cwd: string, timeout?: number): Prom
   });
 }
 
+/** The process-wide claim; registry-global so separate module copies share it. */
+export const GUARD = Symbol.for("@mu-crew/muzzle/extension");
+
 export interface Deps {
   findBinary?: () => string | null;
   tmpRoot?: string;
@@ -142,6 +151,10 @@ export interface Deps {
 export function createExtension(deps: Deps = {}) {
   const findBinary = deps.findBinary ?? (() => findMuzzle());
   return function (pi: ExtensionAPI) {
+    const g = globalThis as Record<symbol, unknown>;
+    if (g[GUARD] !== undefined) return;
+    const claim = {};
+    g[GUARD] = claim;
     let bin: string | null | undefined;
     let reportDir: string | undefined;
     const pending = new Map<string, string>();
@@ -167,6 +180,8 @@ export function createExtension(deps: Deps = {}) {
           if (bin === null) warn(ctx, "muzzle not found: bash calls run unwrapped");
         }
         if (bin === null) return;
+        // Belt and braces for the guard: our own rewrite is never rewritten.
+        if (input.command.startsWith(`${shellQuote(bin)} run `)) return;
         const timeout = typeof input.timeout === "number" ? input.timeout : undefined;
         const wrapped = await wrap(bin, input.command, ctx.cwd, timeout);
         if (wrapWarned) {
@@ -213,6 +228,7 @@ export function createExtension(deps: Deps = {}) {
     });
 
     pi.on("session_shutdown", async () => {
+      if (g[GUARD] === claim) delete g[GUARD];
       if (reportDir) rmSync(reportDir, { recursive: true, force: true });
       reportDir = undefined;
       pending.clear();

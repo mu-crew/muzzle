@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.2 (unreleased)
+
+- `wrap`, `match` and `hook` leave a command that already runs muzzle
+  alone by its first command word's basename, so `/abs/bin/muzzle run …`,
+  `./muzzle run …` and `env A=1 muzzle run …` are no longer wrapped again
+  (spec D22). Before, only a literal `muzzle ` prefix was.
+- The pi extension registers once per pi process. With both the pi package
+  and `-e <extension>` loaded, every bash call was wrapped twice and got
+  two result lines and two `muzzle` entries.
+
 ## 0.1.1
 
 - Runs record `repo`, the canonical path of the repo's main checkout

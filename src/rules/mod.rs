@@ -23,18 +23,17 @@ pub struct Wrapped {
 }
 
 /// D22: rewrite `command` into `muzzle run … -- bash -c '<command>'` when a
-/// rule matches. `None` for no match, or when the command already starts
-/// with `muzzle ` (a hand-wrapped call, or a second hook pass).
+/// rule matches. `None` for no match, or when the command already runs
+/// muzzle ([`shell::runs_muzzle`]: a hand-wrapped call, a second hook pass,
+/// or a second copy of the pi extension, whose first rewrite starts with
+/// the binary's absolute path).
 ///
 /// The class is not passed: `run` resolves it from `--rule` after
 /// `MUZZLE_CLASS` (D12), and `--class` here would outrank the environment.
 /// A harness timeout becomes `--run-timeout` so it stops counting the
 /// queue wait (D24).
 pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) -> Option<Wrapped> {
-    if command.trim_start().starts_with("muzzle ") {
-        return None;
-    }
-    let m = config.matches(command, cwd)?;
+    let m = matches(config, command, cwd)?;
     let mut out = format!(
         "muzzle run --rule={} --slots {}",
         quote_word(&m.rule.name),
@@ -50,6 +49,15 @@ pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) 
         rule: m.rule.name.clone(),
         slots: m.rule.slots,
     })
+}
+
+/// [`Config::matches`], except that a command which already runs muzzle
+/// matches nothing (D22): `match`, `wrap` and `hook` all agree.
+fn matches<'a>(config: &'a Config, command: &str, cwd: &Path) -> Option<config::Match<'a>> {
+    if shell::runs_muzzle(command) {
+        return None;
+    }
+    config.matches(command, cwd)
 }
 
 /// D16a: `command` (shell text) enters a container (`distrobox enter`,
@@ -120,7 +128,7 @@ fn class_str(c: Class) -> &'static str {
 
 /// The `match --json` object (spec §CLI).
 pub fn match_json(config: &Config, command: &str, cwd: &Path) -> Value {
-    match config.matches(command, cwd) {
+    match matches(config, command, cwd) {
         None => json!({ "slots": null }),
         Some(m) => {
             let mut v = json!({
@@ -307,9 +315,15 @@ mod tests {
             "muzzle run --rule gate -- contrib/gate",
             "  muzzle run -- cargo test",
             "muzzle status",
+            "/abs/path/muzzle run --rule=x -- bash -c 'cargo test'",
+            "'/abs/bin/muzzle' run --report '/t/c.json' --rule=gate --slots 6 -- bash -c 'contrib/gate'",
+            "env A=1 /x/muzzle run -- cargo test",
+            "./muzzle run -- cargo test",
         ] {
             assert!(wrap(&c, cmd, cwd, None).is_none(), "{cmd}");
+            assert_eq!(match_json(&c, cmd, cwd), json!({"slots": null}), "{cmd}");
         }
+        assert!(wrap(&c, "cargo test", cwd, None).is_some());
         // Not a muzzle invocation, just a matching command mentioning it.
         assert!(wrap(&c, "muzzlefoo; cargo test", cwd, None).is_some());
         // Wrapping a wrap is a no-op.

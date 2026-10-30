@@ -540,6 +540,28 @@ pub fn command_word(text: &str) -> Option<usize> {
     Some(spans[at].1)
 }
 
+/// D22: `text` already runs muzzle: its first simple command, past
+/// assignments and wrappers (`env A=1`, `timeout 60`), has a command word
+/// whose basename is `muzzle`. Covers `muzzle run …`, an absolute path
+/// (`'/x/bin/muzzle' run …`, what the pi extension writes) and `./muzzle`,
+/// so a second hook pass or a second loaded extension leaves it alone
+/// instead of nesting a run inside a run.
+pub fn runs_muzzle(text: &str) -> bool {
+    // Substitutions lex as commands of their own, ahead of their parent:
+    // the first command in the text is the one that starts first.
+    let Some(first) = command_spans(text)
+        .into_iter()
+        .filter(|c| !c.is_empty())
+        .min_by_key(|c| c[0].1)
+    else {
+        return false;
+    };
+    let words: Vec<String> = first.into_iter().map(|(w, _)| w).collect();
+    strip_prefix(&words)
+        .first()
+        .is_some_and(|w| base(w) == "muzzle")
+}
+
 const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
 
 /// `words` past its first word, a known wrapper, and that wrapper's
@@ -680,6 +702,33 @@ mod tests {
         ] {
             let c = commands(cmd).remove(0);
             assert_eq!(strip_prefix(&c).join(" "), rest, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn runs_muzzle_reads_the_first_command_word() {
+        for cmd in [
+            "muzzle run -- cargo test",
+            "  muzzle status",
+            "/abs/path/muzzle run --rule=x -- bash -c 'cargo test'",
+            "'/a b/muzzle' run --report '/t/r.json' --rule=gate -- bash -c 'x'",
+            "./muzzle run -- cargo test",
+            "env A=1 /x/muzzle run -- cargo test",
+            "A=1 timeout 60 muzzle run -- cargo test",
+            "muzzle run -- true; cargo test",
+        ] {
+            assert!(runs_muzzle(cmd), "{cmd:?}");
+        }
+        for cmd in [
+            "cargo test",
+            "muzzlefoo; cargo test",
+            "/x/muzzle-dogfood run",
+            "echo muzzle run",
+            "cargo test; muzzle run -- true",
+            "echo $(muzzle status) && cargo test",
+            "",
+        ] {
+            assert!(!runs_muzzle(cmd), "{cmd:?}");
         }
     }
 }

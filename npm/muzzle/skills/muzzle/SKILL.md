@@ -53,8 +53,8 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 - **`timeout` goes inside `muzzle run`, never outside it.** An outer
   `timeout` counts the queue wait and kills the gate before it starts. Use
   `--run-timeout S`, which counts from admission and exits 124.
-- In pi, a command that starts with `muzzle ` is left alone by the
-  extension, so pi's own bash `timeout` still counts the wait. Give a
+- In pi, a command that already runs muzzle (`muzzle run …`, by any
+  path) is left alone by the extension, so pi's own bash `timeout` still counts the wait. Give a
   hand-wrapped call no pi timeout, and put the limit in `--run-timeout`.
 - muzzle sets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
   `MUZZLE_SLOTS` from the claim and overwrites any it inherits. Drop

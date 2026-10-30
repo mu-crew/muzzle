@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createExtension, findMuzzle, reportName, resultLine } from "../extension/muzzle.ts";
+import { createExtension, findMuzzle, GUARD, reportName, resultLine } from "../extension/muzzle.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = process.env.MUZZLE_BIN ?? resolve(here, "../../../target/debug/muzzle");
@@ -32,13 +32,14 @@ beforeEach(() => {
   // A test run under muzzle must not read as nested.
   delete process.env.MUZZLE_HOLD;
   delete process.env.MUZZLE_CLASS;
+  // Each test loads a fresh copy; the process-wide claim would refuse it.
+  delete (globalThis as any)[GUARD];
 });
 
 type Handler = (event: any, ctx: any) => any;
 
 /** Just enough of ExtensionAPI and ExtensionContext for this extension. */
-function load(findBinary: () => string | null = () => BIN) {
-  const handlers: Record<string, Handler[]> = {};
+function load(findBinary: () => string | null = () => BIN, handlers: Record<string, Handler[]> = {}) {
   const entries: { type: string; data: any }[] = [];
   const status: (string | undefined)[] = [];
   const pi = {
@@ -56,7 +57,7 @@ function load(findBinary: () => string | null = () => BIN) {
     for (const h of handlers[name] ?? []) out = await h(event, ctx);
     return out;
   };
-  return { emit, entries, status };
+  return { emit, entries, status, handlers };
 }
 
 function call(id: string, input: Record<string, unknown>) {
@@ -288,6 +289,41 @@ test("a nested run (inside an outer muzzle run, D17) gets a line without slots",
   const r = await emit("tool_result", result("n", input, out));
   assert.match(r.content[0].text, /\n\nmuzzle: nested in an outer claim, ran \d+s$/);
   assert.equal(entries[0].data.slots, null);
+});
+
+test("two copies in one pi register once, and a wrapped call gets one result line", async () => {
+  const first = load();
+  // The second copy shares pi (the same handler table): the pi package plus -e.
+  const second = load(() => BIN, first.handlers);
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(first.handlers).map(([k, v]) => [k, v.length])),
+    { tool_call: 1, tool_result: 1, session_shutdown: 1 },
+  );
+  const input: Record<string, unknown> = { command: "echo fake-gate" };
+  await second.emit("tool_call", call("c", input));
+  assert.equal((input.command as string).split(" run --report ").length, 2, input.command as string);
+  const r = await second.emit("tool_result", result("c", input, runBash(input.command as string)));
+  assert.equal(r.content[0].text.match(/^muzzle: /gm)?.length, 1, r.content[0].text);
+  assert.equal(first.entries.length + second.entries.length, 1);
+});
+
+test("session_shutdown releases the claim, so a reload registers again", async () => {
+  const first = load();
+  await first.emit("session_shutdown", { type: "session_shutdown", reason: "reload" });
+  assert.equal(load().handlers.tool_call?.length, 1);
+});
+
+test("a command already starting with this extension's own rewrite is not rewritten again", async () => {
+  // A wrap that matches everything, so only the extension's own check stops a second rewrite.
+  const fake = join(home, "always-muzzle");
+  writeFileSync(fake, `#!/bin/sh\necho '{"command":"muzzle run --slots 1 -- bash -c x"}'\n`);
+  chmodSync(fake, 0o755);
+  const { emit } = load(() => fake);
+  const input: Record<string, unknown> = { command: "echo fake-gate" };
+  await emit("tool_call", call("a", input));
+  const once = input.command as string;
+  await emit("tool_call", call("b", input));
+  assert.equal(input.command, once);
 });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

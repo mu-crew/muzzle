@@ -255,6 +255,50 @@ fn wrap_json() {
     assert_eq!(v, json!({"command": null}));
 }
 
+/// D22: a command that already runs muzzle, by any path, matches nothing in
+/// `match`, `wrap` or `hook`, so two pi extension copies (or a second hook
+/// pass) don't nest a run inside a run.
+#[test]
+fn already_wrapped_commands_match_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    for cmd in [
+        "/abs/path/muzzle run --rule=x -- bash -c 'cargo test'",
+        "env A=1 /x/muzzle run --rule=cargo-test -- bash -c 'cargo test'",
+        "./muzzle run -- cargo test",
+    ] {
+        let v = json_out(&muzzle(home.path(), &["match", "--json", "--", cmd], None));
+        assert_eq!(v, json!({"slots": null}), "{cmd}");
+        let v = json_out(&muzzle(home.path(), &["wrap", "--json", "--", cmd], None));
+        assert_eq!(v, json!({"command": null}), "{cmd}");
+        for h in ["claude", "codex"] {
+            let payload = json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": cmd},
+                "cwd": "/",
+            });
+            let v = json_out(&muzzle(
+                home.path(),
+                &["hook", h],
+                Some(&payload.to_string()),
+            ));
+            assert_eq!(v, json!({}), "{h}: {cmd}");
+        }
+    }
+    let v = json_out(&muzzle(
+        home.path(),
+        &["match", "--json", "--", "cargo test"],
+        None,
+    ));
+    assert_eq!(v["rule"], "cargo-test");
+    let v = json_out(&muzzle(
+        home.path(),
+        &["wrap", "--json", "--", "cargo test"],
+        None,
+    ));
+    assert_eq!(v["rule"], "cargo-test");
+}
+
 #[test]
 fn hook_replies_to_stored_payloads() {
     let home = tempfile::tempdir().unwrap();
