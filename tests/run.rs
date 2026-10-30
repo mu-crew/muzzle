@@ -369,8 +369,11 @@ fn sigkill_of_the_whole_group_kills_the_job_and_frees_the_slots() {
 ///
 /// low_late_prune_loses_heartbeat_pin: it also pins `run::HEARTBEAT` (2 s),
 /// the most a pruned run under-records (admit.rs): the first beat lands
-/// within setup + one period, and ran_s is short of the life by at most one
-/// period. A 5 s beat fails the first bound, a 500 ms one passes both.
+/// within one period, and ran_s is short of the life by at most one period.
+/// The kill comes 3 s after the first beat, mid-way through the second
+/// period, so the second check needs a beat after the first: a heartbeat
+/// that beats once and stops fails it, a 3 s or 5 s one fails the first,
+/// and a 500 ms one passes both (low_a_late_prune_kills_inside_the_first).
 #[test]
 fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
     const HEARTBEAT_S: f64 = 2.0;
@@ -383,15 +386,15 @@ fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
         first.is_some()
     };
     assert!(eventually(Duration::from_secs(10), beaten), "no heartbeat");
-    // Scope setup waits at most 2 s for systemd-run (scope_dir), then one
-    // period; 0.5 s more for the beat's own state write under load.
+    // One period from the spawn, plus 0.5 s for the tick and the beat's
+    // state write under load (measured 2.018-2.024 s). The hog is no
+    // container, so no scope_dir wait comes first.
     let first_s = (first.unwrap() - start) as f64 / 1000.0;
-    assert!(
-        first_s <= 2.0 + HEARTBEAT_S + 0.5,
-        "first beat at {first_s} s"
-    );
-    // Mid-period, so the last beat before the kill is not the first.
-    std::thread::sleep(Duration::from_millis(1000));
+    assert!(first_s <= HEARTBEAT_S + 0.5, "first beat at {first_s} s");
+    // Mid-way through the second period: the last beat before the kill is
+    // the second, about 1 s before it.
+    let kill_at = first.unwrap() + 3000;
+    std::thread::sleep(Duration::from_millis(kill_at.saturating_sub(now_ms())));
     kill(-(hog.id() as i32), libc::SIGKILL);
     let life = (now_ms() - start) as f64 / 1000.0;
     hog.wait().unwrap();
