@@ -143,8 +143,8 @@ slots = 4                               # this machine's global weight
   nothing. A `match` regex (the escape hatch, for shapes that aren't a
   command word) hits anywhere in the string, and a poll it claims holds
   the gate's slots a second time while the real gate runs. Prefer
-  `command`; `bench/linuxpc-config.toml` in the muzzle repo has worked
-  rules. Test a real call and a poll:
+  `command`; `bench/linuxpc-config-021.toml` in the muzzle repo has
+  worked `command` rules. Test a real call and a poll:
 
   ```sh
   muzzle match -- 'cd repo && contrib/fast-gate'

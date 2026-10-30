@@ -149,8 +149,8 @@ slots = 4              # this machine's global weight
 - An included file can't set `include` itself.
 
 Check a rule with `muzzle match -- '<command>'` on both a real call and a
-poll of it. [`bench/linuxpc-config.toml`](../bench/linuxpc-config.toml)
-has worked examples, and
+poll of it. [`bench/linuxpc-config-021.toml`](../bench/linuxpc-config-021.toml)
+has worked `command` rules, and
 [tune.md](../npm/muzzle/skills/muzzle/recipes/tune.md) covers the loop for
 changing weights.
 

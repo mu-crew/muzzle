@@ -47,9 +47,12 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 - Piped or followed by another command (`muzzle run … | tail`), muzzle no
   longer leads the shell's process group. Esc or a pi timeout then kills
   muzzle but leaves the job running, holding its slots.
-- In pi, a call that doesn't start with `muzzle` (`cd repo && muzzle run
-  --class high …`) is wrapped again by the extension. The inner run is
-  nested, so its `--class`, `--slots` and `--run-timeout` are ignored.
+- `cd repo && muzzle run --class high …` also works: bash execs muzzle as
+  the last command, so it leads the group, and no `command` rule matches
+  it, so pi leaves it alone and its flags apply. A `match` regex rule that
+  hits text inside the call does wrap it again, and the inner run is then
+  nested (D17): its `--class`, `--slots` and `--run-timeout` are ignored.
+  Starting the call with `muzzle` avoids that.
 - **`timeout` goes inside `muzzle run`, never outside it.** An outer
   `timeout` counts the queue wait and kills the gate before it starts. Use
   `--run-timeout S`, which counts from admission and exits 124.

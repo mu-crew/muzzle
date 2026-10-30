@@ -19,10 +19,14 @@ snippet and the test runs the edited version. The payload sources are in
 [`tests/fixtures/hooks/README.md`](../../tests/fixtures/hooks/README.md).
 
 `muzzle` must be on the harness's `PATH`; `npm i -g @mu-crew/muzzle` or
-`cargo install muzzle-cli` puts it there. If it isn't, or if `muzzle hook`
-can't answer (unreadable payload, broken config), the hook exits 1. Both
-harnesses treat that as a non-blocking error and run the call unchanged.
-muzzle never exits 2, which both harnesses read as "block".
+`cargo install muzzle-cli` puts it there. If it isn't, the shell exits 127;
+if `muzzle hook` can't answer (unreadable payload, broken config), it
+exits 1. Both harnesses treat any code but 2 as a non-blocking error and
+run the call unchanged. `muzzle hook` itself never exits 2, which both harnesses
+read as "block". clap does, on a usage error: a hook command edited to an
+unknown harness name, or with the name left off, blocks every Bash call.
+Keep the shipped `muzzle hook claude` / `muzzle hook codex` lines as they
+are.
 
 ## Warning: `allow` skips the harness's permission prompt
 

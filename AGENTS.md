@@ -38,12 +38,15 @@ dependency is pre-declared, so a unit edits only its own files.
 | `src/exit.rs` | exit codes, spec §Exit codes |
 | `src/admit.rs` | pure admission: `(state, now, liveness) → (state, admitted)` |
 | `src/state.rs` | locked `state.json` read-modify-write |
-| `src/proc/` | platform layer: `linux.rs`, `macos.rs` |
-| `src/run.rs` | `muzzle run` orchestration, keeper, `runs.jsonl` |
-| `src/rules/` | config, `match`, `wrap`, `hook`, config hash |
-| `src/status.rs`, `src/doctor.rs` | `status`, `doctor` |
-| `src/report.rs` | `report` |
-| `src/bench/` | `bench run` (`replay.rs`) and `bench probe` (`probe.rs`) |
+| `src/proc/` | platform layer: `mod.rs`, `linux.rs`, `macos.rs` |
+| `src/run/` | `muzzle run`: `queue.rs` (enqueue, poll), `spawn.rs` (groups, signals), `scope.rs` (systemd), `job.rs`, `keeper.rs` (D16), `report.rs` (run records, `--report`) |
+| `src/runlog.rs` | `runs.jsonl` append, rotation and monthly archives (P11) |
+| `src/repo.rs` | which repo a run belongs to (D27a) |
+| `src/rules/` | `config/` (load, merge, template, hash), `resolve.rs` (what applies at a cwd), `shell.rs`, `heads.rs` (command rules), `hook.rs`; `match`, `wrap` |
+| `src/status.rs` | `status` |
+| `src/doctor/` | `doctor`: `gather.rs` (I/O), `checks.rs` (pure), `render.rs` |
+| `src/report/` | `report`: `period.rs`, `rows.rs`, `by_repo.rs`, `machine.rs`, `render.rs` |
+| `src/bench/` | `bench run` and `bench burn` (`replay/`), `bench probe` (`probe.rs`) |
 | `npm/muzzle/` | npm wrapper, `extension/` (pi), `skills/muzzle/` |
 | `npm/muzzle-<platform>/` | prebuilt binaries, filled by release CI |
 

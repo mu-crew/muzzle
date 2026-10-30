@@ -333,6 +333,16 @@ mod tests {
             assert_eq!(match_json(&c, cmd, cwd), json!({"slots": null}), "{cmd}");
         }
         assert!(wrap(&c, "cargo test", cwd, None).is_some());
+        // The skill's `cd repo && muzzle run …`: the first command is `cd`,
+        // but a `command` rule doesn't descend into muzzle's argv, so the
+        // inner run's own flags apply (SKILL.md; usage.md §Limits).
+        for cmd in [
+            "cd repo && muzzle run --class high --rule gate -- contrib/fast-gate",
+            "cd repo && muzzle run -- cargo test",
+            "cd repo && muzzle run -- bash -c 'cargo test'",
+        ] {
+            assert!(wrap(&c, cmd, cwd, None).is_none(), "{cmd}");
+        }
         // Not a muzzle invocation, just a matching command mentioning it.
         assert!(wrap(&c, "muzzlefoo; cargo test", cwd, None).is_some());
         // Wrapping a wrap is a no-op.
