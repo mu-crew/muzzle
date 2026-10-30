@@ -104,6 +104,12 @@ pub struct Report {
     pub config_exists: bool,
     pub config_error: Option<String>,
     pub rules: Option<usize>,
+    /// Added field (P8): the root file, then each include in list order,
+    /// with whether it was found. Includes are unknown when the config is
+    /// invalid, so only the root is listed then.
+    pub config_files: Vec<ConfigFile>,
+    /// Added field (P8): distinct path tables in the merged config.
+    pub path_tables: Option<usize>,
     pub config_hash: Option<String>,
     pub runs: Option<RunsLog>,
     /// Added field (P11): `runs.jsonl`'s size and its monthly archives.
@@ -123,6 +129,17 @@ pub struct Report {
     /// unreadable.
     #[serde(skip)]
     pub exit: u8,
+}
+
+/// One config file doctor read or looked for (P8).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConfigFile {
+    pub file: PathBuf,
+    /// `root` or `include`.
+    pub role: &'static str,
+    /// A missing include is skipped silently (P5); a missing root means the
+    /// built-in defaults apply.
+    pub found: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -197,6 +214,19 @@ pub fn check(f: &Facts) -> Report {
     let (container_rules, container_maybe) =
         container_rules(f.config.as_ref().ok(), &f.container_runs);
     let mut warnings = Vec::new();
+    let mut config_files = vec![ConfigFile {
+        file: f.config_path.clone(),
+        role: "root",
+        found: f.config_exists,
+    }];
+    if let Ok(c) = &f.config {
+        config_files.extend(c.includes().into_iter().map(|(file, found)| ConfigFile {
+            file,
+            role: "include",
+            found,
+        }));
+    }
+    let path_tables = f.config.as_ref().ok().map(Config::path_table_count);
     let (reserve, config_slots, rules, hash, config_error) = match &f.config {
         Ok(c) => (
             Some(c.reserve),
@@ -311,6 +341,8 @@ pub fn check(f: &Facts) -> Report {
         config_exists: f.config_exists,
         config_error,
         rules,
+        config_files,
+        path_tables,
         config_hash: hash,
         runs: f.runs.clone(),
         runs_archives: f.runlog.clone(),
@@ -356,13 +388,28 @@ pub fn render_text(r: &Report) -> String {
     let config = match (&r.config_error, r.config_exists) {
         (Some(_), _) => "invalid".to_string(),
         (None, exists) => format!(
-            "{} rules, hash {}{}",
+            "{}; {} rules, {} path tables, hash {}",
+            if exists {
+                "found"
+            } else {
+                "not found: defaults"
+            },
             opt(r.rules.map(|n| n as u64)),
+            opt(r.path_tables.map(|n| n as u64)),
             r.config_hash.as_deref().unwrap_or("?"),
-            if exists { "" } else { ", missing: defaults" }
         ),
     };
     line("config", format!("{} ({config})", r.config_path.display()));
+    for c in r.config_files.iter().filter(|c| c.role == "include") {
+        line(
+            "include",
+            format!(
+                "{} ({})",
+                c.file.display(),
+                if c.found { "found" } else { "not found" }
+            ),
+        );
+    }
     line(
         "runs.jsonl",
         match &r.runs {
@@ -767,7 +814,7 @@ mod tests {
             "budget         14 slots (measured; 16 cores, reserve 2, 2048 MB RAM per slot)",
             "enforcement    enforced (systemd scope",
             "/s (writable)",
-            "1 rules, hash ",
+            "config         /c.toml (found; 1 rules, 0 path tables, hash ",
             "10 bytes, 2 runs, 2026-10-01T00:00:00Z .. 2026-10-02T00:00:00Z",
             "pi extension   not installed",
             "claude hook    installed",
@@ -776,6 +823,91 @@ mod tests {
         ] {
             assert!(t.contains(want), "missing {want:?} in\n{t}");
         }
+    }
+
+    #[test]
+    fn config_files_and_path_tables_are_listed() {
+        // P8, P5: root, each include found or not, and the table count.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("config.toml");
+        std::fs::write(
+            &root,
+            concat!(
+                "include = ['machine.toml', 'gone.toml']\n",
+                "[[rule]]\nname='g'\nmatch='g'\n",
+                "[[path.\"/p\".rule]]\nname='g'\nslots=2\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("machine.toml"),
+            "[[path.\"/q\".rule]]\nname='g'\nslots=3\n[[path.\"/p/\".rule]]\nname='g'\nslots=4\n",
+        )
+        .unwrap();
+        let mut f = facts();
+        f.config_path = root.clone();
+        f.config = Config::load_from(&root).map_err(|e| e.to_string());
+        let r = check(&f);
+        assert_eq!(r.path_tables, Some(2), "/p and /p/ are one table (B1)");
+        let machine = dir.path().join("machine.toml");
+        let gone = dir.path().join("gone.toml");
+        let want = [
+            (root.clone(), "root", true),
+            (machine.clone(), "include", true),
+            (gone.clone(), "include", false),
+        ];
+        let got: Vec<_> = r
+            .config_files
+            .iter()
+            .map(|c| (c.file.clone(), c.role, c.found))
+            .collect();
+        assert_eq!(got, want);
+        assert!(
+            r.warnings.is_empty(),
+            "a missing include is silent: {:?}",
+            r.warnings
+        );
+
+        let t = render_text(&r);
+        for want in [
+            format!(
+                "config         {} (found; 1 rules, 2 path tables, hash ",
+                root.display()
+            ),
+            format!("include        {} (found)\n", machine.display()),
+            format!("include        {} (not found)\n", gone.display()),
+        ] {
+            assert!(t.contains(&want), "missing {want:?} in\n{t}");
+        }
+
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["path_tables"], 2);
+        let files = v["config_files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[1]["file"], machine.to_str().unwrap());
+        assert_eq!(
+            (&files[1]["role"], &files[1]["found"]),
+            (&"include".into(), &true.into())
+        );
+        assert_eq!(files[2]["file"], gone.to_str().unwrap());
+        assert_eq!(files[2]["found"], false);
+        assert_eq!(
+            (&files[0]["role"], &files[0]["found"]),
+            (&"root".into(), &true.into())
+        );
+    }
+
+    #[test]
+    fn missing_root_and_invalid_config_list_only_the_root() {
+        let mut f = facts();
+        f.config_exists = false;
+        let r = check(&f);
+        assert_eq!(r.config_files.len(), 1);
+        assert!(!r.config_files[0].found);
+        assert!(render_text(&r).contains("(not found: defaults; 1 rules, 0 path tables"));
+        f.config = cfg("bogus = 1\n");
+        let r = check(&f);
+        assert_eq!((r.config_files.len(), r.path_tables), (1, None));
     }
 
     #[test]

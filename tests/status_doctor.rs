@@ -243,7 +243,7 @@ fn doctor_reports_every_line_with_no_harness() {
         "budget ",
         "enforcement ",
         "(writable)",
-        "1 rules, hash ",
+        "1 rules, 0 path tables, hash ",
         "runs.jsonl     none yet",
         "pi extension   not installed",
         "claude hook    not found",
