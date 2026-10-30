@@ -349,26 +349,20 @@ fn positional_command<'a>(
 /// gives `None` (the script already leads), `bash|sh|zsh [opts] <file>
 /// args…` (no `-c`: [`shell_script`] took that) gives the file.
 fn script_program(words: &[String]) -> Option<(Option<&String>, &[String])> {
-    let (prog, mut rest) = words.split_first()?;
+    let (prog, rest) = words.split_first()?;
     if base(prog).ends_with(".sh") {
         return Some((None, rest));
     }
     if !SHELLS.contains(&base(prog)) {
         return None;
     }
-    while let Some(w) = rest.first().filter(|w| w.starts_with(['-', '+'])) {
-        // `bash -n <file>` only parses it: nothing runs. The museum check
-        // had 4 `bash -n … contrib/gate` rows that R1.1 claimed for gate.
-        if w.starts_with('-') && !w.starts_with("--") && w.contains('n') {
-            return None;
-        }
-        let takes = matches!(
-            w.as_str(),
-            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
-        );
-        rest = &rest[if takes { 2 } else { 1 }.min(rest.len())..];
+    let opts = shell::shell_args(rest);
+    // `bash -n <file>` only parses it: nothing runs. The museum check had
+    // 4 `bash -n … contrib/gate` rows that R1.1 claimed for gate.
+    if opts.n {
+        return None;
     }
-    let (file, args) = rest.split_first()?;
+    let (file, args) = opts.rest.split_first()?;
     Some((Some(file), args))
 }
 

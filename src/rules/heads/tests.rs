@@ -103,6 +103,16 @@ fn commands_get_their_rule() {
             Some("vtmux-check"),
         ),
         ("bash -x -o pipefail scripts/check.sh", Some("vtmux-check")),
+        // f-shell-opts: an option's argument is neither script nor file.
+        ("bash -o pipefail -c 'cargo test'", Some("cargo-test")),
+        ("bash -O extglob -c 'cargo test'", Some("cargo-test")),
+        ("bash -co pipefail 'cargo test'", Some("cargo-test")),
+        ("bash -co 'cargo test' true", None),
+        ("bash -O extglob scripts/check.sh", Some("vtmux-check")),
+        ("bash -xo pipefail scripts/check.sh", Some("vtmux-check")),
+        // f-ansi-c: `\'` doesn't close `$'…'`.
+        ("echo $'it\\'s'; cargo test", Some("cargo-test")),
+        ("echo $'cargo test'", None),
         // `-n` only parses the file (museum check, u021_check).
         ("bash -n contrib/gate", None),
         ("bash -n contrib/PKGBUILD contrib/gate", None),

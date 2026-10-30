@@ -1,10 +1,12 @@
-//! D16a: a light shell tokeniser for container detection. It finds the
-//! words in command position: after `; & | && || ( ) {` and newlines,
-//! inside `$( )`, backticks and `sh -c '…'` scripts, and past wrappers
-//! such as `env`, `timeout -s KILL 600`, `xargs` and `flatpak-spawn
-//! --host`. Quoted text, heredoc bodies, comments and arguments are not
-//! command position, so `echo "x; podman exec c"` and `git log --
-//! distrobox enter` don't count. This isn't a shell parser: it errs towards
+//! A light shell tokeniser. It started as D16a's container detection
+//! ([`text_enters`]); since 0.2.1 it also drives `command` rule matching
+//! (`heads.rs`, C2), the hook's command word ([`command_word`], R5) and
+//! D22's [`runs_muzzle`]. It finds the words in command position: after
+//! `; & | && || ( ) {` and newlines, inside `$( )`, backticks and `sh -c
+//! '…'` scripts, and past wrappers such as `env`, `timeout -s KILL 600`,
+//! `xargs` and `flatpak-spawn --host`. Quoted text, heredoc bodies,
+//! comments and arguments are not command position, so `echo "x; podman
+//! exec c"` and `git log -- distrobox enter` don't count. This isn't a shell parser: it errs towards
 //! finding an entry, because a miss leaves a container job unheld after a
 //! kill, which is the worse error.
 
@@ -218,6 +220,30 @@ impl Lexer {
                     }
                 }
                 '$' if self.peek(1) == Some('(') => self.substitution(),
+                // f-ansi-c: `$'…'` takes backslash escapes, so `\'` stays
+                // inside. Other escapes keep their backslash: no command
+                // word needs `\n` decoded.
+                '$' if self.peek(1) == Some('\'') => {
+                    self.at += 2;
+                    while let Some(c) = self.peek(0) {
+                        self.at += 1;
+                        match c {
+                            '\'' => break,
+                            '\\' => {
+                                match self.peek(0) {
+                                    Some(e @ ('\'' | '\\')) => w.push(e),
+                                    Some(e) => {
+                                        w.push('\\');
+                                        w.push(e);
+                                    }
+                                    None => {}
+                                }
+                                self.at += 1;
+                            }
+                            _ => w.push(c),
+                        }
+                    }
+                }
                 '`' => self.backticks(),
                 _ => {
                     w.push(c);
@@ -236,6 +262,14 @@ impl Lexer {
         let mut quote = None;
         while let Some(c) = self.peek(0) {
             match (quote, c) {
+                // `$'…'`, marked by `$`: only `'` closes it, `\` escapes.
+                (None, '$') if self.peek(1) == Some('\'') => {
+                    quote = Some('$');
+                    self.at += 1;
+                }
+                (Some('$'), '\'') => quote = None,
+                (Some('$'), '\\') => self.at += 1,
+                (Some('$'), _) => {}
                 (None, '\'' | '"') => quote = Some(c),
                 (Some(q), _) if q == c => quote = None,
                 (None, '\\') | (Some('"'), '\\') => self.at += 1,
@@ -605,6 +639,50 @@ fn is_assignment(w: &str) -> bool {
     })
 }
 
+/// A shell's words after its name, read the way bash reads its options.
+pub(super) struct ShellArgs<'a> {
+    /// `-c` was given: the first of `rest` is the script.
+    pub c: bool,
+    /// `-n` was given: nothing runs.
+    pub n: bool,
+    /// The words past the options and their arguments.
+    pub rest: &'a [String],
+}
+
+/// f-shell-opts: `-o`/`-O`/`+o`/`+O`/`--rcfile`/`--init-file` take the
+/// next word as their argument; in a cluster each `o`/`O` takes one in
+/// turn, so `bash -co pipefail 'x'` runs `x`. `--` or `-` ends options.
+/// One reader for both the `-c` script (rules and D16a container
+/// detection) and R1.1's script file, so the two can't drift again.
+pub(super) fn shell_args(words: &[String]) -> ShellArgs<'_> {
+    let (mut c, mut n, mut at) = (false, false, 0);
+    while let Some(w) = words.get(at) {
+        let w = w.as_str();
+        at += match w {
+            "--" | "-" => {
+                at += 1;
+                break;
+            }
+            "--rcfile" | "--init-file" => 2,
+            _ if w.starts_with("--") => 1,
+            _ if w.len() > 1 && w.starts_with(['-', '+']) => {
+                let opts = &w[1..];
+                if w.starts_with('-') {
+                    c |= opts.contains('c');
+                    n |= opts.contains('n');
+                }
+                1 + opts.matches(['o', 'O']).count()
+            }
+            _ => break,
+        };
+    }
+    ShellArgs {
+        c,
+        n,
+        rest: &words[at.min(words.len())..],
+    }
+}
+
 /// The shell script of `bash -c '<script>'` (any `-…c…` flag), if `words`
 /// is one.
 pub(super) fn shell_script(words: &[String]) -> Option<&str> {
@@ -612,17 +690,8 @@ pub(super) fn shell_script(words: &[String]) -> Option<&str> {
     if !SHELLS.contains(&base(sh)) {
         return None;
     }
-    let mut c = false;
-    for w in rest {
-        if w.starts_with('-') && !w.starts_with("--") {
-            c |= w.contains('c');
-        } else if w.starts_with("--") {
-            continue;
-        } else {
-            return c.then_some(w.as_str());
-        }
-    }
-    None
+    let args = shell_args(rest);
+    args.c.then(|| args.rest.first().map(String::as_str))?
 }
 
 /// How each container tool's entry verb is spelled after its name. The
@@ -706,6 +775,64 @@ mod tests {
             commands("x=$(a b) `c`"),
             vec![words(&["a", "b"]), words(&["c"]), words(&["x="])]
         );
+    }
+
+    /// f-shell-opts: `-o`/`-O`/`+o`/`+O`/`--rcfile`/`--init-file` take the
+    /// next word, so it isn't the `-c` script; clustered `-co` takes it too.
+    #[test]
+    fn shell_script_skips_option_arguments() {
+        for (cmd, script) in [
+            ("bash -c 'cargo test'", Some("cargo test")),
+            ("bash -o pipefail -c 'cargo test'", Some("cargo test")),
+            ("bash -O extglob -c 'cargo test'", Some("cargo test")),
+            ("bash +o posix -c 'cargo test'", Some("cargo test")),
+            ("bash -co pipefail 'cargo test'", Some("cargo test")),
+            ("bash -oc pipefail 'cargo test'", Some("cargo test")),
+            (
+                "bash -oO pipefail extglob -c 'cargo test'",
+                Some("cargo test"),
+            ),
+            ("bash --rcfile /r -c 'cargo test'", Some("cargo test")),
+            ("bash --norc -ec 'cargo test'", Some("cargo test")),
+            ("bash -c -- 'cargo test'", Some("cargo test")),
+            ("bash -o pipefail x.sh", None),
+            ("bash -co", None),
+        ] {
+            let c = commands(cmd).remove(0);
+            assert_eq!(shell_script(&c), script, "{cmd}");
+        }
+    }
+
+    /// f-ansi-c: `\'` inside `$'…'` doesn't close it.
+    #[test]
+    fn ansi_c_quotes_take_escaped_quotes() {
+        assert_eq!(
+            commands("echo $'it\\'s'; cargo test"),
+            vec![words(&["echo", "it's"]), words(&["cargo", "test"])]
+        );
+        assert_eq!(
+            commands("x=$(echo $'a\\'b)'); cargo test"),
+            vec![
+                words(&["echo", "a'b)"]),
+                words(&["x="]),
+                words(&["cargo", "test"])
+            ]
+        );
+        assert_eq!(commands("echo \"$'x\""), vec![words(&["echo", "$'x"])]);
+    }
+
+    /// D16a: container detection reads the same script and quotes.
+    #[test]
+    fn container_entry_is_found_past_shell_options_and_ansi_c() {
+        for cmd in [
+            "bash -o pipefail -c 'podman exec x ls'",
+            "bash -co pipefail 'podman exec x ls'",
+            "bash -O extglob -c 'podman exec x ls'",
+            "echo $'it\\'s'; podman exec x ls",
+        ] {
+            assert!(text_enters(cmd), "{cmd}");
+        }
+        assert!(!text_enters("bash -co 'podman exec x ls' true"));
     }
 
     #[test]
