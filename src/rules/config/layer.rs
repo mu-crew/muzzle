@@ -238,7 +238,10 @@ mod tests {
     fn a_command_program_cannot_be_a_prefix() {
         // rv021_glob_program: `*` only on subcommand words (R2).
         invalid("[[rule]]\nname='a'\ncommand='*'", "can't contain '*'");
-        invalid("[[rule]]\nname='a'\ncommand=['cargo test','cargo*']", "can't contain '*'");
+        invalid(
+            "[[rule]]\nname='a'\ncommand=['cargo test','cargo*']",
+            "can't contain '*'",
+        );
         assert!(parse("[[rule]]\nname='a'\ncommand='npm run test*'").is_ok());
     }
 
