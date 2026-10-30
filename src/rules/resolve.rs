@@ -4,16 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
-
 use super::config::{Config, Entry, Table};
+use super::heads::{Heads, Matcher};
 use crate::cli::Class;
 
 /// A rule with every field filled in.
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
-    pub pattern: Regex,
+    pub matcher: Matcher,
     /// D8: 1 when no file sets it; capping is admit's job.
     pub slots: u32,
     pub class: Option<Class>,
@@ -73,9 +72,10 @@ pub struct Effective {
 impl Effective {
     /// The first enabled rule matching `command` (P3, P4).
     pub fn matches(&self, command: &str) -> Option<Match<'_>> {
+        let heads = Heads::new(command);
         self.rules
             .iter()
-            .find(|r| r.enabled && r.rule.pattern.is_match(command))
+            .find(|r| r.enabled && r.rule.matcher.matches(&heads))
             .map(Match::from)
     }
 
@@ -102,14 +102,14 @@ fn origin(file: &Path, table: Option<&Table>) -> Origin {
     }
 }
 
-/// A new rule from an entry that sets `match` (P3), or `None` for one that
+/// A new rule from an entry that sets a matcher (P3), or `None` for one that
 /// doesn't (B2 makes that unreachable for a rule not already in effect).
 fn create(e: &Entry, table: Option<&Table>) -> Option<Resolved> {
     let created = origin(&e.file, table);
     Some(Resolved {
         rule: Rule {
             name: e.name.clone(),
-            pattern: e.pattern.clone()?,
+            matcher: e.matcher.clone()?,
             slots: e.slots.unwrap_or(1),
             class: e.class,
         },
@@ -131,8 +131,9 @@ fn create(e: &Entry, table: Option<&Table>) -> Option<Resolved> {
 
 /// P3: merge a table entry into an inherited rule, field by field.
 fn merge(r: &mut Resolved, e: &Entry, t: &Table) {
-    if let Some(p) = &e.pattern {
-        r.rule.pattern = p.clone();
+    // C1: `command` and `match` replace each other.
+    if let Some(m) = &e.matcher {
+        r.rule.matcher = m.clone();
         r.match_from = origin(e.match_from.as_deref().unwrap_or(&e.file), Some(t));
     }
     if let Some(s) = e.slots {
@@ -351,6 +352,36 @@ match = 'other'
         assert_eq!(names(&e), ["n1", "n2", "a", "b"]);
         assert_eq!(e.matches("cmd").unwrap().rule.name, "a");
         assert_eq!(e.matches("other").unwrap().rule.name, "n1");
+    }
+
+    /// 0.2.1 C1: in an override, `command` and `match` replace each other.
+    #[test]
+    fn command_and_match_replace_each_other_in_overrides() {
+        let c = parse(
+            r#"
+[[rule]]
+name = "a"
+match = 'regex-only'
+[[rule]]
+name = "b"
+command = "cargo test"
+[[path."/p".rule]]
+name = "a"
+command = "make"
+[[path."/p".rule]]
+name = "b"
+match = 'just-b'
+"#,
+        );
+        let g = c.resolve_target(None);
+        let p = c.resolve_target(Some(Path::new("/p")));
+        let rule = |e: &Effective, t: &str| e.matches(t).map(|m| m.rule.name.clone());
+        assert_eq!(rule(&g, "x regex-only").as_deref(), Some("a"));
+        assert_eq!(rule(&g, "cargo test").as_deref(), Some("b"));
+        assert_eq!(rule(&p, "x regex-only"), None);
+        assert_eq!(rule(&p, "make -j").as_deref(), Some("a"));
+        assert_eq!(rule(&p, "cargo test"), None);
+        assert_eq!(rule(&p, "echo just-b").as_deref(), Some("b"));
     }
 
     #[test]

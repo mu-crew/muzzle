@@ -281,7 +281,7 @@ impl Lexer {
     }
 }
 
-fn base(w: &str) -> &str {
+pub(super) fn base(w: &str) -> &str {
     w.rsplit('/').next().unwrap_or(w)
 }
 
@@ -439,7 +439,7 @@ const WRAPPERS: &[Wrapper] = &[
 
 /// The words of one simple command from where the real command starts:
 /// past assignments, keywords and wrappers.
-fn strip_prefix(mut words: &[String]) -> &[String] {
+pub(super) fn strip_prefix(mut words: &[String]) -> &[String] {
     loop {
         let Some(first) = words.first() else {
             return words;
@@ -562,7 +562,7 @@ pub fn runs_muzzle(text: &str) -> bool {
         .is_some_and(|w| base(w) == "muzzle")
 }
 
-const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
+pub(super) const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
 
 /// `words` past its first word, a known wrapper, and that wrapper's
 /// options and positional words.
@@ -586,7 +586,7 @@ fn is_assignment(w: &str) -> bool {
 
 /// The shell script of `bash -c '<script>'` (any `-…c…` flag), if `words`
 /// is one.
-fn shell_script(words: &[String]) -> Option<&str> {
+pub(super) fn shell_script(words: &[String]) -> Option<&str> {
     let (sh, rest) = words.split_first()?;
     if !SHELLS.contains(&base(sh)) {
         return None;

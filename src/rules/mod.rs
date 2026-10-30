@@ -2,6 +2,7 @@
 //! `match`, `wrap`, `hook` formats, and the config hash (D28).
 
 pub mod config;
+pub mod heads;
 pub mod hook;
 pub mod resolve;
 pub mod shell;

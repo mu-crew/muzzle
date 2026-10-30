@@ -207,6 +207,13 @@ fn bad_tables_and_includes_exit_2_naming_the_cause() {
             None,
             "ghost",
         ),
+        // 0.2.1 C1: one matcher per rule.
+        (
+            "[[rule]]\nname='both'\ncommand='cargo test'\nmatch='x'\n",
+            None,
+            "not both",
+        ),
+        ("[[rule]]\nname='neither'\nslots=2\n", None, "neither"),
     ] {
         write_config(home.path(), text);
         let m = home.path().join("muzzle/m.toml");

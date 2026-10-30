@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::config::Config;
+use super::heads::Matcher;
 use crate::cli::Harness;
 
 /// The reply for one payload. `{}` means "no opinion": the harness runs
@@ -59,9 +60,13 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
 }
 
 /// True when `command` is one simple command and the rule it matches
-/// matches from its command word. The pattern runs on the text from the
-/// command word on, so an anchored `^…` pattern still counts, and the
-/// match must start right there.
+/// names the program at its command word. For a `match` rule the pattern
+/// runs on the text from the command word on, so an anchored `^…` pattern
+/// still counts, and the match must start right there. For a `command`
+/// rule (0.2.1 R5) the command word must be the pattern's program or `./`
+/// plus it, with the subcommand words after it: a match through a wrapper
+/// (`npx`, `mise exec`, `distrobox`), a script (R1) or a variable (R3) is
+/// wrapped but left to Claude's prompt, and so is `/tmp/evil/cargo`.
 fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bool {
     if !is_simple_command(command) {
         return false;
@@ -73,10 +78,19 @@ fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bo
     let Some(m) = eff.matches(command) else {
         return false;
     };
-    m.rule
-        .pattern
-        .find(&command[at..])
-        .is_some_and(|found| found.start() == 0)
+    match &m.rule.matcher {
+        Matcher::Regex(re) => re
+            .find(&command[at..])
+            .is_some_and(|found| found.start() == 0),
+        Matcher::Command(pats) => {
+            // One simple command (checked above), from its command word.
+            let own = super::shell::commands(&command[at..]);
+            own.len() == 1
+                && pats
+                    .iter()
+                    .any(|p| super::heads::head_matches_exactly(&own[0], p))
+        }
+    }
 }
 
 /// True when `command` is one simple command: no `;`, `&`, `&&`, `|`,
@@ -326,6 +340,49 @@ mod tests {
             for cmd in ["cargo test --locked", "timeout 600 contrib/fast-gate"] {
                 updated(&claude(cmd, &c));
             }
+        }
+    }
+
+    /// 0.2.1 R5: a `command` rule auto-allows only the exact program
+    /// word, never through a path elsewhere, a wrapper, a script or a
+    /// variable; those are still wrapped.
+    #[test]
+    fn claude_allows_a_command_rule_only_on_the_exact_program() {
+        let c = Config::parse(
+            "[[rule]]\nname='cargo-test'\ncommand='cargo test'\n\
+             [[rule]]\nname='js-test'\ncommand=['vitest', 'npm run test*']\n\
+             [[rule]]\nname='gate'\ncommand='contrib/gate'",
+            Path::new("t.toml"),
+        )
+        .unwrap();
+        for cmd in [
+            "cargo test",
+            "./cargo test",
+            "cargo +nightly test -p x",
+            "timeout 600 cargo test",
+            "A=1 env B=2 cargo test",
+            "contrib/gate",
+            "./contrib/gate --fast",
+            "npm run test:fast",
+        ] {
+            updated(&claude(cmd, &c));
+        }
+        for cmd in [
+            "/tmp/evil/cargo test",
+            "/x/contrib/gate",
+            "../contrib/gate",
+            "npx vitest run",
+            "mise exec -- cargo test",
+            "distrobox enter b -- cargo test",
+            "bash -c 'cargo test'",
+            "bash evil cargo test",
+            "./evil.sh cargo test",
+            "$D cargo test",
+            "sudo cargo test",
+            "env -S 'x' cargo test",
+            "flock /l cargo test",
+        ] {
+            undecided(&claude(cmd, &c));
         }
     }
 

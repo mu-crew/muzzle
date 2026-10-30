@@ -14,9 +14,8 @@ mod template;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
-
 use crate::cli::Class;
+use crate::rules::heads::Matcher;
 use keys::expand_tilde;
 use layer::{Layer, parse_layer};
 pub use template::TEMPLATE;
@@ -47,13 +46,14 @@ pub enum ConfigError {
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
-    pub pattern: Option<Regex>,
+    /// `command` or `match` (C1): one field, so either replaces the other.
+    pub matcher: Option<Matcher>,
     pub slots: Option<u32>,
     pub class: Option<Class>,
     pub enabled: Option<bool>,
     /// The first file that defined this entry: B2 messages.
     pub file: PathBuf,
-    /// The files that last set `match` and `slots` (P8).
+    /// The files that last set the matcher and `slots` (P8).
     pub match_from: Option<PathBuf>,
     pub slots_from: Option<PathBuf>,
 }
@@ -61,8 +61,8 @@ pub struct Entry {
 impl Entry {
     /// P3 merge: every field `other` sets replaces this one's.
     fn merge(&mut self, other: Entry) {
-        if other.pattern.is_some() {
-            self.pattern = other.pattern;
+        if other.matcher.is_some() {
+            self.matcher = other.matcher;
             self.match_from = other.match_from;
         }
         if other.slots.is_some() {
@@ -211,13 +211,13 @@ impl Config {
             self.slots = layer.slots;
         }
         for e in layer.global {
-            // B2: a global entry with no match reweights a rule an earlier
-            // file defined.
-            if e.pattern.is_none() && !self.global.iter().any(|g| g.name == e.name) {
+            // B2: a global entry with no matcher reweights a rule an
+            // earlier file defined.
+            if e.matcher.is_none() && !self.global.iter().any(|g| g.name == e.name) {
                 return Err(ConfigError::Invalid {
                     path: file.to_path_buf(),
                     message: format!(
-                        "global rule {:?} has no match, and no earlier file defines it",
+                        "global rule {:?} has no command or match, and no earlier file defines it",
                         e.name
                     ),
                 });
@@ -241,7 +241,7 @@ impl Config {
     /// global list or in an ancestor table, so `resolve` can't fail.
     fn validate_tables(&self) -> Result<(), ConfigError> {
         for t in &self.tables {
-            for e in t.entries.iter().filter(|e| e.pattern.is_none()) {
+            for e in t.entries.iter().filter(|e| e.matcher.is_none()) {
                 let global = self.global.iter().any(|g| g.name == e.name);
                 let ancestor = self.tables.iter().any(|a| {
                     a.canonical != t.canonical
@@ -252,8 +252,8 @@ impl Config {
                     return Err(ConfigError::Invalid {
                         path: e.file.clone(),
                         message: format!(
-                            "[path.{:?}] rule {:?} has no match, and no rule of that name \
-                             is in effect there",
+                            "[path.{:?}] rule {:?} has no command or match, and no rule of \
+                             that name is in effect there",
                             t.key, e.name
                         ),
                     });
@@ -281,13 +281,13 @@ impl Config {
         self.tables.len()
     }
 
-    /// Every entry that sets a pattern, global and in tables, in file
+    /// Every entry that sets a matcher, global and in tables, in file
     /// order: what doctor probes.
-    pub fn patterns(&self) -> impl Iterator<Item = (&str, &Regex)> {
+    pub fn patterns(&self) -> impl Iterator<Item = (&str, &Matcher)> {
         self.global
             .iter()
             .chain(self.tables.iter().flat_map(|t| &t.entries))
-            .filter_map(|e| e.pattern.as_ref().map(|p| (e.name.as_str(), p)))
+            .filter_map(|e| e.matcher.as_ref().map(|m| (e.name.as_str(), m)))
     }
 }
 

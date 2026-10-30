@@ -1,23 +1,27 @@
 //! P7 (D28): the merged config's hash.
 
-use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{Config, Entry};
 use crate::cli::Class;
+use crate::rules::heads::Matcher;
 
 impl Config {
     /// P7 (D28): a short hash of the merged config. Each entry carries only
     /// the fields it sets, so an explicit `slots = 1` is a change (in a
     /// table it overrides an inherited value). Global order matters (first
     /// match wins); tables are sorted by canonical key. `v` = 2: no 0.2
-    /// hash equals a 0.1 hash.
+    /// hash equals a 0.1 hash. 0.2.1 C5/R7: `command` is a list of
+    /// patterns with whitespace collapsed, under its own key; absent, it
+    /// isn't serialised, so a 0.2.0 config keeps its hash (C8).
     pub fn hash(&self) -> String {
         #[derive(Serialize)]
         struct NormRule<'a> {
             name: &'a str,
             pattern: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            command: Option<Vec<String>>,
             slots: Option<u32>,
             class: Option<&'static str>,
             enabled: Option<bool>,
@@ -35,7 +39,16 @@ impl Config {
                 .iter()
                 .map(|e| NormRule {
                     name: &e.name,
-                    pattern: e.pattern.as_ref().map(Regex::as_str),
+                    pattern: match &e.matcher {
+                        Some(Matcher::Regex(re)) => Some(re.as_str()),
+                        _ => None,
+                    },
+                    command: match &e.matcher {
+                        Some(Matcher::Command(pats)) => {
+                            Some(pats.iter().map(|p| p.join(" ")).collect())
+                        }
+                        _ => None,
+                    },
                     slots: e.slots,
                     class: e.class.map(|c| match c {
                         Class::High => "high",
@@ -118,6 +131,23 @@ match = 'sweep'
         assert_eq!(hash(reformatted), h);
         let without_reserve = BASE.replacen("reserve = 2\n", "", 1);
         assert_eq!(hash(&without_reserve), h);
+    }
+
+    /// 0.2.1 C5/R7: `command` hashes with whitespace collapsed and a
+    /// string the same as a one-item list; switching matcher kind is a
+    /// change.
+    #[test]
+    fn command_hash_normalises_whitespace_and_kind_matters() {
+        let one = hash("[[rule]]\nname='t'\ncommand='cargo test'");
+        assert_eq!(hash("[[rule]]\nname='t'\ncommand=' cargo  \ttest '"), one);
+        assert_eq!(hash("[[rule]]\nname='t'\ncommand=['cargo test']"), one);
+        assert_ne!(hash("[[rule]]\nname='t'\nmatch='cargo test'"), one);
+        assert_ne!(hash("[[rule]]\nname='t'\ncommand='cargo build'"), one);
+        assert_ne!(
+            hash("[[rule]]\nname='t'\ncommand=['cargo test', 'cargo build']"),
+            one
+        );
+        assert_ne!(hash("[[rule]]\nname='t'\ncommand='cargo test*'"), one);
     }
 
     #[test]

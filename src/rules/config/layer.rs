@@ -10,6 +10,7 @@ use serde::Deserialize;
 use super::keys::canonical_key;
 use super::{ConfigError, Entry};
 use crate::cli::Class;
+use crate::rules::heads::Matcher;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,9 +64,18 @@ struct RawRule {
     name: String,
     #[serde(rename = "match")]
     pattern: Option<String>,
+    command: Option<RawCommand>,
     slots: Option<u32>,
     class: Option<RawClass>,
     enabled: Option<bool>,
+}
+
+/// C1: `command = "<words>"` or `command = ["<words>", …]`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawCommand {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -125,14 +135,33 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
                         r.name
                     )));
                 }
-                let pattern =
-                    r.pattern.map(|p| Regex::new(&p)).transpose().map_err(|e| {
-                        invalid(format!("{scope}: rule {:?}: bad match: {e}", r.name))
-                    })?;
+                let bad = |what: &str| invalid(format!("{scope}: rule {:?}: {what}", r.name));
+                // C1: the matcher is one field, set by either key.
+                let matcher = match (r.pattern, r.command) {
+                    (Some(_), Some(_)) => return Err(bad("set command or match, not both")),
+                    (Some(p), None) => Some(Matcher::Regex(
+                        Regex::new(&p).map_err(|e| bad(&format!("bad match: {e}")))?,
+                    )),
+                    (None, Some(c)) => {
+                        let list = match c {
+                            RawCommand::One(s) => vec![s],
+                            RawCommand::Many(v) => v,
+                        };
+                        let pats: Vec<Vec<String>> = list
+                            .iter()
+                            .map(|s| s.split_whitespace().map(String::from).collect())
+                            .collect();
+                        if pats.is_empty() || pats.iter().any(Vec::is_empty) {
+                            return Err(bad("a command pattern is empty"));
+                        }
+                        Some(Matcher::Command(pats))
+                    }
+                    (None, None) => None,
+                };
                 Ok(Entry {
                     name: r.name,
-                    match_from: pattern.as_ref().map(|_| path.to_path_buf()),
-                    pattern,
+                    match_from: matcher.as_ref().map(|_| path.to_path_buf()),
+                    matcher,
                     slots: r.slots,
                     class: r.class.map(|c| match c {
                         RawClass::High => Class::High,
