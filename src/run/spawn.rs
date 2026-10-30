@@ -125,7 +125,8 @@ pub(super) struct Deadline {
     /// they are reparented and ancestry no longer finds them; the start
     /// stamp keeps a recycled pid from being signalled (f-nested-timeout).
     /// Those orphaned before the SIGTERM are found because a nested run
-    /// with a timeout adopts orphans on Linux ([`proc::adopt_orphans`]).
+    /// with a timeout adopts orphans on Linux ([`proc::adopt_orphans`]);
+    /// only those still in the outer claim's group are tracked.
     pub(super) tree: Vec<(Pid, proc::StartTime)>,
     /// When the tree was last rescanned: a scan reads every process on the
     /// host, so it runs every `POLL`, not every `TICK`, plus right before
@@ -193,9 +194,26 @@ impl Deadline {
         }
         self.scanned = Some(Instant::now());
         let mut roots: Vec<Pid> = self.tree.iter().map(|t| t.0).collect();
-        // muzzle too: what it adopted (`adopt_orphans`) hangs off it, not
-        // off the child.
-        roots.extend([child, std::process::id() as Pid]);
+        roots.push(child);
+        // muzzle's adoptees (`adopt_orphans`) hang off muzzle, not off the
+        // child. Only those in muzzle's group, the outer claim's, are roots:
+        // a daemon that double-forks and calls setsid (gpg-agent, an ssh
+        // ControlMaster, a shared sccache server) is adopted too, and a
+        // top-level timeout, which signals the group only, leaves it alive
+        // (D18 note, low_nested_timeout_subreaper_also_kills). Scans run
+        // only once the deadline fired, so the extra one is cheap.
+        // SAFETY: plain syscall.
+        let outer = unsafe { libc::getpgrp() } as Pid;
+        let me = std::process::id() as Pid;
+        let adopted = proc::descendants(&[me])
+            .into_iter()
+            .filter(|&(p, _)| p != child && proc::pgid(p) == Some(outer));
+        for (p, start) in adopted {
+            if !roots.contains(&p) {
+                roots.push(p);
+                self.tree.push((p, start));
+            }
+        }
         for d in proc::descendants(&roots) {
             if !self.tree.iter().any(|t| t.0 == d.0) {
                 self.tree.push(d);
@@ -327,8 +345,9 @@ pub(super) fn run_nested(
         // A descendant orphaned before the deadline (`(cmd &)`) reparents
         // to init and ancestry loses it, so the timeout missed it
         // (low_nested_run_timeout_misses). As a subreaper muzzle adopts it
-        // instead. Linux only; on macOS it still escapes this timeout,
-        // though not the outer claim's, whose group it stays in (D18 note).
+        // instead, if it is still in the outer claim's group (`track`).
+        // Linux only; on macOS it still escapes this timeout, though not the
+        // outer claim's, whose group it stays in (D18 note).
         proc::adopt_orphans();
     }
     let child = match Command::new(&args.command[0])

@@ -1951,3 +1951,108 @@ fn nested_run_timeout_reaches_a_descendant_orphaned_before_the_deadline() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "nested=124\n");
     assert!(!leaked.exists(), "the orphan outlived the nested timeout");
 }
+
+/// low_nested_timeout_subreaper_also_kills: as a subreaper the nested run
+/// also adopts daemons that `setsid` (gpg-agent, a shared build server).
+/// They are not in the outer claim's group, so its timeout leaves them
+/// alive, as a top-level timeout does (D18 note). The `(cmd &)` orphan the
+/// subreaper is for is covered above.
+#[cfg(target_os = "linux")]
+#[test]
+fn nested_run_timeout_leaves_an_adopted_setsid_daemon_alive() {
+    let env = Env::new();
+    let survived = env.file("survived");
+    let script = format!(
+        r#""$MUZZLE" run --run-timeout 1 -- sh -c '(setsid sh -c "sleep 3; touch {f}" </dev/null >/dev/null 2>&1 &); sleep 10'; echo nested=$?"#,
+        f = survived.display()
+    );
+    let out = env
+        .cmd(&["--", "sh", "-c", &script])
+        .env("MUZZLE", env!("CARGO_BIN_EXE_muzzle"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested=124\n");
+    assert!(
+        eventually(Duration::from_secs(6), || survived.exists()),
+        "the nested timeout killed a daemon outside the outer claim's group"
+    );
+}
+
+/// The D16 stop filter, SIGTTOU half: a non-leader job that changes the
+/// terminal's settings stops on SIGTTOU and is ended like a reader, exit
+/// 128 + SIGTTOU (low_terminal_stop_signal_filter_is).
+#[test]
+fn a_non_leader_job_stopped_setting_up_the_terminal_is_ended() {
+    let env = Env::new();
+    let script = r#""$MUZZLE" run -- sh -c 'stty -echo; echo set'; echo rc=$?"#;
+    let (mut child, master) = on_a_pty(env.shell(script));
+    let out = pty_output(&master, Duration::from_secs(10));
+    let status = wait_for(&mut child, Duration::from_secs(10));
+    let text = out.recv().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(pgid) = env.state().holders.first().and_then(|h| h.pgid) {
+            kill(-(pgid as i32), libc::SIGKILL);
+        }
+    }
+    let ttou = 128 + libc::SIGTTOU;
+    assert!(text.contains(&format!("rc={ttou}")), "{text:?}");
+    assert!(
+        text.contains("muzzle: the command stopped waiting for the terminal"),
+        "{text:?}"
+    );
+    assert!(!text.contains("set\r\n"), "{text:?}");
+    assert_eq!(env.state().held(), 0);
+    let last = env.runs().pop().unwrap();
+    assert_eq!(
+        (&last["killed"], &last["exit"]),
+        (&"signal".into(), &ttou.into())
+    );
+}
+
+/// The D16 stop filter, SIGSTOP half: a plain stop is left alone, as at
+/// 0036aa7, so whoever stopped the job can continue it and it finishes
+/// (low_terminal_stop_signal_filter_is).
+#[test]
+fn a_non_leader_job_stopped_by_sigstop_is_left_to_be_continued() {
+    let env = Env::new();
+    let script = r#""$MUZZLE" run -- sh -c 'kill -STOP $$; echo resumed'; echo rc=$?"#;
+    let (mut child, master) = on_a_pty(env.shell(script));
+    let out = pty_output(&master, Duration::from_secs(10));
+    // The job's group leader is its top `sh`; wait until it is stopped,
+    // and long enough for muzzle to have seen the stop.
+    let mut pgid = 0;
+    let stopped = eventually(Duration::from_secs(5), || {
+        let Some(g) = env.state().holders.first().and_then(|h| h.pgid) else {
+            return false;
+        };
+        pgid = g as i32;
+        let ps = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pgid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&ps.stdout)
+            .trim_start()
+            .starts_with('T')
+    });
+    assert!(stopped, "the job never stopped");
+    std::thread::sleep(Duration::from_millis(500));
+    kill(-pgid, libc::SIGCONT);
+    let status = wait_for(&mut child, Duration::from_secs(5));
+    let text = out.recv().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        kill(-pgid, libc::SIGKILL);
+    }
+    assert!(text.contains("resumed"), "{text:?}");
+    assert!(text.contains("rc=0"), "{text:?}");
+    assert!(
+        !text.contains("stopped waiting for the terminal"),
+        "{text:?}"
+    );
+    assert_eq!(status.map(|s| s.code()), Some(Some(0)), "{text:?}");
+    assert_eq!(env.state().held(), 0);
+}

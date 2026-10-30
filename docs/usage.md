@@ -310,7 +310,11 @@ group has no members left.
   muzzle prints `muzzle: the command stopped waiting for the terminal…`,
   ends the job (SIGTERM, SIGKILL after 10 s), frees its slots and exits
   128 + the stop signal (149 for SIGTTIN). Run muzzle as the first
-  command, or give the job no terminal (`< /dev/null`). The npm `bin/muzzle` shim execs the binary for this reason (Node
+  command, or give the job no terminal (`< /dev/null`). muzzle only
+  sees this when its top command stops too: a top command that ignores
+  the terminal stop signals, like `timeout` in `muzzle run -- timeout N
+  …`, keeps running while the job under it waits, so there is no
+  `muzzle:` line and the slots stay held until `timeout` ends it. The npm `bin/muzzle` shim execs the binary for this reason (Node
   22.15 or later), and the pi extension calls the platform binary
   directly.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps
