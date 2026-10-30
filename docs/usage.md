@@ -266,12 +266,19 @@ codex` approves every matched call, compound commands included:
 `cargo build && curl … | sh` matches a cargo rule. `muzzle hook claude`
 sends `allow` only for one simple command whose own command word (after
 assignments and `env`, `time`, `timeout [opts] N` or `nice`) is the
-rule's program, or `./` plus it, followed by its subcommand words. A
-path elsewhere doesn't count (`/tmp/evil/cargo test`), and neither does
+rule's program, or `./` plus it, followed by its subcommand words, and
+only when every word after that is on the program's allowlist (spec 0.2.1
+R5): `cargo test -p x -- --nocapture` and `cargo clippy --all-targets --
+-D warnings` are allowed, but `npm test` takes no extra words, `cargo
+nextest run --config-file x` and `cargo build --target x.json` are not
+listed, and a program without a list (`contrib/gate`) takes only the
+pattern's words. An unknown word means no `allow`; the command is still
+wrapped. A path elsewhere doesn't count (`/tmp/evil/cargo test`), and neither does
 a match through a wrapper, a container, a script or a variable
 (`npx vitest run`, `mise exec -- cargo test`): those are wrapped, and the
 decision is left to Claude. For a `match` rule, the regex must match at
-the command word. A compound command, or a pattern found only in an
+the command word, and the words after the program go through the same
+allowlist. A compound command, or a pattern found only in an
 argument or a comment (`echo cargo test`, `rm -rf ~/x # cargo test`),
 goes to Claude's own permission check. Keep `Bash(muzzle run:*)` out of Claude's
 allow rules, which would approve every wrapped string.

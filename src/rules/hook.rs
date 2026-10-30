@@ -62,7 +62,9 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
 /// True when `command` is one simple command and the rule it matches
 /// names the program at its command word. For a `match` rule the pattern
 /// runs on the text from the command word on, so an anchored `^…` pattern
-/// still counts, and the match must start right there. For a `command`
+/// still counts, and the match must start right there; then every word
+/// after the program word must be on its list ([`super::heads::words_allowed`],
+/// fix-hook-strict), since a regex says nothing about the rest. For a `command`
 /// rule (0.2.1 R5) the command word must be the pattern's program or `./`
 /// plus it, with the subcommand words after it: a match through a wrapper
 /// (`npx`, `mise exec`, `distrobox`), a script (R1) or a variable (R3) is
@@ -78,18 +80,20 @@ fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bo
     let Some(m) = eff.matches(command) else {
         return false;
     };
+    // One simple command (checked above), from its command word.
+    let own = super::shell::commands(&command[at..]);
+    let [own] = own.as_slice() else {
+        return false;
+    };
     match &m.rule.matcher {
-        Matcher::Regex(re) => re
-            .find(&command[at..])
-            .is_some_and(|found| found.start() == 0),
-        Matcher::Command(pats) => {
-            // One simple command (checked above), from its command word.
-            let own = super::shell::commands(&command[at..]);
-            own.len() == 1
-                && pats
-                    .iter()
-                    .any(|p| super::heads::head_matches_exactly(&own[0], p))
+        Matcher::Regex(re) => {
+            re.find(&command[at..])
+                .is_some_and(|found| found.start() == 0)
+                && super::heads::words_allowed(own)
         }
+        Matcher::Command(pats) => pats
+            .iter()
+            .any(|p| super::heads::head_matches_exactly(own, p)),
     }
 }
 
@@ -547,6 +551,76 @@ mod tests {
             "env -a cargo test",
         ] {
             assert_eq!(claude(cmd, &c), json!({}), "{cmd}");
+        }
+    }
+
+    /// fix-hook-strict: every word of the command is on an allowlist.
+    /// The rules are the template's plus the commit gate's patterns.
+    #[test]
+    fn claude_allows_only_when_every_word_is_listed() {
+        let c = Config::parse(
+            "[[rule]]\nname='cargo-test'\ncommand=['cargo test', 'cargo nextest', \
+             'cargo clippy', 'cargo build', 'cargo check', 'cargo fmt', 'cargo']\n\
+             [[rule]]\nname='js-test'\ncommand=['vitest', 'npm test', 'npm run test*']",
+            Path::new("t.toml"),
+        )
+        .unwrap();
+        for cmd in [
+            "cargo test",
+            "cargo test -- --nocapture",
+            "cargo +nightly test -p x",
+            "cargo test -pCore",
+            "cargo build -pCrate",
+            "cargo test -FCuda",
+            "cargo clippy --all-targets -- -D warnings",
+            "/usr/bin/time -v cargo clippy",
+            "npm run test",
+            "npm test",
+            "vitest",
+            "vitest run",
+            "RUST_BACKTRACE=1 env CARGO_BUILD_JOBS=4 cargo test",
+            "env -uCARGO_HOME cargo test",
+            // AGENTS.md's commit gate, one command at a time.
+            "cargo fmt --check",
+            "CARGO_BUILD_JOBS=4 cargo test",
+            "cargo nextest run --workspace --no-fail-fast",
+            "cargo check --all-targets --locked",
+            "cargo build --release --target x86_64-unknown-linux-gnu",
+        ] {
+            updated(&claude(cmd, &c));
+        }
+        for cmd in [
+            // high_npm_test_passes_unchecked_words_to.
+            "npm test -- --config=/tmp/evil.mjs",
+            "npm test /tmp/evil.cjs",
+            "npm test -- --require /tmp/e.cjs",
+            "npm run test:x -- --import x",
+            "npm run test -- --require /tmp/e.cjs",
+            "npm test -- --import 'data:text/javascript,console.log(1)'",
+            "npm run test -- --run",
+            // medium_cargo_after_subcommand_denylist, and its ALSO note.
+            "cargo nextest run --config-file /tmp/e.toml",
+            "cargo nextest run --tool-config-file x:/tmp/e.toml",
+            "cargo nextest run --archive-file /tmp/a.tar.zst",
+            "cargo build --target /tmp/x.json",
+            "cargo build --target x.json",
+            "cargo test --target-dir /tmp/t",
+            "cargo test -- --logfile /tmp/x",
+            // low_program_only_cargo_npm_patterns_skip.
+            "cargo +/tmp/rv-hfs/tc test",
+            "cargo +../tc test",
+            "cargo run",
+            "cargo xtask regress",
+            // low_allowlisted_assignment_stepped_over.
+            "nice -n 5 RUST_LOG=x/y cargo test",
+            "timeout 600 CI=x/y cargo test",
+            "/usr/bin/time -p RUST_LOG=x/y cargo test",
+            "R''UST_LOG=x/y cargo test",
+            "\"CI\"=x/y cargo test",
+            "C\\I=x/y cargo test",
+            "cargo fmt -- /tmp/x.rs",
+        ] {
+            undecided(&claude(cmd, &c));
         }
     }
 

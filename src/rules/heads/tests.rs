@@ -216,7 +216,8 @@ fn head_matching_rules() {
     assert!(!x("npm --prefix /tmp/evil test", "npm test"));
     assert!(x("cargo --locked test -p x", "cargo test"));
     assert!(x("cargo +nightly test", "cargo test"));
-    assert!(x("cargo test -- -C --config=x", "cargo test"));
+    // fix-hook-strict: words after `--` are on libtest's list too.
+    assert!(!x("cargo test -- -C --config=x", "cargo test"));
     // f-glued-opts: glued, clustered or trailing, an R4 option still
     // names other code to run.
     assert!(!x("cargo -C/tmp/evil test", "cargo test"));
@@ -249,8 +250,31 @@ fn head_matching_rules() {
         assert!(!x(h, "cargo test"), "{h}");
     }
     assert!(x("npm run test", "npm run test"));
-    assert!(x("npm --silent run test -- --x=1", "npm run test"));
-    assert!(x("npm run test --silent file", "npm run test"));
+    assert!(x("npm --silent run test", "npm run test"));
+    // high_npm_test_passes_unchecked_words_to: npm hands every word after
+    // the script name to the script's program.
+    for h in [
+        "npm --silent run test -- --x=1",
+        "npm run test --silent file",
+        "npm test -- --config=/tmp/evil.mjs",
+        "npm test /tmp/evil.cjs",
+        "npm test -- --require /tmp/e.cjs",
+        "npm test -- --import data:text/javascript,1",
+        "npm run test -- --require /tmp/e.cjs",
+    ] {
+        assert!(!x(h, "npm test") && !x(h, "npm run test*"), "{h}");
+    }
+    assert!(!x("npm run test:x -- --import x", "npm run test*"));
+    assert!(x("npm test", "npm test"));
+    assert!(x("npm ci", "npm ci"));
+    assert!(!x("npm ci --foreground-scripts", "npm ci"));
+    assert!(!x("npm ci", "npm"));
+    assert!(x("cargo bench", "cargo bench"));
+    assert!(!x("cargo bench --bench x", "cargo bench"));
+    assert!(!x("cargo run", "cargo"));
+    assert!(!x("npm run deploy", "npm"));
+    assert!(x("cargo test", "cargo"));
+    assert!(x("npm run test:fast", "npm run test*"));
     assert!(x("cargo -q --locked --color=always test", "cargo test"));
     assert!(x("cargo +nightly-2026-01-01 test", "cargo test"));
     // low_cluster_scan_blocks_pcore_ucargo: `-p`/`-F` own the rest of the
@@ -263,7 +287,9 @@ fn head_matching_rules() {
     // words takes only its program's listed options, `--` included; cargo
     // words after `--` go to rustc except for test/nextest/bench/run.
     assert!(x("vitest", "vitest"));
-    assert!(x("vitest run src/a.test.ts", "vitest"));
+    // fix-hook-strict: positionals are vitest's to read too.
+    assert!(!x("vitest run src/a.test.ts", "vitest"));
+    assert!(x("vitest run", "vitest"));
     assert!(x("vitest --run --silent", "vitest"));
     for h in [
         "vitest --config=/tmp/evil.mjs",
@@ -277,7 +303,9 @@ fn head_matching_rules() {
         assert!(!x(h, "vitest"), "{h}");
     }
     assert!(!x("contrib/gate --x", "contrib/gate"));
-    assert!(x("contrib/gate fast", "contrib/gate"));
+    // fix-hook-strict: a program without a list takes only its pattern.
+    assert!(!x("contrib/gate fast", "contrib/gate"));
+    assert!(x("contrib/gate", "contrib/gate"));
     assert!(x(
         "cargo test -- --nocapture -Zunstable-options",
         "cargo test"

@@ -545,7 +545,7 @@ struct SafeOpts {
     positional: usize,
     /// `nice -5`: an adjustment written as the option.
     numeric: bool,
-    /// env: assignments, and `-` meaning `-i`.
+    /// env: assignments may follow it, and `-` means `-i`.
     env: bool,
 }
 
@@ -628,12 +628,6 @@ fn skip_safe_opts(o: &SafeOpts, words: &[String]) -> Option<usize> {
         };
     }
     at += o.positional;
-    while o.env && words.get(at).is_some_and(|w| is_assignment(w)) {
-        if !safe_assignment(&words[at]) {
-            return None;
-        }
-        at += 1;
-    }
     (at <= words.len()).then_some(at)
 }
 
@@ -670,10 +664,19 @@ pub fn command_word(text: &str) -> Option<usize> {
     let spans = spans.remove(0);
     let words: Vec<String> = spans.iter().map(|(w, _)| w.clone()).collect();
     let mut at = 0;
+    // R5 (fix-hook-strict): an assignment is one only in the shell's
+    // position, before the first prefix, or as env's operand right after
+    // its options. After `nice`, `timeout N` or `time` the word is the
+    // program they exec (`nice RUST_LOG=x/y cargo test` runs
+    // `./RUST_LOG=x/y` if it exists), so it stops the allow.
+    let mut assignments = true;
     loop {
         let w = words.get(at)?.as_str();
         if is_assignment(w) {
-            if !safe_assignment(w) {
+            // The name must be spelt plainly: bash takes `"CI"=x` or
+            // `C\I=x` as a command word, though the lexer dequotes it.
+            let name = &w[..w.find('=')? + 1];
+            if !assignments || !safe_assignment(w) || !text[spans[at].1..].starts_with(name) {
                 return None;
             }
             at += 1;
@@ -693,6 +696,7 @@ pub fn command_word(text: &str) -> Option<usize> {
             return None;
         }
         at += 1 + skip_safe_opts(o, &words[at + 1..])?;
+        assignments = o.env;
     }
     // A shell, another wrapper (`exec`, `sudo`, `xargs`) or a `*.sh`
     // script as the command word runs some other program, yet an anchored
@@ -1093,6 +1097,8 @@ mod tests {
             ("timeout -sKILL 600 cargo test", "cargo"),
             ("nice -5 time -p cargo test", "cargo"),
             ("env -- cargo test", "cargo"),
+            ("CI=1 nice env RUST_LOG=x cargo test", "cargo"),
+            ("CI='x y' cargo test", "cargo"),
         ] {
             let at = command_word(cmd).unwrap_or_else(|| panic!("{cmd}"));
             assert!(cmd[at..].starts_with(word), "{cmd}");
@@ -1138,6 +1144,16 @@ mod tests {
             "NODE_OPTIONS=--require=/e.js npm run test",
             "env RUSTUP_TOOLCHAIN=/tmp/tc cargo test",
             "CARGO_HOME=/tmp/evil cargo build",
+            // low_allowlisted_assignment_stepped_over: an assignment only
+            // in the shell's or env's position, with its name unquoted.
+            "nice -n 5 RUST_LOG=x/y cargo test",
+            "timeout 600 CI=x/y cargo test",
+            "/usr/bin/time -p RUST_LOG=x/y cargo test",
+            "env CI=1 nice CI=2 cargo test",
+            "R''UST_LOG=x/y cargo test",
+            "\"CI\"=x/y cargo test",
+            "C\\I=x/y cargo test",
+            "env 'CI'=1 cargo test",
         ] {
             assert_eq!(command_word(cmd), None, "{cmd}");
         }

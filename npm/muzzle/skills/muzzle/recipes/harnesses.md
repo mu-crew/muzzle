@@ -99,7 +99,10 @@ harness doesn't ask you. muzzle's rules match anywhere in the string, so
   `timeout [opts] N` or `nice`. A match in an argument or a comment
   (`echo cargo test`, `rm -rf ~/x # cargo test`) doesn't count, nor, for a
   `command` rule, a program path elsewhere (`/tmp/evil/cargo`) or a match
-  through a wrapper or container (`npx vitest run`). Anything
+  through a wrapper or container (`npx vitest run`). Every word after
+  the program must also be on muzzle's allowlist for it: `npm test --
+  --config=x`, `cargo nextest run --config-file x` or `contrib/gate
+  --fast` are wrapped but prompted. Anything
   else is rewritten with no decision, so
   Claude's own check runs on `muzzle run … -- bash -c '…'`, and since your
   `Bash(cargo build:*)` rules don't match that form, it prompts.

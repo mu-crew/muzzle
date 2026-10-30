@@ -89,9 +89,11 @@ pub fn head_matches(head: &[String], pattern: &[String]) -> bool {
 }
 
 /// R5: the hook's exact form. The program word is the pattern's program
-/// or `./` plus it, never a path elsewhere (`/tmp/evil/cargo`), and its
-/// options pass [`safe_before`] and [`safe_after`]: anything unknown is
-/// wrapped but left for the user to approve.
+/// or `./` plus it, never a path elsewhere (`/tmp/evil/cargo`), the
+/// pattern's subcommand words follow it, and (fix-hook-strict) every
+/// word after the program is on its list in [`allow`]: a program without
+/// a list takes exactly the pattern's words. Anything unknown is wrapped
+/// but left for the user to approve.
 pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
     let (Some(word), Some(prog)) = (head.first(), pattern.first()) else {
         return false;
@@ -99,140 +101,28 @@ pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
     if !(word == prog || word.strip_prefix("./") == Some(prog.as_str())) {
         return false;
     }
-    // No R4 option arguments here: an option before the subcommand is one
-    // word from the allowlist, so `cargo -C /x test` stops the allow.
-    let mut rest = &head[1..];
+    let rest = &head[1..];
+    if !allow::listed(prog) {
+        return rest.len() == pattern.len() - 1
+            && rest
+                .iter()
+                .zip(&pattern[1..])
+                .all(|(w, p)| word_matches(w, p));
+    }
+    // The subcommand words are the next words that aren't options: no R4
+    // option arguments here, and [`allow::allowed`] refuses any option
+    // that takes one before the subcommand (`cargo -C /x test`).
+    let mut words = rest;
     for sub in &pattern[1..] {
-        while let Some(w) = rest.first().filter(|w| w.starts_with(['-', '+'])) {
-            if !safe_before(prog, w) {
-                return false;
-            }
-            rest = &rest[1..];
+        while words.first().is_some_and(|w| w.starts_with(['-', '+'])) {
+            words = &words[1..];
         }
-        match rest.split_first() {
-            Some((w, tail)) if word_matches(w, sub) => rest = tail,
+        match words.split_first() {
+            Some((w, tail)) if word_matches(w, sub) => words = tail,
             _ => return false,
         }
     }
-    match prog.as_str() {
-        // Words after `--` go to the script (npm) or, for cargo, to the
-        // test binary or to rustc: see [`safe_after_dashes`].
-        "npm" | "cargo" => {
-            let dashes = rest.iter().position(|w| w == "--").unwrap_or(rest.len());
-            rest[..dashes].iter().all(|w| safe_after(prog, w))
-                && (prog == "npm"
-                    || safe_after_dashes(pattern.get(1).map(String::as_str), &rest[dashes..]))
-        }
-        // R5 (fix-hook-failsafe): what `--` means is the program's own
-        // business, so every word counts, `--` included.
-        _ => rest.iter().all(|w| safe_after(prog, w)),
-    }
-}
-
-/// R5 (fix-hook-failsafe): what follows cargo's `--` (from the `--` on).
-/// For `test`, `nextest`, `bench` and `run` it goes to the workspace's own
-/// binary, which the allow already trusts. For every other subcommand it
-/// goes to rustc or clippy-driver, where `-Zcodegen-backend=/x.so`, `-C
-/// linker=` or `--extern` load code from elsewhere; there only lint levels
-/// (`-D warnings`, `-Wclippy::x`, `--deny=x`) pass.
-fn safe_after_dashes(sub: Option<&str>, words: &[String]) -> bool {
-    let Some((_, mut rest)) = words.split_first() else {
-        return true;
-    };
-    if matches!(sub, Some("test" | "nextest" | "bench" | "run")) {
-        return true;
-    }
-    let lint = |w: &str| {
-        !w.is_empty()
-            && w.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c))
-    };
-    while let Some((w, tail)) = rest.split_first() {
-        let level = ["-D", "-W", "-A", "-F"]
-            .iter()
-            .chain(&["--deny", "--warn", "--allow", "--forbid"])
-            .find_map(|o| Some((o, w.strip_prefix(o)?)));
-        rest = match level {
-            Some((_, "")) => match tail.split_first() {
-                Some((l, t)) if lint(l) => t,
-                _ => return false,
-            },
-            Some((o, v)) if !o.starts_with("--") && lint(v) => tail,
-            Some((o, v)) if o.starts_with("--") && v.strip_prefix('=').is_some_and(lint) => tail,
-            _ => return false,
-        };
-    }
-    true
-}
-
-/// R5: an option word before the subcommand that can't make `prog` run
-/// code from elsewhere. An allowlist: npm reads any unambiguous
-/// abbreviation (`--prefi=` is `--prefix`) and has options that run code
-/// (`--script-shell`, `--node-options`); cargo's `+toolchain` may be a
-/// path (`+/tmp/tc` runs `/tmp/tc/bin/cargo`). Other programs get none.
-fn safe_before(prog: &str, w: &str) -> bool {
-    match prog {
-        "cargo" => {
-            if let Some(tc) = w.strip_prefix('+') {
-                // A toolchain name; rustup takes anything with a `/` as a path.
-                return !tc.is_empty()
-                    && tc
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
-            }
-            matches!(
-                w,
-                "--locked" | "--frozen" | "--offline" | "--quiet" | "--verbose"
-            ) || w.strip_prefix("--color=").is_some()
-                || short_flags(w, "qv")
-        }
-        "npm" => matches!(w, "--silent" | "--quiet") || short_flags(w, "sqd"),
-        // vitest reads `--config`/`-c`, `--root`/`-r`, `--dir`,
-        // `--workspace` and custom `--reporter`/`--environment` modules,
-        // all JS from elsewhere; these only change how the run reports.
-        "vitest" => matches!(w, "--run" | "--silent" | "--passWithNoTests" | "--no-color"),
-        _ => false,
-    }
-}
-
-/// R5: an option word after the subcommand. npm reads these as config
-/// just as before it (`npm run test --script-shell=x`), so the same
-/// allowlist holds. cargo's clap takes no abbreviations, so its options
-/// that name other code (`--config`, `--manifest-path`, `-C`, `-Z`) can be
-/// refused by name; a short cluster is read up to its first letter that
-/// takes an argument, so `-pCore` and `-FCuda` are a package and a
-/// feature, not `-C`.
-fn safe_after(prog: &str, w: &str) -> bool {
-    match prog {
-        "npm" => !w.starts_with('-') || safe_before(prog, w),
-        "cargo" => {
-            if let Some(long) = w.strip_prefix("--") {
-                let name = long.split_once('=').map_or(long, |(n, _)| n);
-                return !matches!(name, "config" | "manifest-path");
-            }
-            let Some(opt) = w.strip_prefix('-') else {
-                return true;
-            };
-            for c in opt.chars() {
-                match c {
-                    'C' | 'Z' => return false,
-                    'p' | 'F' | 'j' => return true,
-                    _ => {}
-                }
-            }
-            true
-        }
-        // R5 (fix-hook-failsafe): other programs (vitest, a project's
-        // `contrib/gate`) get only the options [`safe_before`] lists, so
-        // `vitest --config=/tmp/evil.mjs` is left to the prompt.
-        _ => !w.starts_with('-') || safe_before(prog, w),
-    }
-}
-
-/// `-x`, `-xy`: a cluster of only `flags`.
-fn short_flags(w: &str, flags: &str) -> bool {
-    w.strip_prefix('-')
-        .is_some_and(|o| !o.is_empty() && o.chars().all(|c| flags.contains(c)))
+    allow::allowed(prog, rest, pattern.len() - 1)
 }
 
 fn word_matches(word: &str, pat: &str) -> bool {
@@ -471,6 +361,23 @@ fn script_program(words: &[String]) -> Option<(Option<&String>, &[String])> {
     let (file, args) = opts.rest.split_first()?;
     Some((Some(file), args))
 }
+
+/// R5 (fix-hook-strict): a `match` rule's head, which names no program
+/// or subcommand words: every word after the program word must be on the
+/// program's list (with no subcommand words named, so `npm` takes none),
+/// and an unlisted program takes no words at all.
+pub fn words_allowed(head: &[String]) -> bool {
+    let Some((prog, rest)) = head.split_first() else {
+        return false;
+    };
+    if allow::listed(prog) {
+        allow::allowed(prog, rest, 0)
+    } else {
+        rest.is_empty()
+    }
+}
+
+mod allow;
 
 #[cfg(test)]
 mod tests;
