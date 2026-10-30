@@ -284,13 +284,15 @@ A claim belongs to the process group the job runs in, and lasts until that
 group has no members left.
 
 - **muzzle leads its group** when it is the only, or the last, simple
-  command bash execs: pi's `bash -c 'muzzle run …'` and
-  `bash -c 'cd repo && muzzle run …'` both exec muzzle. The job
-  then runs in muzzle's own group, so a harness that kills the group (pi
+  command bash execs: pi's `bash -c 'muzzle run …'` execs muzzle on
+  any bash, and `bash -c 'cd repo && muzzle run …'` does on bash 4.4
+  or later. The job then runs in muzzle's own group, so a harness that kills the group (pi
   on Esc or timeout) kills the job too, and the next waiter frees the
   slots.
 - **muzzle is not the leader** when it is piped (`muzzle run … | tail`),
-  followed by another command (`muzzle run …; true`), typed into an
+  followed by another command (`muzzle run …; true`), the last command
+  of an `&&` list under bash older than 4.4 (macOS `/bin/bash` is 3.2,
+  and forks it), typed into an
   interactive shell after another command, or spawned as a child by a
   wrapper. Put the pipe inside instead:
   `muzzle run --rule gate -- bash -c 'contrib/fast-gate 2>&1 | tail -50'`. It then starts the job in a new group of its own. **Killing the

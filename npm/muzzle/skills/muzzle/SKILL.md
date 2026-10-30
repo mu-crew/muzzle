@@ -47,17 +47,20 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 - Piped or followed by another command (`muzzle run … | tail`), muzzle no
   longer leads the shell's process group. Esc or a pi timeout then kills
   muzzle but leaves the job running, holding its slots.
-- `cd repo && muzzle run --class high …` also works: bash execs muzzle as
-  the last command, so it leads the group, and no `command` rule matches
-  it, so pi leaves it alone and its flags apply. A `match` regex rule that
-  hits text inside the call does wrap it again, and the inner run is then
-  nested (D17): its `--class`, `--slots` and `--run-timeout` are ignored.
-  Starting the call with `muzzle` avoids that.
+- `cd repo && muzzle run …` leads the group only on bash 4.4 or later,
+  which execs the last command of an `&&` list. Older bash, including
+  macOS `/bin/bash` 3.2, forks it, so Esc or a pi timeout leaves the job
+  running. No `command` rule matches this form, so pi leaves it alone and
+  its flags apply. A `match` regex rule that hits text inside the call
+  wraps it again, and the inner run is then nested (D17): it claims
+  nothing, so its `--class` and `--slots` do nothing, but its
+  `--run-timeout` still fires. Starting the call with `muzzle` avoids
+  both.
 - **`timeout` goes inside `muzzle run`, never outside it.** An outer
   `timeout` counts the queue wait and kills the gate before it starts. Use
   `--run-timeout S`, which counts from admission and exits 124.
-- In pi, a command that already runs muzzle (`muzzle run …`, by any
-  path) is left alone by the extension, so pi's own bash `timeout` still counts the wait. Give a
+- In pi, a command that already runs muzzle (`muzzle run …` by any
+  path, or `cd repo && muzzle run …`) is left alone by the extension, so pi's own bash `timeout` still counts the wait. Give a
   hand-wrapped call no pi timeout, and put the limit in `--run-timeout`.
 - muzzle sets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`, `MAKEFLAGS` and
   `MUZZLE_SLOTS` from the claim and overwrites any it inherits. Drop
