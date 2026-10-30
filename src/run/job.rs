@@ -92,18 +92,41 @@ impl Job<'_> {
                 "MUZZLE_HOLD",
                 format!("{}:{}:{}", self.ticket, self.me, self.my_start),
             );
+        // f-tcsetpgrp: a job in a group of its own is in the terminal's
+        // background, and reading the terminal stopped it on SIGTTIN for
+        // good. When muzzle's group is the foreground, the job's group takes
+        // it in `pre_exec` (after `process_group(0)`, before exec, so the
+        // first read already owns it) and gets it until it ends.
+        let tty = (!self.leader).then(proc::Terminal::open).flatten();
         if !self.leader {
             cmd.process_group(0);
+            if let Some(fd) = tty.as_ref().filter(|t| t.ours()).map(|t| t.fd()) {
+                // SAFETY: the hook only makes async-signal-safe syscalls.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        // A terminal that refuses is no reason not to run.
+                        let _ = proc::Terminal::take_in_child(fd);
+                        Ok(())
+                    });
+                }
+                tty.as_ref().inspect(|t| t.mark_lent());
+            }
         }
+        // D16a: until the path is known, a waiter in this pid namespace
+        // finds the scope by scanning /proc, so the probe goes in at once.
+        let mut probe = scope.as_ref().map(|_| ScopeProbe {
+            cgroup: None,
+            cgroup_ns: proc::namespace("cgroup"),
+            pid_ns: proc::namespace("pid"),
+        });
         let started = Instant::now();
-        let child = match cmd.spawn() {
+        let child = match self.spawn_recorded(&mut cmd, enforced, reason, &scope, &probe)? {
             Ok(c) => c,
             Err(e) => {
-                self.store.update(now_ms(), |s| Ok(s.remove(self.ticket)))?;
+                tty.as_ref().inspect(|t| t.give_back());
                 return Ok(spawn_failed(&args.command[0], &e));
             }
         };
-        self.spawned = true;
         let pid = child.id() as Pid;
         let target = if self.leader {
             Target::GroupButMe {
@@ -114,14 +137,6 @@ impl Job<'_> {
             Target::Group(pid)
         };
         let pgid = if self.leader { self.me } else { pid as u32 };
-        // D16a: until the path is known, a waiter in this pid namespace
-        // finds the scope by scanning /proc, so the probe goes in at once.
-        let mut probe = scope.as_ref().map(|_| ScopeProbe {
-            cgroup: None,
-            cgroup_ns: proc::namespace("cgroup"),
-            pid_ns: proc::namespace("pid"),
-        });
-        self.set_spawned(pgid, enforced, reason, &scope, &probe);
         let mut sampler = scoped.then(|| Sampler {
             unit: unit.clone(),
             dir: None,
@@ -143,11 +158,7 @@ impl Job<'_> {
                 self.set_spawned(pgid, enforced, reason, &scope, &probe);
             }
         }
-        let mut deadline = Deadline {
-            after: run_timeout,
-            termed: None,
-            killed: false,
-        };
+        let mut deadline = Deadline::new(run_timeout);
         let mut beat = Heartbeat::new(self.store, self.ticket);
         let (status, ru) = supervise(
             pid,
@@ -155,8 +166,13 @@ impl Job<'_> {
             &mut deadline,
             sampler.as_mut(),
             Some(&mut beat),
+            tty.as_ref(),
         )?;
-        deadline.drain(target, sampler.as_mut(), &mut beat);
+        // The top command is gone: the terminal goes back to the caller
+        // now, not after the grace or a keeper's wait, and the keeper must
+        // not inherit the fd.
+        drop(tty);
+        deadline.drain(target, sampler.as_mut(), Some(&mut beat));
         let ran_s = started.elapsed().as_secs_f64();
         let mut ending = Ending {
             code: exit_code(status),
@@ -214,6 +230,67 @@ impl Job<'_> {
         Ok(ending.code)
     }
 
+    /// Spawn `cmd` with the state lock held, and record the job's group in
+    /// the same write (f-nonleader-pgid). A non-leader's group is the
+    /// child's pid, unknown until spawn, and the holder sat at `pgid: None`
+    /// until a later write that waited for the lock: a muzzle SIGKILLed in
+    /// that wait read as a dead holder with no group, and its slots were
+    /// handed out while the job ran. Under the lock no pruner can run
+    /// between spawn and the write, so the window is down to spawn plus one
+    /// save (milliseconds, whatever the contention); `spawn` returns once
+    /// the child has exec'd. The lock fd is CLOEXEC, so the job never holds
+    /// it. The outer `Err` is the state write failing; the inner one is a
+    /// spawn failure, which frees the entry.
+    fn spawn_recorded(
+        &mut self,
+        cmd: &mut Command,
+        enforced: bool,
+        reason: Option<EnforcedReason>,
+        scope: &Option<String>,
+        probe: &Option<ScopeProbe>,
+    ) -> anyhow::Result<std::io::Result<std::process::Child>> {
+        let mut spawned = None;
+        let recorded = self.store.update(now_ms(), |s| {
+            let c = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    s.remove(self.ticket);
+                    spawned = Some(Err(e));
+                    return Ok(());
+                }
+            };
+            let pgid = if self.leader { self.me } else { c.id() };
+            spawned = Some(Ok(c));
+            if let Some(h) = s.holder_mut(self.ticket) {
+                apply_spawned(h, pgid, enforced, reason, scope, probe);
+            }
+            Ok(())
+        });
+        match spawned {
+            Some(Ok(c)) => {
+                self.spawned = true;
+                let pgid = if self.leader { self.me } else { c.id() };
+                match recorded {
+                    Ok(()) => apply_spawned(&mut self.holder, pgid, enforced, reason, scope, probe),
+                    // The job runs, so supervise it: retry the write, and
+                    // until it lands a waiter sees this muzzle alive.
+                    Err(e) => {
+                        eprintln!("muzzle: recording the spawned job: {e:#}");
+                        self.set_spawned(pgid, enforced, reason, scope, probe);
+                    }
+                }
+                Ok(Ok(c))
+            }
+            // A failed spawn removed the entry. If that write failed too,
+            // the caller's error path frees it.
+            Some(Err(e)) => recorded.map(|()| Err(e)),
+            // The lock or the read failed: nothing ran, nothing was written.
+            None => Err(recorded
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("spawn skipped"))),
+        }
+    }
+
     /// Store what spawn learnt in the holder entry and in `self.holder`.
     /// Best effort: the job is already running, and giving up here would
     /// leave it unsupervised while muzzle's exit freed its slots. Without
@@ -226,13 +303,7 @@ impl Job<'_> {
         scope: &Option<String>,
         probe: &Option<ScopeProbe>,
     ) {
-        let apply = |h: &mut Holder| {
-            h.pgid = Some(pgid);
-            h.enforced = enforced;
-            h.enforced_reason = reason;
-            h.scope = scope.clone();
-            h.probe = probe.clone();
-        };
+        let apply = |h: &mut Holder| apply_spawned(h, pgid, enforced, reason, scope, probe);
         if let Err(e) = self.store.update(now_ms(), |s| {
             if let Some(h) = s.holder_mut(self.ticket) {
                 apply(h);
@@ -252,4 +323,19 @@ impl Job<'_> {
             .as_deref()
             .is_some_and(|u| scope_populated(u, self.holder.probe.as_ref()))
     }
+}
+
+fn apply_spawned(
+    h: &mut Holder,
+    pgid: u32,
+    enforced: bool,
+    reason: Option<EnforcedReason>,
+    scope: &Option<String>,
+    probe: &Option<ScopeProbe>,
+) {
+    h.pgid = Some(pgid);
+    h.enforced = enforced;
+    h.enforced_reason = reason;
+    h.scope = scope.clone();
+    h.probe = probe.clone();
 }

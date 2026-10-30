@@ -35,6 +35,12 @@ fn parse_stat(text: &str) -> Option<Stat> {
     })
 }
 
+pub(super) fn all_pids() -> io::Result<Vec<Pid>> {
+    Ok(fs::read_dir("/proc")?
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect())
+}
+
 pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     // Kernel threads sit in pgid 0 (269 on linuxpc); no real group is <= 0.
     if pgid <= 0 {

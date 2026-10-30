@@ -110,6 +110,29 @@ pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     }
 }
 
+pub(super) fn all_pids() -> io::Result<Vec<Pid>> {
+    // Sized as `group_members` is: grow and retry while the table fills
+    // the buffer.
+    let mut cap = 1024usize;
+    loop {
+        let mut buf: Vec<libc::c_int> = vec![0; cap];
+        let bytes = (cap * mem::size_of::<libc::c_int>()) as libc::c_int;
+        // SAFETY: the buffer is `bytes` long.
+        let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // proc_listallpids returns a count of pids, not bytes.
+        if n as usize >= cap {
+            cap *= 4;
+            continue;
+        }
+        buf.truncate(n as usize);
+        buf.retain(|&p| p > 0);
+        return Ok(buf);
+    }
+}
+
 fn sysctl<T: Copy + Default>(name: &CStr) -> io::Result<T> {
     let mut value = T::default();
     let mut len = mem::size_of::<T>();

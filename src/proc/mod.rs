@@ -112,6 +112,129 @@ pub fn ancestors(pid: Pid) -> Vec<Ancestor> {
     chain
 }
 
+/// Every live process descended from one of `roots` (not the roots
+/// themselves), with its start stamp, from one scan of the process table.
+/// A nested run's `--run-timeout` signals these: its job shares the outer
+/// claim's group, so the group can't be the target (D17, D18,
+/// f-nested-timeout).
+pub fn descendants(roots: &[Pid]) -> Vec<(Pid, StartTime)> {
+    let table: Vec<(Pid, Stat)> = imp::all_pids()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| imp::stat(p).map(|s| (p, s)))
+        .collect();
+    let mut found: Vec<(Pid, StartTime)> = Vec::new();
+    let mut frontier: Vec<Pid> = roots.to_vec();
+    while let Some(parent) = frontier.pop() {
+        for &(pid, s) in &table {
+            if s.ppid == parent && !roots.contains(&pid) && !found.iter().any(|f| f.0 == pid) {
+                found.push((pid, s.start));
+                frontier.push(pid);
+            }
+        }
+    }
+    found
+}
+
+/// The controlling terminal, as seen by a muzzle that runs its job in a
+/// group of its own (D16 non-leader case, f-tcsetpgrp). When muzzle's group
+/// is the foreground, the job's group is lent the terminal for the run, or
+/// a job that reads it stops on SIGTTIN and holds its slots forever; it is
+/// given back when the job ends. Only ever given back if it was lent, so a
+/// background muzzle never takes the terminal from the shell.
+pub struct Terminal {
+    tty: std::os::fd::OwnedFd,
+    mine: Pid,
+    lent: std::cell::Cell<bool>,
+}
+
+impl Terminal {
+    /// `None` without a controlling terminal.
+    pub fn open() -> Option<Terminal> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: plain syscalls; the fd is owned from here on. CLOEXEC:
+        // the job and a keeper must not inherit it.
+        unsafe {
+            let fd = libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return None;
+            }
+            Some(Terminal {
+                tty: std::os::fd::OwnedFd::from_raw_fd(fd),
+                mine: libc::getpgrp(),
+                lent: std::cell::Cell::new(false),
+            })
+        }
+    }
+
+    /// The raw fd, for [`Terminal::take_in_child`].
+    pub fn fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        self.tty.as_raw_fd()
+    }
+
+    /// Whether muzzle's group is the terminal's foreground.
+    pub fn ours(&self) -> bool {
+        // SAFETY: plain syscall on an fd this struct owns.
+        unsafe { libc::tcgetpgrp(self.fd()) == self.mine }
+    }
+
+    /// Make the calling process's group the foreground of `fd`. For a
+    /// `pre_exec` hook after `process_group(0)`, so the job owns the
+    /// terminal before it execs: only async-signal-safe calls.
+    pub fn take_in_child(fd: libc::c_int) -> io::Result<()> {
+        // SAFETY: plain syscalls on the fd the parent passed down.
+        unsafe { to_fg(fd, libc::getpgrp()) }
+    }
+
+    /// Record that the job took the terminal in its `pre_exec`.
+    pub fn mark_lent(&self) {
+        self.lent.set(true);
+    }
+
+    /// Lend the terminal to `pgid` (resuming after `fg`).
+    pub fn lend(&self, pgid: Pid) {
+        // SAFETY: plain syscalls on an fd this struct owns.
+        if unsafe { to_fg(self.fd(), pgid) }.is_ok() {
+            self.lent.set(true);
+        }
+    }
+
+    /// Give the terminal back to muzzle's group, if it was lent.
+    pub fn give_back(&self) {
+        if self.lent.replace(false) {
+            // SAFETY: plain syscalls on an fd this struct owns.
+            let _ = unsafe { to_fg(self.fd(), self.mine) };
+        }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.give_back();
+    }
+}
+
+/// `tcsetpgrp` with SIGTTOU blocked (POSIX: a blocked SIGTTOU lets a
+/// background process change the foreground group).
+unsafe fn to_fg(fd: libc::c_int, pgid: Pid) -> io::Result<()> {
+    // SAFETY: the caller passes a valid fd; the sigsets live on the stack.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGTTOU);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        let r = libc::tcsetpgrp(fd, pgid);
+        let err = io::Error::last_os_error();
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        if r == 0 { Ok(()) } else { Err(err) }
+    }
+}
+
 /// Logical cores (D7). Linux: `available_parallelism`, which respects cgroup
 /// CPU limits. macOS: `hw.logicalcpu`; E-cores count as full slots.
 pub fn logical_cores() -> io::Result<usize> {
@@ -144,6 +267,53 @@ pub struct Rusage {
     pub max_rss_bytes: u64,
 }
 
+/// What a non-blocking [`poll_child`] found.
+pub enum ChildState {
+    Running,
+    /// Stopped by this signal (Ctrl-Z, SIGTTIN). Reported once per stop.
+    Stopped(libc::c_int),
+    Exited(ExitStatus, Rusage),
+}
+
+/// [`wait_child`] without blocking, also reporting a stop (`WUNTRACED`):
+/// a job stopped in its own group must not leave muzzle waiting on it
+/// forever (f-tcsetpgrp).
+pub fn poll_child(pid: Pid) -> io::Result<ChildState> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: a zeroed rusage is a valid value of a plain C struct.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: both out-pointers are valid for the call's duration.
+        let r = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG | libc::WUNTRACED, &mut ru) };
+        if r == 0 {
+            return Ok(ChildState::Running);
+        }
+        if r == pid {
+            if libc::WIFSTOPPED(status) {
+                return Ok(ChildState::Stopped(libc::WSTOPSIG(status)));
+            }
+            return Ok(ChildState::Exited(
+                ExitStatus::from_raw(status),
+                rusage(&ru),
+            ));
+        }
+        let err = io::Error::last_os_error();
+        if r < 0 && err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
+fn rusage(ru: &libc::rusage) -> Rusage {
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    let maxrss = u64::try_from(ru.ru_maxrss).unwrap_or(0);
+    Rusage {
+        cpu_s: secs(ru.ru_utime) + secs(ru.ru_stime),
+        max_rss_bytes: maxrss * imp::MAXRSS_UNIT,
+    }
+}
+
 /// Reap `pid` (a child of this process) with `wait4`, returning its status
 /// and rusage. Use this instead of `Child::wait`, which throws the rusage
 /// away. The rusage covers the child plus the descendants it reaped; a
@@ -165,15 +335,7 @@ pub fn wait_child(pid: Pid) -> io::Result<(ExitStatus, Rusage)> {
         }
         return Err(err);
     }
-    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
-    let maxrss = u64::try_from(ru.ru_maxrss).unwrap_or(0);
-    Ok((
-        ExitStatus::from_raw(status),
-        Rusage {
-            cpu_s: secs(ru.ru_utime) + secs(ru.ru_stime),
-            max_rss_bytes: maxrss * imp::MAXRSS_UNIT,
-        },
-    ))
+    Ok((ExitStatus::from_raw(status), rusage(&ru)))
 }
 
 /// Whether a systemd user manager can be reached (D15, §Systemd scope on

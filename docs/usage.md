@@ -182,13 +182,17 @@ can kill the command before it starts. Use the flags:
 
 | flag | counts | on expiry |
 | --- | --- | --- |
-| `--run-timeout S` | from admission | the job's group gets SIGTERM, then SIGKILL after 10 s; exit 124 |
+| `--run-timeout S` | from admission | the job's group (a nested run: its own process tree) gets SIGTERM, then SIGKILL after 10 s; exit 124 |
 | `--timeout S` | while queued | muzzle gives up, nothing runs; exit 75 |
 
 Waiting has no limit by default, and a progress line prints every 30 s.
 A waiter killed by SIGTERM or SIGINT prints `muzzle: killed while queued
 (…)`, which names the usual cause: a harness or outer `timeout` counting
 the wait.
+
+Signals muzzle catches (HUP, INT, QUIT, TERM) go on to the job. A signal
+the caller ignores stays ignored for muzzle and the job, so `nohup muzzle
+run …` survives a hangup.
 
 ### Exit codes
 
@@ -291,7 +295,9 @@ group has no members left.
   wrapper. Put the pipe inside instead:
   `muzzle run --rule gate -- bash -c 'contrib/fast-gate 2>&1 | tail -50'`. It then starts the job in a new group of its own. **Killing the
   caller may leave the job running**, still holding its slots until it
-  exits. The npm `bin/muzzle` shim execs the binary for this reason (Node
+  exits. In an interactive terminal the job's group gets the terminal for
+  the run, so a job that reads it works, and Ctrl-Z and `fg` behave as
+  they would without muzzle. The npm `bin/muzzle` shim execs the binary for this reason (Node
   22.15 or later), and the pi extension calls the platform binary
   directly.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps

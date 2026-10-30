@@ -86,10 +86,23 @@ impl Env {
 
     /// `muzzle run ARGS…`, in the caller's group (muzzle is not a leader).
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_muzzle"));
-        c.arg("run")
-            .args(args)
-            .env("XDG_STATE_HOME", &self.state)
+        let mut c = self.under(env!("CARGO_BIN_EXE_muzzle"));
+        c.arg("run").args(args);
+        c
+    }
+
+    /// `sh -c SCRIPT` with this test's environment, for a script that runs
+    /// muzzle itself (as `$MUZZLE`).
+    fn shell(&self, script: &str) -> Command {
+        let mut c = self.under("sh");
+        c.args(["-c", script])
+            .env("MUZZLE", env!("CARGO_BIN_EXE_muzzle"));
+        c
+    }
+
+    fn under(&self, program: &str) -> Command {
+        let mut c = Command::new(program);
+        c.env("XDG_STATE_HOME", &self.state)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("MUZZLE_UNIT_PREFIX", &self.units)
             // A test run under muzzle must not read as nested.
@@ -1033,6 +1046,11 @@ fn exit_codes() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+    // f-timeout-panic: finite but past Duration's range was a panic (101).
+    for flag in ["--timeout", "--run-timeout"] {
+        let out = env.cmd(&[flag, "1e30", "--", "true"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flag}: {out:?}");
+    }
     // Signals from the caller reach a job in its own group.
     let mut c = env.cmd(&["--", "sleep", "30"]).spawn().unwrap();
     assert!(eventually(Duration::from_secs(5), || env.state().held() == 1));
@@ -1356,4 +1374,216 @@ fn ctrl_c_to_a_container_gate_keeps_the_slots_until_its_scope_empties() {
 #[test]
 fn run_timeout_of_a_container_gate_keeps_the_slots_until_its_scope_empties() {
     container_job_outlives_a_graceful_stop("timeout");
+}
+
+/// f-sigign: a signal the caller ignores (`nohup`, `trap '' HUP`) stays
+/// ignored for muzzle and for the job, which inherits the ignore through
+/// exec. muzzle caught HUP, forwarded it, and exited 129.
+#[test]
+fn signals_the_caller_ignores_stay_ignored_for_muzzle_and_the_job() {
+    let env = Env::new();
+    let started = env.file("started");
+    // The job signals itself, the HUP and INT a terminal hangup or a
+    // stray Ctrl-C would bring; muzzle gets its own HUP from the test.
+    let script = format!(
+        r#"trap '' HUP INT; exec "$MUZZLE" run -- sh -c 'touch {s}; sleep 1; kill -HUP $$; kill -INT $$; echo survived'"#,
+        s = started.display()
+    );
+    let child = env.shell(&script).spawn().unwrap();
+    assert!(eventually(Duration::from_secs(5), || started.exists()));
+    kill(child.id() as i32, libc::SIGHUP);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "survived\n");
+    // A signal the caller doesn't ignore is still caught and forwarded.
+    let mut c = env.cmd(&["--", "sleep", "30"]).spawn().unwrap();
+    assert!(eventually(Duration::from_secs(5), || env.state().held() == 1));
+    kill(c.id() as i32, libc::SIGHUP);
+    let s = wait_for(&mut c, Duration::from_secs(3)).unwrap();
+    assert_eq!(s.code(), Some(129));
+}
+
+/// f-nested-timeout: a nested run's `--run-timeout` ends the nested job's
+/// descendants too (D18), not only its top command, and leaves the outer
+/// job, which shares their group, alone (D17).
+#[test]
+fn nested_run_timeout_kills_the_nested_tree_but_not_the_outer_job() {
+    let env = Env::new();
+    let leaked = env.file("leaked");
+    let outer_done = env.file("outer-done");
+    // The nested top command is a shell whose grandchild sleeps past the
+    // timeout; `; true` keeps sh from exec'ing it.
+    let script = format!(
+        r#""$MUZZLE" run --run-timeout 0.5 -- sh -c 'sh -c "sleep 2; touch {l}"; true'; echo nested=$?; sleep 3; touch {o}"#,
+        l = leaked.display(),
+        o = outer_done.display()
+    );
+    let out = env
+        .cmd(&["--", "sh", "-c", &script])
+        .env("MUZZLE", env!("CARGO_BIN_EXE_muzzle"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested=124\n");
+    assert!(outer_done.exists(), "the outer job was hit");
+    assert!(
+        !leaked.exists(),
+        "the nested job's grandchild outlived its timeout"
+    );
+}
+
+/// f-nonleader-pgid: a non-leader's job group (the child's pid) is
+/// recorded in the same locked write as the spawn. It used to be written
+/// after, in a write that waited for the lock, and a muzzle SIGKILLed in
+/// that wait left a running job whose claim read as dead. The test holds
+/// the lock from admission on, as a contended host would.
+#[test]
+fn a_non_leader_job_never_runs_with_its_group_unrecorded() {
+    let env = Env::new();
+    let started = env.file("started");
+    let job = format!("touch {}; sleep 30", started.display());
+    let mut c = env
+        .cmd(&["--slots", "3", "--", "sh", "-c", &job])
+        .spawn()
+        .unwrap();
+    let dir = env.state.join("muzzle");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("state.lock"))
+        .unwrap();
+    let read = || -> State {
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap()
+    };
+    // Take the lock as soon as the ticket is admitted, and hold it.
+    let admitted = eventually(Duration::from_secs(5), || {
+        lock.lock().unwrap();
+        if !read().holders.is_empty() {
+            return true;
+        }
+        lock.unlock().unwrap();
+        false
+    });
+    assert!(admitted);
+    std::thread::sleep(Duration::from_millis(700));
+    let unrecorded = started.exists() && read().holders[0].pgid.is_none();
+    lock.unlock().unwrap();
+    assert!(!unrecorded, "the job ran while its holder had no group");
+    assert!(eventually(Duration::from_secs(5), || started.exists()));
+    let pgid = env.state().holders[0].pgid.unwrap() as i32;
+    assert_ne!(pgid, c.id() as i32, "a non-leader's job has its own group");
+    kill(c.id() as i32, libc::SIGKILL);
+    c.wait().unwrap();
+    // The job's group still holds the claim.
+    let out = env
+        .cmd(&["--slots", "2", "--timeout", "0.5", "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    kill(-pgid, libc::SIGKILL);
+    assert!(eventually(Duration::from_secs(5), || group_empty(pgid)));
+}
+
+/// `sh -c SCRIPT` as the session leader of a fresh pty, as an interactive
+/// shell's command runs: its group is the terminal's foreground. Returns
+/// the child and the pty master.
+fn on_a_pty(mut cmd: Command) -> (Child, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty writes two fds; the null pointers are allowed.
+    let r = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            // `*mut` on macOS, `*const` on Linux: null_mut fits both.
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: login_tty (setsid, make the pty controlling, dup onto 0-2)
+    // runs in the forked child before exec.
+    unsafe {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(move || {
+                if libc::login_tty(slave) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+    }
+    let child = cmd.spawn().unwrap();
+    // SAFETY: both fds are ours; the child has its own copy of the slave.
+    unsafe {
+        libc::close(slave);
+        (child, std::fs::File::from_raw_fd(master))
+    }
+}
+
+/// Everything the pty prints, read on a thread until EOF or `within`.
+fn pty_output(master: &std::fs::File, within: Duration) -> std::sync::mpsc::Receiver<String> {
+    use std::io::Read;
+    let mut m = master.try_clone().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        // EIO once every slave fd is closed.
+        while let Ok(n) = m.read(&mut buf) {
+            if n == 0
+                || tx
+                    .send(String::from_utf8_lossy(&buf[..n]).into_owned())
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + within;
+        let mut all = String::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(s) => all.push_str(&s),
+                Err(_) => break,
+            }
+        }
+        let _ = out_tx.send(all);
+    });
+    out_rx
+}
+
+/// f-tcsetpgrp: a non-leader muzzle (`muzzle run …; more` in an interactive
+/// shell) runs its job in a new group. That group gets the terminal for the
+/// run, so a job reading it isn't stopped on SIGTTIN for good, and the
+/// shell gets it back after. A job stopped outright (`kill -STOP`) doesn't
+/// leave muzzle waiting forever either: in this orphaned test group the
+/// shell can't stop muzzle in turn, so muzzle continues the job.
+#[test]
+fn a_non_leader_job_owns_the_terminal_and_gives_it_back() {
+    use std::io::Write;
+    let env = Env::new();
+    let script = r#""$MUZZLE" run -- sh -c 'kill -STOP $$; read x; echo got:$x'; echo rc=$?; read y; echo again:$y"#;
+    let (mut child, mut master) = on_a_pty(env.shell(script));
+    let out = pty_output(&master, Duration::from_secs(10));
+    // The tty buffers input until a reader asks for it.
+    master.write_all(b"hello\nworld\n").unwrap();
+    let status = wait_for(&mut child, Duration::from_secs(10));
+    let text = out.recv().unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        text.contains("got:hello"),
+        "job never read the terminal: {text:?}"
+    );
+    assert!(text.contains("rc=0"), "{text:?}");
+    assert!(
+        text.contains("again:world"),
+        "the shell never got the terminal back: {text:?}"
+    );
+    assert_eq!(status.map(|s| s.code()), Some(Some(0)), "{text:?}");
 }

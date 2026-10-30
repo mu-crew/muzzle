@@ -11,7 +11,7 @@ use anyhow::Context;
 
 use super::report::{Times, repo_str, write_report};
 use super::scope::Sampler;
-use super::{Heartbeat, KILL_GRACE, TICK, take_signal};
+use super::{Heartbeat, KILL_GRACE, POLL, TICK, take_signal};
 use crate::cli::RunArgs;
 use crate::exit;
 use crate::proc::{self, Pid};
@@ -24,7 +24,9 @@ pub(super) enum Target {
     /// The job shares muzzle's group (D16 leader case): every member but
     /// muzzle itself.
     GroupButMe { pgid: Pid, me: Pid },
-    /// A nested run: only the child, never the outer claim's group.
+    /// A nested run: only the child, never the outer claim's group. Its
+    /// descendants share that group, so on `--run-timeout` [`Deadline`]
+    /// reaches them through ancestry instead (D18, f-nested-timeout).
     Child(Pid),
 }
 
@@ -95,21 +97,83 @@ pub(super) struct Deadline {
     pub(super) after: Option<Duration>,
     pub(super) termed: Option<Instant>,
     pub(super) killed: bool,
+    /// A nested run's descendants (pid, start), tracked from the SIGTERM on.
+    /// Remembered rather than re-read, because once the top command dies
+    /// they are reparented and ancestry no longer finds them; the start
+    /// stamp keeps a recycled pid from being signalled (f-nested-timeout).
+    pub(super) tree: Vec<(Pid, proc::StartTime)>,
+    /// When the tree was last rescanned: a scan reads every process on the
+    /// host, so it runs every `POLL`, not every `TICK`, plus right before
+    /// each signal.
+    scanned: Option<Instant>,
 }
 
 impl Deadline {
+    pub(super) fn new(after: Option<Duration>) -> Deadline {
+        Deadline {
+            after,
+            termed: None,
+            killed: false,
+            tree: Vec::new(),
+            scanned: None,
+        }
+    }
+
     fn check(&mut self, started: Instant, target: Target) {
         let Some(after) = self.after else { return };
         match self.termed {
             None if started.elapsed() >= after => {
-                target.signal(libc::SIGTERM);
+                self.hit(target, libc::SIGTERM);
                 self.termed = Some(Instant::now());
             }
             Some(at) if !self.killed && at.elapsed() >= KILL_GRACE => {
-                target.signal(libc::SIGKILL);
+                self.hit(target, libc::SIGKILL);
                 self.killed = true;
             }
+            // During the grace, so what the tree forks is still found.
+            Some(_) => self.track(target),
             _ => {}
+        }
+    }
+
+    /// The deadline's signal: the target, and for a nested run its tracked
+    /// descendants too.
+    fn hit(&mut self, target: Target, sig: libc::c_int) {
+        self.scanned = None;
+        self.track(target);
+        for &(pid, _) in &self.tree {
+            // SAFETY: plain syscall; `track` just checked the start stamp.
+            unsafe { libc::kill(pid, sig) };
+        }
+        target.signal(sig);
+    }
+
+    /// Drop the dead from a nested run's tree and add what the child and
+    /// the tree have forked since. A no-op for a group target.
+    fn track(&mut self, target: Target) {
+        let Target::Child(child) = target else { return };
+        self.tree.retain(|&(p, s)| proc::is_alive(p, s));
+        if self.scanned.is_some_and(|t| t.elapsed() < POLL) {
+            return;
+        }
+        self.scanned = Some(Instant::now());
+        let mut roots: Vec<Pid> = self.tree.iter().map(|t| t.0).collect();
+        roots.push(child);
+        for d in proc::descendants(&roots) {
+            if !self.tree.iter().any(|t| t.0 == d.0) {
+                self.tree.push(d);
+            }
+        }
+    }
+
+    /// What the deadline still waits for once the top command is gone.
+    fn remaining(&mut self, target: Target) -> Vec<Pid> {
+        match target {
+            Target::Child(_) => {
+                self.track(target);
+                self.tree.iter().map(|t| t.0).collect()
+            }
+            _ => target.others(),
         }
     }
 
@@ -125,16 +189,16 @@ impl Deadline {
         &mut self,
         target: Target,
         mut sampler: Option<&mut Sampler>,
-        beat: &mut Heartbeat,
+        mut beat: Option<&mut Heartbeat>,
     ) {
         let Some(termed) = self.termed else { return };
         loop {
-            let others = target.others();
+            let others = self.remaining(target);
             let Some(&member) = others.first() else {
                 return;
             };
             if termed.elapsed() >= KILL_GRACE {
-                target.signal(libc::SIGKILL);
+                self.hit(target, libc::SIGKILL);
                 self.killed = true;
                 return;
             }
@@ -144,23 +208,48 @@ impl Deadline {
             if let Some(s) = sampler.as_deref_mut() {
                 s.sample(member);
             }
-            beat.beat();
+            if let Some(b) = beat.as_deref_mut() {
+                b.beat();
+            }
             std::thread::sleep(TICK);
         }
     }
 }
 
 /// Wait for the top command, forwarding signals, enforcing the deadline and
-/// sampling the scope, and beating for the holder if there is one. Returns its status and rusage once reaped.
+/// sampling the scope, and beating for the holder if there is one. With
+/// `tty`, a job in its own group that stops is relayed to the shell (see
+/// [`relay_stop`]). Returns its status and rusage once reaped.
 pub(super) fn supervise(
     pid: Pid,
     target: Target,
     deadline: &mut Deadline,
     mut sampler: Option<&mut Sampler>,
     mut beat: Option<&mut Heartbeat>,
+    tty: Option<&proc::Terminal>,
 ) -> anyhow::Result<(ExitStatus, proc::Rusage)> {
     let started = Instant::now();
-    while !exited(pid) {
+    // A job left stopped waiting for the terminal, resumed once it's ours.
+    let mut parked = false;
+    loop {
+        match proc::poll_child(pid).context("waiting for the command")? {
+            proc::ChildState::Exited(status, ru) => return Ok((status, ru)),
+            proc::ChildState::Stopped(sig) => {
+                if let (Target::Group(pgid), Some(t)) = (target, tty) {
+                    parked = !relay_stop(pgid, t, sig);
+                }
+            }
+            proc::ChildState::Running => {}
+        }
+        if let (true, Target::Group(pgid), Some(t)) = (parked, target, tty)
+            && t.ours()
+        {
+            // `fg` after `bg`: the shell gave muzzle the terminal back.
+            t.lend(pgid);
+            // SAFETY: plain syscall.
+            unsafe { libc::kill(-pgid, libc::SIGCONT) };
+            parked = false;
+        }
         if let Some(sig) = take_signal() {
             target.forward(sig);
         }
@@ -173,7 +262,37 @@ pub(super) fn supervise(
         }
         std::thread::sleep(TICK);
     }
-    proc::wait_child(pid).context("waiting for the command")
+}
+
+/// f-tcsetpgrp: the job, in its own group (D16 non-leader), was stopped
+/// (Ctrl-Z, or SIGTTIN reading a terminal it doesn't own). The shell only
+/// sees muzzle, so muzzle gives the terminal back and stops too, and the
+/// shell reports the job stopped. On `fg` or `bg` the shell continues
+/// muzzle, which lends the terminal again if it got it back (`fg`) and
+/// continues the job. Without this muzzle waited on a stopped job forever,
+/// holding its slots and the shell. Returns whether the job was continued.
+fn relay_stop(pgid: Pid, tty: &proc::Terminal, sig: libc::c_int) -> bool {
+    tty.give_back();
+    // SAFETY: plain syscall. SIGTSTP keeps its default action (muzzle
+    // never catches it), so this returns once muzzle is continued, or at
+    // once if the kernel discards it for an orphaned group.
+    unsafe {
+        libc::raise(libc::SIGTSTP);
+    }
+    if tty.ours() {
+        tty.lend(pgid);
+    } else if matches!(sig, libc::SIGTTIN | libc::SIGTTOU) {
+        // Still in the background (`bg`, or an orphaned group where the
+        // stop was discarded): continuing a job that waits for the terminal
+        // only stops it again, so it stays stopped, as a background reader
+        // does in a plain shell, until the terminal comes back.
+        return false;
+    }
+    // SAFETY: plain syscall.
+    unsafe {
+        libc::kill(-pgid, libc::SIGCONT);
+    }
+    true
 }
 
 /// D17: a nested run starts at once, claims nothing and is not logged; its
@@ -191,12 +310,11 @@ pub(super) fn run_nested(
         Err(e) => return Ok(ExitCode::from(spawn_failed(&args.command[0], &e))),
     };
     let pid = child.id() as Pid;
-    let mut deadline = Deadline {
-        after: run_timeout,
-        termed: None,
-        killed: false,
-    };
-    let (status, _) = supervise(pid, Target::Child(pid), &mut deadline, None, None)?;
+    let target = Target::Child(pid);
+    let mut deadline = Deadline::new(run_timeout);
+    let (status, _) = supervise(pid, target, &mut deadline, None, None, None)?;
+    // D18's grace applies to the nested job's leftovers as to a group.
+    deadline.drain(target, None, None);
     let code = if deadline.fired() {
         exit::RUN_TIMEOUT
     } else {

@@ -58,11 +58,22 @@ extern "C" fn on_signal(sig: libc::c_int) {
 /// (D19) or forward them to the job (§Architecture 4.4) instead of dying
 /// and leaving the job unsupervised. Handlers reset to default across exec,
 /// so the job starts with default dispositions.
+///
+/// A signal the caller ignores (`nohup`, `trap '' HUP`) stays ignored, for
+/// muzzle and, since `SIG_IGN` survives exec, for the job: catching it made
+/// `nohup muzzle run …` die on HUP with 129 and took the ignore from the job
+/// (f-sigign, §Architecture 4.4 note of 2026-10-30).
 fn install_handlers() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-        // SAFETY: a zeroed sigaction is valid; the handler only stores to an
+        // SAFETY: zeroed sigactions are valid; the handler only stores to an
         // atomic, which is async-signal-safe.
         unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+            {
+                continue;
+            }
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
             libc::sigemptyset(&mut sa.sa_mask);
@@ -290,8 +301,11 @@ fn bad_usage(msg: impl std::fmt::Display) -> anyhow::Result<ExitCode> {
 fn seconds(flag: &str, v: Option<f64>) -> Result<Option<Duration>, String> {
     match v {
         None => Ok(None),
-        Some(s) if s.is_finite() && s >= 0.0 => Ok(Some(Duration::from_secs_f64(s))),
-        Some(s) => Err(format!("{flag} {s}: must be a number of seconds")),
+        // `try_`: 1e30 is finite but no Duration, and `from_secs_f64`
+        // panicked with exit 101 instead of a usage error (f-timeout-panic).
+        Some(s) => Duration::try_from_secs_f64(s)
+            .map(Some)
+            .map_err(|_| format!("{flag} {s}: must be a number of seconds")),
     }
 }
 
@@ -601,6 +615,18 @@ mod tests {
         live.groups.clear();
         assert!(!is_nested(&s, &[], Some("7:100:55"), &live));
         assert!(!is_nested(&s, &[ancestor(100, 200, 55)], None, &live));
+    }
+
+    #[test]
+    fn timeouts_out_of_duration_range_are_usage_errors() {
+        assert_eq!(
+            seconds("--timeout", Some(1.5)),
+            Ok(Some(Duration::from_millis(1500)))
+        );
+        assert_eq!(seconds("--timeout", None), Ok(None));
+        for bad in [1e30, f64::MAX, f64::INFINITY, f64::NAN, -1.0] {
+            assert!(seconds("--run-timeout", Some(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
