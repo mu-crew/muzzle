@@ -1,7 +1,9 @@
 //! `muzzle report` (spec §Interface, `report` and `runs.jsonl`; D29, D30,
-//! D30a, D41). Reads `runs.jsonl` and nothing else of muzzle's: the
-//! arithmetic is pure over parsed records, so tests drive it with fixtures.
-//! It never edits the config (D29).
+//! D30a, D41). Reads `runs.jsonl`, plus the live stored budget in
+//! `state.json` and the config's `slots =` to size suggestions as the next
+//! run would (D17a, see [`host`]): the arithmetic is pure over parsed
+//! records, so tests drive it with fixtures. It never edits the config
+//! (D29).
 
 use std::process::ExitCode;
 
@@ -49,24 +51,45 @@ pub struct Host {
     pub budget: Option<u32>,
 }
 
-/// D9 memory per slot and the budget, from the stored budget (D17a) the
-/// next run at `now_ms` would use, else this host's reading. It reads
-/// through `live_budget` as `status` and `doctor` do, so an idle state file
-/// past `BUDGET_TTL_MS`, which the next run ignores, sizes nothing.
-fn host(store: &crate::state::Store, now_ms: u64) -> Host {
-    if let Ok(Some(b)) = store.read().map(|s| s.live_budget(now_ms)) {
-        return Host {
-            mem_per_slot_mb: Some(b.ram_per_slot as f64 / (1024.0 * 1024.0)),
+/// D9 memory per slot and the budget the next run at `now_ms` would use,
+/// as state.rs `resolve_budget` picks it (D17a): with a config `slots =`,
+/// that slot count and this host's own cores and RAM; otherwise the stored
+/// budget, read through `live_budget` as `status` and `doctor` do (an idle
+/// state file past `BUDGET_TTL_MS`, which the next run ignores, sizes
+/// nothing); else this host's reading with no cap.
+fn host(store: &crate::state::Store, now_ms: u64, config_slots: Option<u32>) -> Host {
+    let live = store.read().ok().and_then(|s| s.live_budget(now_ms));
+    let reading = crate::proc::logical_cores()
+        .ok()
+        .filter(|&c| c > 0)
+        .zip(crate::proc::total_ram().ok());
+    resolve_host(live, config_slots, reading)
+}
+
+/// The pure part of [`host`]: `reading` is this host's (cores, RAM bytes).
+fn resolve_host(
+    live: Option<crate::state::Budget>,
+    config_slots: Option<u32>,
+    reading: Option<(usize, u64)>,
+) -> Host {
+    const MB: f64 = 1024.0 * 1024.0;
+    let measured = reading.map(|(c, r)| r as f64 / c as f64 / MB);
+    let stored = live.map(|b| b.ram_per_slot as f64 / MB);
+    match (config_slots, live) {
+        // As doctor checks.rs: no reading means the run would fail to read
+        // too, so the stored RAM beats nothing.
+        (Some(slots), _) => Host {
+            mem_per_slot_mb: measured.or(stored),
+            budget: Some(slots),
+        },
+        (None, Some(b)) => Host {
+            mem_per_slot_mb: stored,
             budget: Some(b.budget),
-        };
-    }
-    let cores = crate::proc::logical_cores().ok().filter(|&c| c > 0);
-    let ram = crate::proc::total_ram().ok();
-    Host {
-        mem_per_slot_mb: cores
-            .zip(ram)
-            .map(|(c, r)| r as f64 / c as f64 / (1024.0 * 1024.0)),
-        budget: None,
+        },
+        (None, None) => Host {
+            mem_per_slot_mb: measured,
+            budget: None,
+        },
     }
 }
 
@@ -132,9 +155,19 @@ pub fn main(args: &ReportArgs) -> anyhow::Result<ExitCode> {
     if skipped > 0 {
         eprintln!("muzzle: report: skipped {skipped} unreadable runs.jsonl lines");
     }
+    // Only `slots =` matters here (D17a). Read only an existing file, as
+    // doctor does, so report never writes the template (D29); a bad config
+    // is `--by repo`'s to report, so plain `report` sizes as if it set none.
+    let path = crate::rules::config::path();
+    let config_slots = path
+        .exists()
+        .then(|| crate::rules::config::Config::load_from(&path).ok())
+        .flatten()
+        .and_then(|c| c.slots);
+    let host = host(&store, now_ms, config_slots);
     let out = match args.by {
-        Some(crate::cli::By::Repo) => render_by_repo(&runs, args, now, host(&store, now_ms)),
-        None => Ok(render(&runs, args, now, host(&store, now_ms))),
+        Some(crate::cli::By::Repo) => render_by_repo(&runs, args, now, host),
+        None => Ok(render(&runs, args, now, host)),
     };
     let out = match out {
         Ok(out) => out,
@@ -176,11 +209,32 @@ mod tests {
                "budget":{"budget":3,"cores":3,"ram_per_slot":1048576}}"#,
         )
         .unwrap();
-        let fresh = host(&store, 1000 + crate::state::BUDGET_TTL_MS);
+        let fresh = host(&store, 1000 + crate::state::BUDGET_TTL_MS, None);
         assert_eq!((fresh.budget, fresh.mem_per_slot_mb), (Some(3), Some(1.0)));
-        let stale = host(&store, 1001 + crate::state::BUDGET_TTL_MS);
+        let stale = host(&store, 1001 + crate::state::BUDGET_TTL_MS, None);
         assert_eq!(stale.budget, None, "{stale:?}");
         assert_ne!(stale.mem_per_slot_mb, Some(1.0));
+    }
+
+    #[test]
+    fn config_slots_sizes_from_this_reading() {
+        // D17a, state.rs resolve_budget: with `slots =` the next run keeps
+        // the slot count and replaces the stored cores and RAM with its own
+        // reading, so a container-written 1 MB/slot must not size anything.
+        let stored = crate::state::Budget {
+            budget: 6,
+            cores: 8,
+            ram_per_slot: 1024 * 1024,
+        };
+        let reading = Some((16, 16 * 2048 * 1024 * 1024));
+        let h = resolve_host(Some(stored), Some(5), reading);
+        assert_eq!((h.budget, h.mem_per_slot_mb), (Some(5), Some(2048.0)));
+        // No stored budget: the cap is still the slots value.
+        let h = resolve_host(None, Some(5), reading);
+        assert_eq!((h.budget, h.mem_per_slot_mb), (Some(5), Some(2048.0)));
+        // Without `slots =` the live stored budget wins (unchanged).
+        let h = resolve_host(Some(stored), None, reading);
+        assert_eq!((h.budget, h.mem_per_slot_mb), (Some(6), Some(1.0)));
     }
 
     /// A clean `gate` run on 2 slots under cfg `c1`, budget 8.

@@ -35,6 +35,7 @@ fn report(args: &[&str]) -> Output {
         .arg("report")
         .args(args)
         .env("XDG_STATE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .output()
         .unwrap()
 }
@@ -136,6 +137,7 @@ fn missing_log_is_an_empty_report() {
     let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(["report", "--json"])
         .env("XDG_STATE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -181,6 +183,7 @@ fn since_skips_archives_outside_the_period() {
             .arg("report")
             .args(args)
             .env("XDG_STATE_HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
             .output()
             .unwrap()
     };
@@ -215,6 +218,7 @@ fn identical_runs_in_one_file_all_count() {
     let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(["report", "--json"])
         .env("XDG_STATE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
