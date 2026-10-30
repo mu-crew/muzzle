@@ -629,6 +629,9 @@ fn skip_safe_opts(o: &SafeOpts, words: &[String]) -> Option<usize> {
     }
     at += o.positional;
     while o.env && words.get(at).is_some_and(|w| is_assignment(w)) {
+        if !safe_assignment(&words[at]) {
+            return None;
+        }
         at += 1;
     }
     (at <= words.len()).then_some(at)
@@ -670,6 +673,9 @@ pub fn command_word(text: &str) -> Option<usize> {
     loop {
         let w = words.get(at)?.as_str();
         if is_assignment(w) {
+            if !safe_assignment(w) {
+                return None;
+            }
             at += 1;
             continue;
         }
@@ -722,6 +728,34 @@ pub fn runs_muzzle(text: &str) -> bool {
 }
 
 pub(super) const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
+
+/// Variables `hook claude` lets an assignment set before the command word
+/// (R5, amended for fix-hook-failsafe). A variable is config just like an
+/// option: `CARGO_TARGET_<triple>_RUNNER` is `--config target.x.runner`,
+/// `npm_config_script_shell` is `--script-shell`, `NODE_OPTIONS` is
+/// `--node-options`, and `PATH`, `LD_PRELOAD`, `RUSTUP_TOOLCHAIN` or
+/// `CARGO_HOME` change the program itself. So it is an allowlist of names
+/// that only tune output, logging or parallelism and can't name code; any
+/// other name fails safe (wrapped, left to the prompt).
+const SAFE_VARS: [&str; 12] = [
+    "CARGO_BUILD_JOBS",
+    "CARGO_INCREMENTAL",
+    "CARGO_TERM_COLOR",
+    "CARGO_TERM_QUIET",
+    "CARGO_TERM_VERBOSE",
+    "CI",
+    "FORCE_COLOR",
+    "NO_COLOR",
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+];
+
+fn safe_assignment(w: &str) -> bool {
+    w.split_once('=')
+        .is_some_and(|(name, _)| SAFE_VARS.contains(&name))
+}
 
 fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(name, _)| {
@@ -1033,12 +1067,18 @@ mod tests {
         for (cmd, word) in [
             ("cargo test", "cargo"),
             ("/usr/bin/time -v cargo clippy", "cargo"),
-            ("/bin/env A=1 cargo test", "cargo"),
-            ("A=1 env B=2 nice -n 5 timeout 9 cargo test", "cargo"),
+            ("/bin/env CI=1 cargo test", "cargo"),
+            (
+                "CI=1 env RUST_LOG=x nice -n 5 timeout 9 cargo test",
+                "cargo",
+            ),
             ("env -u X cargo test", "cargo"),
             // low_cluster_scan_blocks_pcore_ucargo: `-u` owns the rest.
             ("env -uCARGO_HOME cargo test", "cargo"),
-            ("env -iuCARGO_HOME --unset=X - A=1 cargo test", "cargo"),
+            (
+                "env -iuCARGO_HOME --unset=X - NO_COLOR=1 cargo test",
+                "cargo",
+            ),
             ("timeout -s KILL --kill-after=5 600 cargo test", "cargo"),
             ("timeout -sKILL 600 cargo test", "cargo"),
             ("nice -5 time -p cargo test", "cargo"),
@@ -1078,6 +1118,16 @@ mod tests {
             "time -o /home/u/.bashrc cargo test",
             "timeout --foo 5 cargo test",
             "nice --adj=5 cargo test",
+            // high_env_assignments_name_other_code: only SAFE_VARS.
+            "A=1 cargo test",
+            "PATH=/tmp/evil cargo test",
+            "env -i PATH=/tmp/evil cargo test",
+            "CI=1 env LD_PRELOAD=/e.so cargo test",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=x cargo test",
+            "npm_config_script_shell=/e npm run test",
+            "NODE_OPTIONS=--require=/e.js npm run test",
+            "env RUSTUP_TOOLCHAIN=/tmp/tc cargo test",
+            "CARGO_HOME=/tmp/evil cargo build",
         ] {
             assert_eq!(command_word(cmd), None, "{cmd}");
         }

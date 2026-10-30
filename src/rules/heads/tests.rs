@@ -255,6 +255,46 @@ fn head_matching_rules() {
     assert!(x("cargo build -pCrate", "cargo build"));
     assert!(x("cargo test -FCuda", "cargo test"));
     assert!(x("cargo test -j8 --release", "cargo test"));
+    // medium_options_of_programs_without: a pattern with no subcommand
+    // words takes only its program's listed options, `--` included; cargo
+    // words after `--` go to rustc except for test/nextest/bench/run.
+    assert!(x("vitest", "vitest"));
+    assert!(x("vitest run src/a.test.ts", "vitest"));
+    assert!(x("vitest --run --silent", "vitest"));
+    for h in [
+        "vitest --config=/tmp/evil.mjs",
+        "vitest -c /tmp/e.mjs",
+        "vitest --root /tmp/evil",
+        "vitest -r /tmp/evil",
+        "vitest --dir /tmp/evil",
+        "vitest --workspace=/tmp/w",
+        "vitest -- --config=/x",
+    ] {
+        assert!(!x(h, "vitest"), "{h}");
+    }
+    assert!(!x("contrib/gate --x", "contrib/gate"));
+    assert!(x("contrib/gate fast", "contrib/gate"));
+    assert!(x(
+        "cargo test -- --nocapture -Zunstable-options",
+        "cargo test"
+    ));
+    assert!(x("cargo clippy -- -D warnings", "cargo clippy"));
+    assert!(x(
+        "cargo clippy --all-targets -- -Dwarnings -W clippy::pedantic --allow=dead_code",
+        "cargo clippy"
+    ));
+    for h in [
+        "cargo clippy -- -Zcodegen-backend=/tmp/be.so",
+        "cargo clippy -- -C linker=/tmp/e",
+        "cargo clippy -- -D",
+        "cargo clippy -- -D /x",
+        "cargo clippy -- --extern x=/e.rlib",
+        "cargo clippy -- -L /tmp/e",
+        "cargo clippy -- --deny",
+    ] {
+        assert!(!x(h, "cargo clippy"), "{h}");
+    }
+    assert!(!x("cargo build -- -Zx", "cargo build"));
     // rv021_glob_program: a `*` in the pattern's program is literal here.
     assert!(!x("cargo-evil", "cargo*"));
 }

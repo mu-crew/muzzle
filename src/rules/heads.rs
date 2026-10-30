@@ -114,10 +114,55 @@ pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
             _ => return false,
         }
     }
-    // Words after `--` go to the test binary or script, not to `prog`.
-    rest.iter()
-        .take_while(|w| *w != "--")
-        .all(|w| safe_after(prog, w))
+    match prog.as_str() {
+        // Words after `--` go to the script (npm) or, for cargo, to the
+        // test binary or to rustc: see [`safe_after_dashes`].
+        "npm" | "cargo" => {
+            let dashes = rest.iter().position(|w| w == "--").unwrap_or(rest.len());
+            rest[..dashes].iter().all(|w| safe_after(prog, w))
+                && (prog == "npm"
+                    || safe_after_dashes(pattern.get(1).map(String::as_str), &rest[dashes..]))
+        }
+        // R5 (fix-hook-failsafe): what `--` means is the program's own
+        // business, so every word counts, `--` included.
+        _ => rest.iter().all(|w| safe_after(prog, w)),
+    }
+}
+
+/// R5 (fix-hook-failsafe): what follows cargo's `--` (from the `--` on).
+/// For `test`, `nextest`, `bench` and `run` it goes to the workspace's own
+/// binary, which the allow already trusts. For every other subcommand it
+/// goes to rustc or clippy-driver, where `-Zcodegen-backend=/x.so`, `-C
+/// linker=` or `--extern` load code from elsewhere; there only lint levels
+/// (`-D warnings`, `-Wclippy::x`, `--deny=x`) pass.
+fn safe_after_dashes(sub: Option<&str>, words: &[String]) -> bool {
+    let Some((_, mut rest)) = words.split_first() else {
+        return true;
+    };
+    if matches!(sub, Some("test" | "nextest" | "bench" | "run")) {
+        return true;
+    }
+    let lint = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_:".contains(c))
+    };
+    while let Some((w, tail)) = rest.split_first() {
+        let level = ["-D", "-W", "-A", "-F"]
+            .iter()
+            .chain(&["--deny", "--warn", "--allow", "--forbid"])
+            .find_map(|o| Some((o, w.strip_prefix(o)?)));
+        rest = match level {
+            Some((_, "")) => match tail.split_first() {
+                Some((l, t)) if lint(l) => t,
+                _ => return false,
+            },
+            Some((o, v)) if !o.starts_with("--") && lint(v) => tail,
+            Some((o, v)) if o.starts_with("--") && v.strip_prefix('=').is_some_and(lint) => tail,
+            _ => return false,
+        };
+    }
+    true
 }
 
 /// R5: an option word before the subcommand that can't make `prog` run
@@ -142,6 +187,10 @@ fn safe_before(prog: &str, w: &str) -> bool {
                 || short_flags(w, "qv")
         }
         "npm" => matches!(w, "--silent" | "--quiet") || short_flags(w, "sqd"),
+        // vitest reads `--config`/`-c`, `--root`/`-r`, `--dir`,
+        // `--workspace` and custom `--reporter`/`--environment` modules,
+        // all JS from elsewhere; these only change how the run reports.
+        "vitest" => matches!(w, "--run" | "--silent" | "--passWithNoTests" | "--no-color"),
         _ => false,
     }
 }
@@ -173,7 +222,10 @@ fn safe_after(prog: &str, w: &str) -> bool {
             }
             true
         }
-        _ => true,
+        // R5 (fix-hook-failsafe): other programs (vitest, a project's
+        // `contrib/gate`) get only the options [`safe_before`] lists, so
+        // `vitest --config=/tmp/evil.mjs` is left to the prompt.
+        _ => !w.starts_with('-') || safe_before(prog, w),
     }
 }
 

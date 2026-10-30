@@ -68,7 +68,7 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
 /// (`npx`, `mise exec`, `distrobox`), a script (R1) or a variable (R3) is
 /// wrapped but left to Claude's prompt, and so is `/tmp/evil/cargo`.
 fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bool {
-    if !is_simple_command(command) {
+    if !is_simple_command(command) || expands(command) {
         return false;
     }
     let Some(at) = super::shell::command_word(command) else {
@@ -147,6 +147,48 @@ pub fn is_simple_command(command: &str) -> bool {
     true
 }
 
+/// True when bash would rewrite a word of `command` before running it, so
+/// the lexed words the allow checks are not the words that run (R5,
+/// amended for fix-hook-failsafe): `{a,b}` and `{a..b}` turn one word
+/// into several (`timeout {5,sh,-c,x} cargo test` runs `sh`), `$` in any
+/// form outside single quotes (`$X`, `${X:-…}`, `$"…"`) substitutes text
+/// the hook can't see, `*`, `?` and `[` glob into file names, and `~`
+/// becomes a path. Rather than model which of these are harmless, any of
+/// them refuses the allow; the command is still wrapped. Quoted or
+/// backslash-escaped, they are literal.
+fn expands(command: &str) -> bool {
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' => {
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                }
+            }
+            '"' => {
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => {
+                            chars.next();
+                        }
+                        '$' | '`' => return true,
+                        _ => {}
+                    }
+                }
+            }
+            '{' | '$' | '`' | '*' | '?' | '[' | '~' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The payload's timeout in seconds. Claude's Bash `timeout` is in ms.
 /// Zero, negative and non-finite values pass through: `wrap` drops them.
 /// Codex's Bash `tool_input` carries only `command` (checked against
@@ -210,6 +252,35 @@ mod tests {
             "",
         ] {
             assert!(is_simple_command(c), "{c:?}");
+        }
+    }
+
+    /// fix-hook-failsafe: words bash rewrites before running them.
+    #[test]
+    fn expansions_are_found_outside_single_quotes() {
+        for c in [
+            "timeout {5,sh} cargo test",
+            "cargo test -p{a..b}",
+            "cargo test $X",
+            "cargo test ${X:-y}",
+            r#"cargo test $"x""#,
+            r#"cargo test "$X""#,
+            r#"cargo test "${X}""#,
+            "cargo test *.rs",
+            "cargo test t?",
+            "cargo test [ab]",
+            "cargo test ~/x",
+        ] {
+            assert!(expands(c), "{c:?}");
+        }
+        for c in [
+            "cargo test",
+            "cargo test -- 'a{b,c}' '$X' '*'",
+            r"cargo test -- \{a,b\} \$X \*",
+            r#"cargo test -- "a{b,c}" "*" "~""#,
+            "cargo test -- a=b,c",
+        ] {
+            assert!(!expands(c), "{c:?}");
         }
     }
 
@@ -329,7 +400,7 @@ mod tests {
             for cmd in [
                 "cargo test --locked",
                 "timeout 600 contrib/fast-gate",
-                "FOO=1 env A=2 nice -n 5 time cargo build --release",
+                "CI=1 env RUST_LOG=x nice -n 5 time cargo build --release",
                 "timeout -s KILL 600 cargo test",
                 "/usr/bin/time -v cargo clippy",
                 "cargo test -- 'a&&b'",
@@ -356,7 +427,7 @@ mod tests {
     #[test]
     fn claude_allows_a_command_rule_only_on_the_exact_program() {
         let c = Config::parse(
-            "[[rule]]\nname='cargo-test'\ncommand='cargo test'\n\
+            "[[rule]]\nname='cargo-test'\ncommand=['cargo test', 'cargo clippy', 'cargo build']\n\
              [[rule]]\nname='js-test'\ncommand=['vitest', 'npm run test*']\n\
              [[rule]]\nname='gate'\ncommand='contrib/gate'",
             Path::new("t.toml"),
@@ -367,7 +438,13 @@ mod tests {
             "./cargo test",
             "cargo +nightly test -p x",
             "timeout 600 cargo test",
-            "A=1 env B=2 cargo test",
+            // fix-hook-failsafe: `A=1 env B=2 cargo test` with allowlisted
+            // names; arbitrary names now fail safe (below).
+            "RUST_BACKTRACE=1 env CARGO_BUILD_JOBS=4 cargo test",
+            "cargo test -- --nocapture",
+            "cargo clippy -- -D warnings",
+            "vitest",
+            "vitest run",
             "/usr/bin/time -v cargo test",
             "cargo +nightly test",
             "npm run test",
@@ -375,7 +452,6 @@ mod tests {
             "cargo test -FCuda",
             "env -uCARGO_HOME cargo test",
             "contrib/gate",
-            "./contrib/gate --fast",
             "npm run test:fast",
         ] {
             updated(&claude(cmd, &c));
@@ -417,6 +493,48 @@ mod tests {
             "npm run test --script-shell=/tmp/evil",
             "npm --node-options='--require /tmp/e.js' run test",
             "cargo +/tmp/tc test",
+            // fix-hook-failsafe: high_brace_parameter_expansion_smuggles.
+            "timeout {5,sh,-c,'echo PWNED-BRACE'} cargo test",
+            "env -u {X,-S,'sh -c \"echo PWNED-ENVS\"'} cargo test",
+            "nice -n {5,sh,-c,'echo P'} cargo test",
+            "time -f {%e,sh,-c,'echo P'} cargo test",
+            "cargo test -q ${X:-'--config=target.x86_64-unknown-linux-gnu.runner=[\"sh\"]'}",
+            "cargo test -q $\"--config=foo\"",
+            "cargo test {--config=foo,}",
+            "cargo test {-q,--config=foo}",
+            "cargo test -p{a..b}",
+            "cargo test $X",
+            "cargo test -- \"$X\"",
+            "npm run test {--script-shell=/tmp/evil/sh,-s}",
+            "cargo test ~/x",
+            "cargo test *",
+            // high_env_assignments_name_other_code.
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sh -c x' cargo test -q",
+            "CARGO_BUILD_RUSTC_WRAPPER=/e cargo test",
+            "RUSTC_WRAPPER=/e cargo test",
+            "npm_config_script_shell=/tmp/evil/sh npm run test",
+            "NPM_CONFIG_SCRIPT_SHELL=/tmp/evil/sh npm run test",
+            "NODE_OPTIONS='--require /tmp/e.js' npm run test",
+            "npm_config_prefix=/e npm run test",
+            "PATH=/tmp/evil cargo test",
+            "env -i PATH=/tmp/evil cargo test",
+            "LD_PRELOAD=/tmp/e.so cargo test",
+            "env RUSTUP_TOOLCHAIN=/tmp/tc cargo test",
+            "CARGO_HOME=/tmp/evil cargo test",
+            "BASH_ENV=/tmp/e cargo test",
+            "A=1 env B=2 cargo test",
+            "CI=1 env PATH=/e cargo test",
+            // medium_options_of_programs_without.
+            "vitest --config=/tmp/evil/vitest.config.mjs",
+            "vitest -c /tmp/evil.mjs",
+            "vitest --root /tmp/evil",
+            "vitest run --config=/tmp/e.mjs",
+            "vitest -- --config=/tmp/e.mjs",
+            "cargo clippy -- -Zcodegen-backend=/tmp/rv2/be.so",
+            "cargo +nightly clippy -- -Zcodegen-backend=/tmp/rv2/be.so",
+            "cargo clippy -- -C linker=/tmp/e",
+            "cargo build -- --extern x=/tmp/e.rlib",
+            "contrib/gate --anything",
         ] {
             undecided(&claude(cmd, &c));
         }
