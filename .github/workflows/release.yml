@@ -48,10 +48,10 @@ jobs:
 
   publish:
     needs: build
-    # v0.1.0 and v0.1.1 were published by hand (before trusted publishing);
-    # their tag pushes build but must not republish. Later tags publish
-    # through trusted publishing.
-    if: github.event_name == 'push' && github.ref_name != 'v0.1.0' && github.ref_name != 'v0.1.1'
+    # v0.1.0-v0.1.2 were published (fully or partly) by hand before trusted
+    # publishing worked end to end; their tag pushes build but must not
+    # republish. Later tags publish through trusted publishing.
+    if: github.event_name == 'push' && !contains(fromJSON('["v0.1.0","v0.1.1","v0.1.2"]'), github.ref_name)
     runs-on: ubuntu-latest
     # id-token: trusted publishing to npm and crates.io. No tokens are stored;
     # both registries trust this repo's release.yml for muzzle's packages.
@@ -85,16 +85,23 @@ jobs:
             npm publish "./npm/$package" --access public
           done
           npm publish ./npm/muzzle --access public
+      # The GitHub release goes before the crate, so a crates.io failure
+      # still leaves a release with the tarballs.
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for package in muzzle-linux-x64 muzzle-linux-arm64 muzzle-darwin-arm64; do
+            tar -C "npm/$package/bin" -czf "$package-$version.tar.gz" muzzle
+          done
+          sha256sum muzzle-*-"$version".tar.gz > SHA256SUMS
+          python3 scripts/changelog-section.py CHANGELOG.md "$version" > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "muzzle $version" --notes-file notes.md --verify-tag \
+            muzzle-*-"$version".tar.gz SHA256SUMS
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
         run: cargo publish --locked
-      - name: GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          python3 scripts/changelog-section.py CHANGELOG.md "$version" > notes.md
-          gh release create "$GITHUB_REF_NAME" --title "muzzle $version" --notes-file notes.md --verify-tag
