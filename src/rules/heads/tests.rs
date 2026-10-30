@@ -181,6 +181,14 @@ fn head_matching_rules() {
     assert!(!x("/tmp/evil/cargo test", "cargo test"));
     assert!(!x("/x/contrib/gate", "contrib/gate"));
     assert!(!x("../cargo test", "cargo test"));
+    // rv021_hook_optargs: the exact form steps over no option arguments,
+    // so `-C dir` and `--config runner=…` are left for the user.
+    assert!(!x("cargo -C /tmp/evil test", "cargo test"));
+    assert!(!x("cargo --config runner=/tmp/e test", "cargo test"));
+    assert!(!x("npm --prefix /tmp/evil test", "npm test"));
+    assert!(x("cargo --locked test -p x", "cargo test"));
+    // rv021_glob_program: a `*` in the pattern's program is literal here.
+    assert!(!x("cargo-evil", "cargo*"));
 }
 
 #[test]

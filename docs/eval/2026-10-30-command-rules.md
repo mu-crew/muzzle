@@ -50,7 +50,7 @@ oracle-sweep 5 → 5.
 | class | rows | reason |
 | --- | ---: | --- |
 | **regression** | **0** | |
-| accepted miss | 1 | inside a script the text writes, then runs (P12) |
+| fix | 1 | heredoc text that is written to a file, not run (review_u021) |
 | fix | 15 | quoted text: a note, message, grep pattern or remote command |
 | fix | 3 | runs on another host over ssh |
 | fix | 3 | an argument of a read-only command (`ps`, `grep`, `git diff --`) |
@@ -89,9 +89,12 @@ matcher or config change was needed.
 
 Paths are trimmed and examples cut short.
 
-**Accepted miss: a written-then-run script (P12).**
+**Fix: heredoc text written to a file, not run** (complete row;
+relabelled from "accepted miss" by review_u021: nothing runs in this text,
+and the script runs in a later, separate call that neither config claims).
 - `cat > …/h39/gate.sh <<'E' ⏎ cd …/fixer-14 ⏎ contrib/gate 2>&1 | tail -40 ⏎ E`
-  (complete; the script runs in a later call).
+
+**Accepted miss: a written-then-run script (P12), truncated rows.**
 - `cat > /tmp/u.sh <<'E' ⏎ … cargo test "$@" … ⏎ E ⏎ distrobox enter swayward-dev -- bash /tmp/u.sh pam_children`
 - `python3 - <<'EOF' ⏎ import subprocess … subprocess.run("npx vitest run …")`
   (a heredoc-fed interpreter).

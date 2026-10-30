@@ -154,6 +154,12 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
                         if pats.is_empty() || pats.iter().any(Vec::is_empty) {
                             return Err(bad("a command pattern is empty"));
                         }
+                        // R2 prefixes are for subcommand words only: a `*`
+                        // program would match any program, and the hook
+                        // would auto-allow it (R5).
+                        if pats.iter().any(|p| p[0].contains('*')) {
+                            return Err(bad("a command's program can't contain '*'"));
+                        }
                         Some(Matcher::Command(pats))
                     }
                     (None, None) => None,
@@ -226,6 +232,14 @@ mod tests {
             assert!(matches!(err, ConfigError::Parse { .. }), "{text}: {err}");
             assert!(err.to_string().contains(key), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn a_command_program_cannot_be_a_prefix() {
+        // rv021_glob_program: `*` only on subcommand words (R2).
+        invalid("[[rule]]\nname='a'\ncommand='*'", "can't contain '*'");
+        invalid("[[rule]]\nname='a'\ncommand=['cargo test','cargo*']", "can't contain '*'");
+        assert!(parse("[[rule]]\nname='a'\ncommand='npm run test*'").is_ok());
     }
 
     #[test]

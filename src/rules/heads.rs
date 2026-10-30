@@ -85,7 +85,7 @@ pub fn head_matches(head: &[String], pattern: &[String]) -> bool {
         || word
             .match_indices('/')
             .any(|(i, _)| word_matches(&word[i + 1..], prog));
-    named && subcommands_match(&head[1..], pattern)
+    named && subcommands_match(&head[1..], pattern, true)
 }
 
 /// R5: the hook's exact form. The program word is the pattern's program
@@ -94,11 +94,11 @@ pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
     let (Some(word), Some(prog)) = (head.first(), pattern.first()) else {
         return false;
     };
-    let named = word_matches(word, prog)
-        || word
-            .strip_prefix("./")
-            .is_some_and(|w| word_matches(w, prog));
-    named && subcommands_match(&head[1..], pattern)
+    let named = word == prog || word.strip_prefix("./") == Some(prog.as_str());
+    // No R4 option arguments here: `cargo -C /x test` and
+    // `cargo --config 'target.x.runner=…' test` name other code to run, so
+    // they are wrapped but left for the user to approve.
+    named && subcommands_match(&head[1..], pattern, false)
 }
 
 fn word_matches(word: &str, pat: &str) -> bool {
@@ -118,8 +118,12 @@ fn program_opts(prog: &str) -> &'static [&'static str] {
     }
 }
 
-fn subcommands_match(mut rest: &[String], pattern: &[String]) -> bool {
-    let takes = program_opts(base(&pattern[0]));
+fn subcommands_match(mut rest: &[String], pattern: &[String], option_args: bool) -> bool {
+    let takes: &[&str] = if option_args {
+        program_opts(base(&pattern[0]))
+    } else {
+        &[]
+    };
     for sub in &pattern[1..] {
         while let Some(w) = rest.first().filter(|w| w.starts_with(['-', '+'])) {
             let n = if takes.contains(&w.as_str()) { 2 } else { 1 };

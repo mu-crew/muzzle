@@ -34,7 +34,12 @@ Changed:
   path elsewhere (`/tmp/evil/cargo`) and a match through a wrapper,
   container, script or variable are wrapped but left to Claude's
   permission check. **`npx vitest run` loses auto-allow**, as do
-  `mise exec -- …` and `distrobox enter … -- …`.
+  `mise exec -- …` and `distrobox enter … -- …`. The hook's form also
+  skips no option arguments, so `cargo -C <dir> test`,
+  `cargo --config '…runner=…' test` and `npm --prefix <dir> test` are
+  wrapped but not auto-allowed.
+- A `command` pattern's program can't contain `*` (exit 2): a prefix
+  program would match, and auto-allow, any program.
 
 ## 0.2.0
 
