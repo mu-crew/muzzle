@@ -1,0 +1,80 @@
+# muzzle 0.2.1 config for linuxpc: the live rules as `command` rules
+# (spec 2026-10-30-muzzle-0.2.1-command-rules.md C6, R7). Install as
+# ~/.config/muzzle/config.toml. bench/linuxpc-config.toml stays the v1
+# snapshot the traces were labelled with.
+#
+# A `command` pattern matches a command word in command position: after
+# ; && | and in $( ), inside `bash -c '…'`, past env/timeout/nice/A=1 and
+# through mise exec, npx, uv run, flock, distrobox enter, toolbox run and
+# podman/docker exec (C2, C3, R4). Quoted text, heredocs and comments are
+# never command words, so polls such as `pgrep -f 'contrib/fast-gate'`
+# stay unclaimed. The museum check is docs/eval/2026-10-30-command-rules.md.
+# The first match wins, so the gates come before the cargo rule their
+# scripts contain; a [path] table's new rules are tried before the global
+# ones.
+
+reserve = 2
+
+[[rule]]
+name  = "oracle-sweep"
+match = '''(^|[;&|({\n]|-\w*c\s*['"]|\s--\s|\b(do|then|else)\s)\s*([A-Za-z_]\w*=\S*\s+|(\S*/)?(time|env|nice|exec|bash|sh)\s+(-\w\s+("[^"]*"|\S+)\s+)?|timeout\s+\S+\s+|\S+\.sh\s+(\d+\s+)?['"]?)*(\S*/)?oracle-sweep(\s|['"]|$)|\bflock\s+(-\w+\s+(\d+\s+)?)*\S*oracle-sweep\.lock['"]?\s+(\S*/)?(podman|distrobox|systemd-run|bash|sh|\S*oracle-sweep|contrib/)|oracle-sweep\.lock['"]?;?\s+exec\s+\d+>'''
+slots = 999
+# why: a `match` rule on purpose (C6, R7): `L=<lock>; exec 9>>$L; flock 9`
+# takes the lock with no command word. D8 replaces oracle-sweep.lock; 999
+# is capped to the whole budget, so it runs alone. `flock -n <lock> true`
+# is a probe in a poll loop and stays unclaimed.
+
+[[rule]]
+name    = "fast-gate"
+command = "contrib/fast-gate"
+slots   = 6
+# why: swayward's full gate (fmt, clippy, cargo test --all, doc checks);
+# role cap 6. Museum: median 650 s, the most frequent heavy call.
+
+[[rule]]
+name    = "gate"
+command = "contrib/gate"
+slots   = 6
+# why: swaywardlock's full gate, cargo plus pytest -n auto e2e; role cap 6.
+# Museum: median 265 s. Its own label so report tunes it apart from fast-gate.
+
+[[rule]]
+name    = "js-test"
+command = ["npm test", "npm run test*", "vitest"]
+slots   = 5
+# why: mu's vitest suite (`npm run test`, `test:fast`, `npx vitest`).
+# report 2026-10-30: p90 4.3 cores over 40 clean runs, suggest 5 (was 2).
+
+[[rule]]
+name    = "cargo-test"
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
+slots   = 3
+# why: 3 by the tune loop (63 runs at 3, p50 22->21 s). report --by repo
+# 2026-10-30: repos without a table stay at 3 (p90 2.8 cores, 326 runs).
+# `cargo +nightly fmt` stays unclaimed.
+
+# --- per-repo tables (report --by repo, 2026-10-30) ---
+
+[path."~/hacking/vtmux"]
+# vtmux's slow gate and harness match no global rule. scripts/check.sh is
+# fmt + clippy --workspace + cargo test --workspace; xtask regress/oracle
+# drive tmux regress scripts and the oracle.
+[[path."~/hacking/vtmux".rule]]
+name    = "vtmux-check"
+command = "scripts/check.sh"
+slots   = 4
+[[path."~/hacking/vtmux".rule]]
+name    = "vtmux-harness"
+command = ["cargo xtask regress", "cargo xtask oracle"]
+slots   = 2
+[[path."~/hacking/vtmux".rule]]
+name  = "cargo-test"
+slots = 4
+# why: p90 3.0 cores over 229 runs; one OOM at 5.9 GB under 3 slots
+# (2 GB/slot), so 4 gives 8 GB.
+
+[path."~/hacking/crew/muzzle"]
+[[path."~/hacking/crew/muzzle".rule]]
+name  = "cargo-test"
+slots = 4
+# why: p90 3.4 cores over 123 clean runs; report suggests 4.

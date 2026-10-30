@@ -103,6 +103,10 @@ fn commands_get_their_rule() {
             Some("vtmux-check"),
         ),
         ("bash -x -o pipefail scripts/check.sh", Some("vtmux-check")),
+        // `-n` only parses the file (museum check, u021_check).
+        ("bash -n contrib/gate", None),
+        ("bash -n contrib/PKGBUILD contrib/gate", None),
+        ("sh -en scripts/check.sh", None),
         // Refuter 5 / R3: a variable program.
         (
             "D=\"distrobox enter b --\"; $D bash -c 'contrib/gate'",
@@ -216,4 +220,55 @@ fn nesting_is_bounded() {
     assert!(found(&shallow));
     // Deeper than MAX_DEPTH: no head for the innermost, and no hang.
     assert!(!found(&t));
+}
+
+/// bench/linuxpc-config-021.toml, the shipped command-rule config (C6),
+/// with cases from the museum check (docs/eval/2026-10-30-command-rules.md).
+#[test]
+fn linuxpc_021_config_labels_museum_shapes() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/linuxpc-config-021.toml");
+    // The vtmux table moved to a directory that exists everywhere, so its
+    // key canonicalises the same in CI.
+    let dir = std::env::temp_dir().canonicalize().unwrap();
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("~/hacking/vtmux", &dir.to_string_lossy());
+    let c = Config::parse(&text, &path).unwrap();
+    let vtmux = Some(dir.as_path());
+    let at = |text: &str, target: Option<&Path>| {
+        c.resolve_target(target)
+            .matches(text)
+            .map(|m| (m.rule.name.clone(), m.rule.slots))
+    };
+    let r = |name: &str, slots: u32| Some((name.to_string(), slots));
+    assert_eq!(at("contrib/fast-gate", None), r("fast-gate", 6));
+    assert_eq!(
+        at("distrobox enter b -- bash -lc 'contrib/gate'", None),
+        r("gate", 6)
+    );
+    assert_eq!(at("npm run test:fast", None), r("js-test", 5));
+    assert_eq!(at("npx vitest run t.test.ts", None), r("js-test", 5));
+    assert_eq!(at("taskset -c 0-3 cargo test -q", None), r("cargo-test", 3));
+    assert_eq!(at("cargo +nightly fmt --check", None), None);
+    assert_eq!(at("ps aux | grep -c 'cargo build'", None), None);
+    assert_eq!(at("bash -n contrib/gate", None), None);
+    // vtmux's table: its own rules first, cargo-test reweighted.
+    assert_eq!(
+        at("mise exec -- bash scripts/check.sh", vtmux),
+        r("vtmux-check", 4)
+    );
+    assert_eq!(
+        at("cargo xtask regress --tmux r", vtmux),
+        r("vtmux-harness", 2)
+    );
+    assert_eq!(at("cargo test -p vtmux-core", vtmux), r("cargo-test", 4));
+    assert_eq!(at("scripts/check.sh", None), None);
+    // oracle-sweep stays a match rule, first (R7).
+    assert_eq!(
+        at(
+            "L=/x/oracle-sweep.lock; exec 9>>$L; flock 9; cargo test",
+            None
+        ),
+        r("oracle-sweep", 999)
+    );
 }
