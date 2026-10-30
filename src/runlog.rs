@@ -4,9 +4,22 @@
 //! `doctor` the sizes.
 //!
 //! Archives are `runs-YYYY-MM.jsonl.gz`, named for the month of their first
-//! line, then `-2`, `-3`, … when that name is taken (a crash, a clock jump,
-//! a size rotation). They are kept forever: about 2–5 MB of gzip a year at
-//! linuxpc's rate.
+//! readable line, then `-2`, `-3`, … when that name is taken (a crash, a
+//! clock jump, a size rotation). They are kept forever: about 2–5 MB of
+//! gzip a year at linuxpc's rate.
+//!
+//! What an archive can hold (rv020r_archive_month_label): a rotation runs
+//! just before an append, so every line of an archive ends no later than
+//! the first line of the next file (the next archive, or `runs.jsonl` for
+//! the newest). An archive named M therefore holds lines from M up to the
+//! next file's month, which is more than M when a size rotation, a failing
+//! rotation or a clock jump let later months in. [`read`] opens an archive
+//! when that span meets the period. Only a clock jump backwards can put a
+//! line before its archive's name; that is not handled.
+//!
+//! Rotation is best effort (rv020r_rotation_failure_wedges): a failure is
+//! one stderr line and the append still happens, because the append runs
+//! under the state lock inside a prune and failing it would wedge the host.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -36,7 +49,9 @@ pub fn append(dir: &Path, records: &[RunRecord], now_ms: u64) -> anyhow::Result<
     if records.is_empty() {
         return Ok(());
     }
-    rotate(dir, now_ms)?;
+    if let Err(e) = rotate(dir, now_ms) {
+        eprintln!("muzzle: runs.jsonl rotation failed: {e:#}; appending anyway");
+    }
     let mut buf = Vec::new();
     for r in records {
         serde_json::to_writer(&mut buf, r)?;
@@ -62,12 +77,11 @@ fn rotate(dir: &Path, now_ms: u64) -> anyhow::Result<()> {
     if len == 0 {
         return Ok(());
     }
-    let mut first = String::new();
-    BufReader::new(file).read_line(&mut first)?;
     let now_month = &crate::admit::rfc3339(now_ms)[..7];
-    // A first line with no readable `end` (torn, hand-edited) never forces
-    // a month rotation; the size bound still applies, named for now.
-    let month = line_month(&first).unwrap_or_else(|| now_month.to_string());
+    // Torn or hand-edited lines are skipped. A file with no readable `end`
+    // never forces a month rotation; the size bound still applies, named
+    // for now.
+    let month = first_month(BufReader::new(file))?.unwrap_or_else(|| now_month.to_string());
     if month.as_str() >= now_month && len <= LIVE_MAX_BYTES {
         return Ok(());
     }
@@ -82,8 +96,20 @@ fn rotate(dir: &Path, now_ms: u64) -> anyhow::Result<()> {
 /// temp file, fsync, rename. Leaves `runs.jsonl` as it was.
 fn archive(dir: &Path, month: &str) -> anyhow::Result<PathBuf> {
     let tmp = dir.join(format!("runs-{month}.jsonl.gz.tmp"));
+    // A crash mid-archive leaves the temp file; an empty directory there is
+    // cleared too. Anything else makes the create below fail, which
+    // `append` survives.
+    let _ = fs::remove_file(&tmp).or_else(|_| fs::remove_dir(&tmp));
+    let dest = write_archive(dir, month, &tmp);
+    if dest.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    dest
+}
+
+fn write_archive(dir: &Path, month: &str, tmp: &Path) -> anyhow::Result<PathBuf> {
     let mut src = File::open(dir.join(LIVE))?;
-    let out = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let out = File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
     let mut gz = GzEncoder::new(out, Compression::default());
     io::copy(&mut src, &mut gz)?;
     gz.finish()?
@@ -93,7 +119,7 @@ fn archive(dir: &Path, month: &str) -> anyhow::Result<PathBuf> {
         .map(|n| dir.join(archive_name(month, n)))
         .find(|p| !p.exists())
         .expect("an unbounded range has a free name");
-    fs::rename(&tmp, &dest).with_context(|| format!("renaming to {}", dest.display()))?;
+    fs::rename(tmp, &dest).with_context(|| format!("renaming to {}", dest.display()))?;
     // The rename is durable only once the directory is. Best effort: not
     // every filesystem lets a directory be fsynced.
     let _ = File::open(dir).and_then(|d| d.sync_all());
@@ -106,6 +132,16 @@ fn archive_name(month: &str, n: u32) -> String {
     } else {
         format!("runs-{month}-{n}.jsonl.gz")
     }
+}
+
+/// `YYYY-MM` of the first line with a readable `end`.
+fn first_month(r: impl BufRead) -> io::Result<Option<String>> {
+    for line in r.split(b'\n') {
+        if let Some(m) = line_month(&String::from_utf8_lossy(&line?)) {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
 }
 
 /// `YYYY-MM` of a line's `end`, which is RFC 3339 UTC.
@@ -177,41 +213,91 @@ fn archives(dir: &Path) -> anyhow::Result<Vec<(String, u32, PathBuf)>> {
 }
 
 /// The run lines of `period` (`[since, until)` in Unix seconds; `None` is
-/// everything): every archive whose month overlaps it, then `runs.jsonl`,
-/// with exact duplicate lines dropped (a crash between archive and
-/// truncate). Archives outside the period are never opened. Lines inside
-/// a read archive are not filtered: `report` filters by period itself.
+/// everything): every archive whose span (see the module docs) meets it,
+/// then `runs.jsonl`. A line already seen in an earlier file is dropped:
+/// that is a crash between archive and truncate. Repeats inside one file
+/// are kept, since a loop of fast runs writes identical lines
+/// (rv020r_dedupe_drops_runs). Archives outside the period are never
+/// opened. Lines inside a read archive are not filtered: `report` filters
+/// by period itself.
 pub fn read(dir: &Path, period: Option<(f64, f64)>) -> anyhow::Result<String> {
-    let mut texts = Vec::new();
-    for (month, _, path) in archives(dir)? {
-        let overlaps = match (period, month_span(&month)) {
-            (Some((since, until)), Some((start, end))) => start < until && since < end,
-            _ => true,
-        };
-        if !overlaps {
-            continue;
+    let live_path = dir.join(LIVE);
+    let live = match fs::read(&live_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", live_path.display())),
+    };
+    let list = archives(dir)?;
+    // The month each archive's lines can reach: that of the next file's
+    // first line. Unknown (an empty live file) means unbounded.
+    let live_month = first_month(live.as_bytes())?;
+    let nexts = list
+        .iter()
+        .skip(1)
+        .map(|(m, _, _)| Some(m.clone()))
+        .chain([live_month]);
+    let mut paths = Vec::new();
+    for ((month, _, path), next) in list.iter().zip(nexts) {
+        if let Some((since, until)) = period {
+            let start = month_start(month).unwrap_or(f64::NEG_INFINITY);
+            let end = next
+                .and_then(|n| month_span(&n))
+                .map_or(f64::INFINITY, |(_, e)| e);
+            if start >= until || since >= end {
+                continue;
+            }
         }
+        paths.push(path.as_path());
+    }
+    load(&paths, live)
+}
+
+/// The newest archive and `runs.jsonl`, deduped as [`read`] does: enough
+/// for doctor to see the last runs right after a rotation
+/// (rv020r_doctor_live_only) without reading the whole history.
+pub fn recent(dir: &Path) -> anyhow::Result<String> {
+    let live = match fs::read(dir.join(LIVE)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let list = archives(dir)?;
+    let newest: Vec<&Path> = list
+        .last()
+        .map(|(_, _, p)| p.as_path())
+        .into_iter()
+        .collect();
+    load(&newest, live)
+}
+
+/// Gunzips `archives`, then appends `live`, as one deduped text.
+fn load(archives: &[&Path], live: String) -> anyhow::Result<String> {
+    let mut texts = Vec::new();
+    for path in archives {
         let mut bytes = Vec::new();
-        File::open(&path)
+        File::open(path)
             .and_then(|f| MultiGzDecoder::new(f).read_to_end(&mut bytes))
             .with_context(|| format!("reading {}", path.display()))?;
         texts.push(String::from_utf8_lossy(&bytes).into_owned());
     }
-    let live = dir.join(LIVE);
-    match fs::read(&live) {
-        Ok(bytes) => texts.push(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", live.display())),
-    }
-    let mut seen = HashSet::new();
+    texts.push(live);
+    Ok(dedupe_across(&texts))
+}
+
+/// The lines of `texts` in order, minus any line that appeared in an
+/// earlier text; repeats within one text stay.
+fn dedupe_across(texts: &[String]) -> String {
+    let mut earlier: HashSet<&str> = HashSet::new();
     let mut out = String::new();
-    for line in texts.iter().flat_map(|t| t.lines()) {
-        if seen.insert(line) {
-            out.push_str(line);
+    for t in texts {
+        let mine: Vec<&str> = t.lines().filter(|l| !earlier.contains(l)).collect();
+        for l in &mine {
+            out.push_str(l);
             out.push('\n');
         }
+        earlier.extend(t.lines());
     }
-    Ok(out)
+    out
 }
 
 /// What doctor shows of the run log (P11).
@@ -364,15 +450,83 @@ mod tests {
         let oct = nov15() - 20 * DAY;
         append(dir.path(), &[rec(oct)], oct).unwrap();
         append(dir.path(), &[rec(nov15())], nov15()).unwrap();
-        let since = month_start("2026-10").unwrap();
-        let text = read(dir.path(), Some((since, f64::INFINITY))).unwrap();
-        assert_eq!(text.lines().count(), 2, "{text}");
-        assert!(read(dir.path(), Some((since - 1.0, f64::INFINITY))).is_err());
-        assert!(read(dir.path(), None).is_err());
-        // November only: the October archive is skipped too.
+        // September's lines can reach October's first line, so it is
+        // skipped only from November on.
         let nov = month_start("2026-11").unwrap();
         let text = read(dir.path(), Some((nov, f64::INFINITY))).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(read(dir.path(), Some((nov - 1.0, f64::INFINITY))).is_err());
+        assert!(read(dir.path(), None).is_err());
+        // Before September: every archive is skipped; the live file is
+        // always read.
+        let aug = month_start("2026-08").unwrap();
+        let text = read(dir.path(), Some((0.0, aug))).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
+    }
+
+    /// rv020r_dedupe_drops_runs: a loop of fast runs writes identical
+    /// lines into one file; all of them count.
+    #[test]
+    fn repeats_inside_one_file_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let oct = nov15() - 20 * DAY;
+        let same: Vec<RunRecord> = (0..200).map(|_| rec(oct)).collect();
+        append(dir.path(), &same, oct).unwrap();
+        assert_eq!(read(dir.path(), None).unwrap().lines().count(), 200);
+        // Archived, the same 200 still count once each.
+        append(dir.path(), &vec![rec(nov15()); 3], nov15()).unwrap();
+        assert!(dir.path().join("runs-2026-10.jsonl.gz").exists());
+        assert_eq!(read(dir.path(), None).unwrap().lines().count(), 203);
+    }
+
+    /// rv020r_rotation_failure_wedges: a rotation that can't write its
+    /// archive still appends, and later clears a stale temp file.
+    #[test]
+    fn a_failing_rotation_still_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let oct = nov15() - 20 * DAY;
+        append(dir.path(), &[rec(oct)], oct).unwrap();
+        // A non-empty directory where the temp file goes can't be cleared.
+        let tmp = dir.path().join("runs-2026-10.jsonl.gz.tmp");
+        fs::create_dir_all(tmp.join("x")).unwrap();
+        append(dir.path(), &[rec(nov15())], nov15()).unwrap();
+        assert_eq!(read(dir.path(), None).unwrap().lines().count(), 2);
+        assert!(!dir.path().join("runs-2026-10.jsonl.gz").exists());
+        // Once it can be (empty dir, or a stale file), rotation recovers.
+        fs::remove_dir(tmp.join("x")).unwrap();
+        append(dir.path(), &[rec(nov15() + 1000)], nov15()).unwrap();
+        assert_eq!(names(dir.path()), ["runs-2026-10.jsonl.gz", "runs.jsonl"]);
+        assert_eq!(read(dir.path(), None).unwrap().lines().count(), 3);
+    }
+
+    /// rv020r_archive_month_label: a torn first line names the archive by
+    /// the first readable one, and an archive that holds later months
+    /// (here, a size rotation in a month after its name) is read for them.
+    #[test]
+    fn archives_are_named_and_read_by_their_readable_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let oct = nov15() - 20 * DAY;
+        let line = |ms| serde_json::to_string(&rec(ms)).unwrap() + "\n";
+        fs::write(dir.path().join(LIVE), format!("torn\n{}", line(oct))).unwrap();
+        append(dir.path(), &[rec(nov15())], nov15()).unwrap();
+        assert_eq!(names(dir.path()), ["runs-2026-10.jsonl.gz", "runs.jsonl"]);
+
+        // October's archive is followed by one named October that holds
+        // November and December lines too, then December's live file.
+        let dir = tempfile::tempdir().unwrap();
+        let dec = nov15() + 20 * DAY;
+        fs::write(dir.path().join(LIVE), line(oct)).unwrap();
+        archive(dir.path(), "2026-10").unwrap();
+        fs::write(
+            dir.path().join(LIVE),
+            line(oct) + &line(nov15()) + &line(dec),
+        )
+        .unwrap();
+        archive(dir.path(), "2026-10").unwrap();
+        fs::write(dir.path().join(LIVE), line(dec + DAY)).unwrap();
+        let nov = month_start("2026-11").unwrap();
+        let text = read(dir.path(), Some((nov, nov + 1.0))).unwrap();
+        assert!(text.contains("2026-11-15T"), "{text}");
     }
 
     #[test]
@@ -406,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_first_line_never_forces_a_month_rotation() {
+    fn an_unreadable_file_never_forces_a_month_rotation() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(LIVE), "torn\n").unwrap();
         append(dir.path(), &[rec(nov15())], nov15()).unwrap();

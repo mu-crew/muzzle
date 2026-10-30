@@ -346,6 +346,50 @@ fn doctor_warns_when_stored_budget_differs_from_its_reading() {
     assert!(t.contains("warning: stored budget differs"), "{t}");
 }
 
+/// rv020r_doctor_live_only: right after a rotation the live file is
+/// nearly empty, and doctor still counts the archived runs and flags the
+/// rule a recorded run showed entering a container (D16a).
+#[test]
+fn doctor_after_a_rotation_still_shows_runs_and_container_rules() {
+    use std::io::Write;
+    let env = Env::new();
+    let dir = env.path("state/muzzle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = |end: &str, rule: &str, reason: &str| {
+        format!(
+            "{{\"v\":1,\"end\":\"{end}\",\"rule\":\"{rule}\",\"slots\":1,\
+             \"class\":\"normal\",\"cfg\":null,\"agent\":null,\"cwd\":\"/\",\"waited_s\":0,\
+             \"ran_s\":1,\"exit\":0,\"killed\":null,\"cpu_s\":null,\"mem_peak_mb\":null,\
+             \"enforced\":false,\"nested\":false,\"kept\":false,\"budget\":4{reason}}}\n"
+        )
+    };
+    let mut gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(dir.join("runs-2026-10.jsonl.gz")).unwrap(),
+        flate2::Compression::default(),
+    );
+    write!(
+        gz,
+        "{}{}",
+        line(
+            "2026-10-20T00:00:00Z",
+            "gate",
+            ",\"enforced_reason\":\"container\""
+        ),
+        line("2026-10-30T00:00:00Z", "gate", "")
+    )
+    .unwrap();
+    gz.finish().unwrap();
+    std::fs::write(
+        dir.join("runs.jsonl"),
+        line("2026-11-01T00:00:00Z", "gate", ""),
+    )
+    .unwrap();
+    let v = env.json(&["doctor", "--json"]);
+    assert_eq!(v["runs"]["lines"], 3, "{v}");
+    assert_eq!(v["runs"]["oldest"], "2026-10-20T00:00:00Z");
+    assert_eq!(v["container_rules"], serde_json::json!(["gate"]), "{v}");
+}
+
 #[test]
 fn doctor_reads_the_runs_log_and_exits_2_on_bad_config() {
     let env = Env::new();

@@ -68,7 +68,9 @@ pub struct Facts {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunsLog {
+    /// Size of `runs.jsonl` itself.
     pub bytes: u64,
+    /// Runs in the live file plus the newest archive (rv020r_doctor_live_only).
     pub lines: usize,
     /// The oldest and newest `end`, RFC 3339 strings compare in time order.
     pub oldest: Option<String>,
@@ -305,11 +307,13 @@ pub fn check(f: &Facts) -> Report {
                 mb(ARCHIVES_WARN_BYTES)
             ));
         }
-        if l.live_bytes > LIVE_MAX_BYTES {
+        // Rotation runs before an append, so a healthy live file can sit
+        // just over the bound until the next one: warn only at twice it.
+        if l.live_bytes > 2 * LIVE_MAX_BYTES {
             warnings.push(format!(
                 "runs.jsonl is {} MB (over {} MB): rotation is failing",
                 mb(l.live_bytes),
-                mb(LIVE_MAX_BYTES)
+                mb(2 * LIVE_MAX_BYTES)
             ));
         }
     }
@@ -461,30 +465,42 @@ pub fn render_text(r: &Report) -> String {
     out
 }
 
-/// Size, count and age range of `runs.jsonl`; `None` when there is none.
-fn runs_log(path: &Path) -> Option<RunsLog> {
-    let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
+/// The recent run lines: the newest archive plus `runs.jsonl`, so a
+/// rotation on the 1st doesn't blank the runs line or the D16a container
+/// rules (rv020r_doctor_live_only). An unreadable archive falls back to the
+/// live file alone: doctor still answers.
+fn recent_runs(dir: &Path) -> String {
+    runlog::recent(dir)
+        .or_else(|_| std::fs::read_to_string(dir.join(runlog::LIVE)))
+        .unwrap_or_default()
+}
+
+/// The live file's size, and the count and age range of `recent` (see
+/// [`recent_runs`]); `None` when there are no runs and no live file.
+fn runs_log(dir: &Path, recent: &str) -> Option<RunsLog> {
+    let bytes = std::fs::metadata(dir.join(runlog::LIVE)).map(|m| m.len());
+    if bytes.is_err() && recent.is_empty() {
+        return None;
+    }
     #[derive(serde::Deserialize)]
     struct End {
         end: String,
     }
-    let ends: Vec<String> = text
+    let ends: Vec<String> = recent
         .lines()
         .filter_map(|l| serde_json::from_str::<End>(l).ok().map(|e| e.end))
         .collect();
     Some(RunsLog {
-        bytes: bytes.len() as u64,
-        lines: text.lines().filter(|l| !l.trim().is_empty()).count(),
+        bytes: bytes.unwrap_or(0),
+        lines: recent.lines().filter(|l| !l.trim().is_empty()).count(),
         oldest: ends.iter().min().cloned(),
         newest: ends.iter().max().cloned(),
     })
 }
 
-/// Rules with a `runs.jsonl` line marked `enforced_reason: "container"`.
-fn container_runs(path: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let (runs, _) = crate::report::parse(&text);
+/// Rules with a run line marked `enforced_reason: "container"`.
+fn container_runs(text: &str) -> Vec<String> {
+    let (runs, _) = crate::report::parse(text);
     runs.into_iter()
         .filter(|r| r.rec.enforced_reason.is_some())
         .filter_map(|r| r.rec.rule)
@@ -642,6 +658,7 @@ fn gather() -> Facts {
         .map(|d| d.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let recent = recent_runs(&state_dir);
     Facts {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -651,9 +668,9 @@ fn gather() -> Facts {
         config_exists,
         config: config.map_err(|e| e.to_string()),
         stored,
-        runs: runs_log(&state_dir.join("runs.jsonl")),
+        runs: runs_log(&state_dir, &recent),
         runlog: runlog::stats(&state_dir).ok(),
-        container_runs: container_runs(&state_dir.join("runs.jsonl")),
+        container_runs: container_runs(&recent),
         state_dir,
         state_writable,
         state_readable,
@@ -950,8 +967,6 @@ mod tests {
 
     #[test]
     fn container_runs_come_from_the_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("runs.jsonl");
         let line = |rule: &str, reason: &str| {
             format!(
                 "{{\"v\":1,\"end\":\"2026-10-29T00:00:00Z\",\"rule\":\"{rule}\",\"slots\":1,\
@@ -961,21 +976,20 @@ mod tests {
             )
         };
         let text = line("box", ",\"enforced_reason\":\"container\"") + &line("host", "");
-        std::fs::write(&p, text).unwrap();
-        assert_eq!(container_runs(&p), ["box"]);
+        assert_eq!(container_runs(&text), ["box"]);
     }
 
     #[test]
     fn runs_log_reads_size_and_range() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("runs.jsonl");
-        assert_eq!(runs_log(&p), None);
+        assert_eq!(runs_log(dir.path(), &recent_runs(dir.path())), None);
         std::fs::write(
             &p,
             "{\"end\":\"2026-10-05T00:00:00Z\"}\n{\"end\":\"2026-10-01T00:00:00Z\"}\nbad\n",
         )
         .unwrap();
-        let l = runs_log(&p).unwrap();
+        let l = runs_log(dir.path(), &recent_runs(dir.path())).unwrap();
         assert_eq!((l.lines, l.bytes), (3, 66));
         assert_eq!(l.oldest.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(l.newest.as_deref(), Some("2026-10-05T00:00:00Z"));
@@ -989,8 +1003,10 @@ mod tests {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(!render_text(&r).contains("archives"));
 
+        // A healthy live file can sit just over the bound until the next
+        // append rotates it.
         f.runlog = Some(Stats {
-            live_bytes: LIVE_MAX_BYTES,
+            live_bytes: 2 * LIVE_MAX_BYTES,
             archives: 3,
             archive_bytes: ARCHIVES_WARN_BYTES,
             oldest_month: Some("2026-08".into()),
@@ -1006,7 +1022,7 @@ mod tests {
         );
 
         f.runlog = Some(Stats {
-            live_bytes: LIVE_MAX_BYTES + 1,
+            live_bytes: 2 * LIVE_MAX_BYTES + 1,
             archive_bytes: ARCHIVES_WARN_BYTES + 1,
             ..f.runlog.unwrap()
         });

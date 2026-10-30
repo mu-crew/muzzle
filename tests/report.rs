@@ -158,6 +158,14 @@ fn since_skips_archives_outside_the_period() {
     );
     writeln!(gz, "{first}").unwrap();
     gz.finish().unwrap();
+    // An archive's lines reach at most the next file's month, so October's
+    // archive bounds September's to October.
+    let mut gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(dir.join("runs-2026-10.jsonl.gz")).unwrap(),
+        flate2::Compression::default(),
+    );
+    writeln!(gz, "{}", first.replace("2026-11-01T10", "2026-10-15T10")).unwrap();
+    gz.finish().unwrap();
     std::fs::write(dir.join("runs-2026-09.jsonl.gz"), "not gzip").unwrap();
     std::fs::write(dir.join("runs.jsonl"), format!("{first}\n{rest}")).unwrap();
     let run = |args: &[&str]| {
@@ -181,6 +189,29 @@ fn since_skips_archives_outside_the_period() {
         String::from_utf8_lossy(&all.stderr).contains("runs-2026-09.jsonl.gz"),
         "{all:?}"
     );
+}
+
+/// rv020r_dedupe_drops_runs: identical lines in one file (a loop of fast
+/// runs ending in the same second) all count.
+#[test]
+fn identical_runs_in_one_file_all_count() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("muzzle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let basic = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runs/basic.jsonl"),
+    )
+    .unwrap();
+    let first = basic.lines().next().unwrap();
+    std::fs::write(dir.join("runs.jsonl"), format!("{first}\n").repeat(200)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
+        .args(["report", "--json"])
+        .env("XDG_STATE_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rule(&v, "gate")["runs"], 200, "{v}");
 }
 
 /// 0.2 P9, B6: `--by repo` over runs in three repos plus none, with the

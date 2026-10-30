@@ -331,6 +331,42 @@ fn sigkill_of_the_whole_group_kills_the_job_and_frees_the_slots() {
     assert_eq!(runs[0]["slots"], 4);
 }
 
+/// rv020r_rotation_failure_wedges: an archive that can't be written (a
+/// directory where its temp file goes) neither fails the run nor, through
+/// the pruning waiter's append, wedges the host after a holder is killed.
+#[test]
+fn a_failing_rotation_never_fails_a_run_or_a_prune() {
+    let env = Env::new();
+    let dir = env.state.join("muzzle");
+    std::fs::write(
+        dir.join("runs.jsonl"),
+        "{\"end\":\"2026-09-01T00:00:00Z\"}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("runs-2026-09.jsonl.gz.tmp/x")).unwrap();
+    let out = env
+        .cmd(&["--slots", "1", "--", "echo", "hi"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("rotation failed"),
+        "{out:?}"
+    );
+    let mut hog = env.hog("30");
+    kill(-(hog.id() as i32), libc::SIGKILL);
+    hog.wait().unwrap();
+    let out = env
+        .cmd(&["--slots", "1", "--", "echo", "hi3"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi3\n");
+    let lines = std::fs::read_to_string(dir.join("runs.jsonl")).unwrap();
+    assert!(lines.contains("\"killed\":\"holder\""), "{lines}");
+    assert!(env.state().holders.is_empty());
+}
+
 #[test]
 fn sigkill_of_only_the_muzzle_keeps_the_slots_until_the_group_exits() {
     let env = Env::new();

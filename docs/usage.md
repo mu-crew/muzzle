@@ -188,8 +188,10 @@ Every admitted run appends one line to
   MB a year. `zcat` and `jq` read them.
 - `report` reads the archives as well as the live file, so its default
   period is the whole history. Use `--since` to narrow it.
-- `doctor` shows the live file and the archives, and warns when the live
-  file passes 16 MB (rotation is failing) or the archives pass 256 MB.
+- `doctor` counts the runs in the live file and the newest archive, shows
+  the archives, and warns when the live file passes 32 MB (rotation is
+  failing) or the archives pass 256 MB. A rotation that fails prints one
+  `muzzle: runs.jsonl rotation failed` line and the run still logs.
 - The log is local state and records working directories, so don't
   publish it.
 
