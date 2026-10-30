@@ -301,6 +301,8 @@ mod tests {
             enforced_reason: None,
             scope: None,
             probe: None,
+            admit_load1: None,
+            admit_held: None,
             claim: claim(slots, Class::High, agent),
         }
     }

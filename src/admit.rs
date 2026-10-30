@@ -135,6 +135,8 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         enforced_reason: None,
         scope: None,
         probe: None,
+        admit_load1: None,
+        admit_held: None,
         claim,
     }
 }
@@ -163,6 +165,8 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         kept: h.kept,
         budget,
         enforced_reason: h.enforced_reason,
+        load1: h.admit_load1,
+        held: h.admit_held,
     }
 }
 
@@ -412,6 +416,24 @@ mod tests {
         assert_eq!((r.cpu_s, r.mem_peak_mb), (None, None));
         assert_eq!(r.budget, Some(2));
         assert_eq!(r.end, "1970-01-01T00:01:01Z");
+        assert_eq!((r.load1, r.held), (None, None));
+    }
+
+    #[test]
+    fn a_pruned_holder_keeps_its_admission_load() {
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::High, 0);
+        let mut s = run(s, 1_000).state;
+        s.holders[0].admit_load1 = Some(3.5);
+        s.holders[0].admit_held = Some(0);
+        let mut live = all_alive(&s);
+        live.procs.remove(&(t as u32 + 100, START));
+        live.groups.remove(&(t as u32 + 100));
+        let out = admit(s, 61_000, &live);
+        assert_eq!(
+            (out.records[0].load1, out.records[0].held),
+            (Some(3.5), Some(0))
+        );
     }
 
     #[test]

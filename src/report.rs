@@ -22,6 +22,9 @@ pub const SATURATED: f64 = 0.9;
 pub const EXPERIMENT_STEP: u32 = 2;
 /// D30a: an OOM suggestion covers the largest OOM peak plus 25%.
 pub const OOM_HEADROOM: f64 = 1.25;
+/// P12: the unclaimed-load line needs this many runs carrying `load1` and
+/// `held`; fewer is noise from a lagging load average.
+pub const MIN_UNCLAIMED_RUNS: usize = 20;
 /// Spec §report: report can't see commands that match no rule, so it names
 /// the query that finds them instead of guessing.
 pub const UNMATCHED_HINT: &str = "museum-search calls --min-secs 30 --tool bash";
@@ -209,6 +212,20 @@ pub struct Machine {
     pub queue_nonempty: f64,
     /// CPU seconds ÷ slot-seconds held, over runs with CPU figures.
     pub cpu_efficiency: Option<f64>,
+    /// P12: `max(0, load1 - held)` at admission, `None` under
+    /// `MIN_UNCLAIMED_RUNS`; and how many runs carry both fields.
+    pub unclaimed_load: Option<P5090>,
+    pub unclaimed_n: usize,
+}
+
+/// P12: load muzzle didn't admit, over runs recording both fields.
+fn unclaimed_load(runs: &[&Run]) -> (Option<P5090>, usize) {
+    let v: Vec<f64> = runs
+        .iter()
+        .filter_map(|r| Some((r.rec.load1? - f64::from(r.rec.held?)).max(0.0)))
+        .collect();
+    let p = (v.len() >= MIN_UNCLAIMED_RUNS).then(|| p5090(&v)).flatten();
+    (p, v.len())
 }
 
 /// D41 by a sweep over each run's wait and hold intervals, clipped to the
@@ -265,6 +282,7 @@ pub fn machine(runs: &[Run], period: Period) -> Option<Machine> {
         .filter_map(|r| Some((r.rec.cpu_s?, f64::from(r.rec.slots) * r.rec.ran_s)))
         .fold((0.0, 0.0), |(a, b), (c, s)| (a + c, b + s));
     let span = hi - lo;
+    let (unclaimed_load, unclaimed_n) = unclaimed_load(&ended);
     Some(Machine {
         since: lo,
         until: hi,
@@ -277,6 +295,8 @@ pub fn machine(runs: &[Run], period: Period) -> Option<Machine> {
         blocked_idle_slot_s: budget.map(|_| idle),
         queue_nonempty: queued_s / span,
         cpu_efficiency: (cpu_slot_s > 0.0).then(|| cpu / cpu_slot_s),
+        unclaimed_load,
+        unclaimed_n,
     })
 }
 
@@ -630,6 +650,10 @@ fn machine_json(m: &Option<Machine>) -> Value {
         "held_slot_s": m.held_slot_s, "utilisation": m.utilisation,
         "blocked_idle_slot_s": m.blocked_idle_slot_s,
         "queue_nonempty": m.queue_nonempty, "cpu_efficiency": m.cpu_efficiency,
+        "unclaimed_load": {
+            "p50": m.unclaimed_load.map(|p| p.p50), "p90": m.unclaimed_load.map(|p| p.p90),
+            "n": m.unclaimed_n,
+        },
     })
 }
 
@@ -700,6 +724,12 @@ fn machine_text(m: &Option<Machine>, out: &mut String) {
         pct(Some(m.queue_nonempty)),
         pct(m.cpu_efficiency),
     ));
+    if let Some(p) = m.unclaimed_load {
+        out.push_str(&format!(
+            "unclaimed load: p50 {:.1}, p90 {:.1} cores\n",
+            p.p50, p.p90
+        ));
+    }
 }
 
 fn row_text(r: &Row) -> String {
@@ -951,6 +981,8 @@ mod tests {
                 kept: false,
                 budget: Some(8),
                 enforced_reason: None,
+                load1: None,
+                held: None,
             },
         }
     }
@@ -1358,6 +1390,67 @@ mod tests {
         assert!(out.contains("insufficient data (3 runs)"), "{out}");
         assert!(out.contains(UNMATCHED_HINT), "{out}");
         assert!(out.contains("utilisation "), "{out}");
+    }
+
+    /// P12 fixture: run `i` has load `i + 2`. Runs 1..=15 have 30 slots
+    /// held by others, more than the load, so they clamp to 0; later runs
+    /// leave `i` cores unclaimed. Plus one 0.1 line without the fields,
+    /// which doesn't count.
+    fn loaded(n: usize) -> Vec<Run> {
+        let mut runs: Vec<Run> = (1..=n)
+            .map(|i| {
+                let mut r = run(T0 + 100.0 * i as f64, 10.0);
+                r.rec.load1 = Some(i as f64 + 2.0);
+                r.rec.held = Some(if i <= 15 { 30 } else { 2 });
+                r
+            })
+            .collect();
+        runs.push(run(T0 + 100.0 * (n + 1) as f64, 10.0));
+        runs
+    }
+
+    #[test]
+    fn unclaimed_load_over_twenty_five_runs() {
+        let runs = loaded(25);
+        let m = machine(&runs, Period::default()).unwrap();
+        // Fifteen 0s, then 16..=25: nearest rank 13 and 23.
+        assert_eq!(
+            m.unclaimed_load,
+            Some(P5090 {
+                p50: 0.0,
+                p90: 23.0
+            })
+        );
+        assert_eq!(m.unclaimed_n, 25);
+        let text = render(&runs, &args(false), T0 + 1e6, HOST).unwrap();
+        assert!(
+            text.contains("unclaimed load: p50 0.0, p90 23.0 cores\n"),
+            "{text}"
+        );
+        let v: Value =
+            serde_json::from_str(&render(&runs, &args(true), T0 + 1e6, HOST).unwrap()).unwrap();
+        assert_eq!(
+            v["machine"]["unclaimed_load"],
+            json!({"p50": 0.0, "p90": 23.0, "n": 25})
+        );
+    }
+
+    #[test]
+    fn unclaimed_load_needs_twenty_runs() {
+        let runs = loaded(19);
+        let m = machine(&runs, Period::default()).unwrap();
+        assert_eq!((m.unclaimed_load, m.unclaimed_n), (None, 19));
+        let text = render(&runs, &args(false), T0 + 1e6, HOST).unwrap();
+        assert!(!text.contains("unclaimed"), "{text}");
+        let v: Value =
+            serde_json::from_str(&render(&runs, &args(true), T0 + 1e6, HOST).unwrap()).unwrap();
+        assert_eq!(
+            v["machine"]["unclaimed_load"],
+            json!({"p50": null, "p90": null, "n": 19})
+        );
+        let twenty = machine(&loaded(20), Period::default()).unwrap();
+        assert_eq!(twenty.unclaimed_n, 20);
+        assert!(twenty.unclaimed_load.is_some());
     }
 
     #[test]

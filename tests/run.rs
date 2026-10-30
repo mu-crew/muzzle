@@ -383,6 +383,7 @@ fn background_child_hands_off_to_a_keeper() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["kept"], true);
     assert_eq!(runs[0]["exit"], 0);
+    assert_eq!(runs[0]["held"], 0, "the keeper's line keeps P12's fields");
     assert!(runs[0]["ran_s"].as_f64().unwrap() >= 1.8, "{}", runs[0]);
 }
 
@@ -510,7 +511,11 @@ fn nested_run_through_ancestry_starts_at_once() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "inner\n");
-    assert_eq!(env.runs().len(), 1, "nested runs are not logged");
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1, "nested runs are not logged");
+    // P12: the outer line, which carries the nested run's load, has them.
+    assert_eq!(runs[0]["held"], 0, "{}", runs[0]);
+    assert!(runs[0]["load1"].as_f64().unwrap() >= 0.0, "{}", runs[0]);
 }
 
 /// The inner muzzle is started by a double fork plus setsid(2), so by the
@@ -799,9 +804,12 @@ fn a_run_appends_its_line_to_runs_jsonl() {
         "nested",
         "kept",
         "budget",
+        "load1",
+        "held",
     ] {
         assert!(r.get(key).is_some(), "missing {key}: {r}");
     }
+    assert_eq!(r["held"], 0, "nobody else held slots");
     assert_eq!(r["rule"], "gate");
     assert_eq!(r["slots"], 2, "the rule's slots");
     assert_eq!(r["class"], "normal");
@@ -821,6 +829,24 @@ fn a_run_appends_its_line_to_runs_jsonl() {
         !err.contains("admitted after"),
         "no admitted line without a wait"
     );
+}
+
+/// P12: `held` is the slots other tickets held when this one was admitted.
+#[test]
+fn held_counts_the_other_holders_at_admission() {
+    let env = Env::new();
+    let mut other = env
+        .leader(&["--slots", "1", "--", "sleep", "5"])
+        .spawn()
+        .unwrap();
+    job_started(&other, "sleep");
+    let out = env.cmd(&["--slots", "2", "--", "true"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    kill(other.id() as i32, libc::SIGTERM);
+    other.wait().unwrap();
+    let runs = env.runs();
+    let mine = runs.iter().find(|r| r["slots"] == 2).unwrap();
+    assert_eq!(mine["held"], 1, "{mine}");
 }
 
 /// D27a: `repo` is the main checkout's canonical path, the same from a git

@@ -128,6 +128,12 @@ pub struct Holder {
     /// without lingering) can't read "no answer" as "empty".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ScopeProbe>,
+    /// P12: the 1-minute load average and the slots others held, read when
+    /// this muzzle found itself admitted; copied into its run line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admit_load1: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admit_held: Option<u32>,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,
@@ -178,6 +184,12 @@ pub struct RunRecord {
     /// Added field (D16a); absent on older lines.
     #[serde(default)]
     pub enforced_reason: Option<EnforcedReason>,
+    /// P12: the 1-minute load average at admission; absent on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+    /// P12: slots held by other tickets at admission; absent on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<u32>,
 }
 
 /// D16a: why a run that had a scope was not enforced.
@@ -622,10 +634,32 @@ mod tests {
             kept: false,
             budget: Some(14),
             enforced_reason: None,
+            load1: None,
+            held: None,
         };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["killed"], "holder");
         assert_eq!(json["class"], "normal");
         assert!(json["cpu_s"].is_null());
+        // P12: absent fields stay off the line, so it is the 0.1 shape.
+        assert!(json.get("load1").is_none() && json.get("held").is_none());
+        let back: RunRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn run_record_round_trips_load1_and_held() {
+        let line = r#"{"v":1,"end":"2026-11-03T10:12:44Z","rule":"gate","slots":6,
+            "class":"normal","cfg":null,"agent":null,"cwd":"/x","waited_s":0.0,"ran_s":1.0,
+            "exit":0,"killed":null,"cpu_s":null,"mem_peak_mb":null,"enforced":true,
+            "nested":false,"kept":false,"budget":14,"load1":7.25,"held":4}"#;
+        let r: RunRecord = serde_json::from_str(line).unwrap();
+        assert_eq!((r.load1, r.held), (Some(7.25), Some(4)));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            (json["load1"].as_f64(), json["held"].as_u64()),
+            (Some(7.25), Some(4))
+        );
+        assert_eq!(serde_json::from_value::<RunRecord>(json).unwrap(), r);
     }
 }

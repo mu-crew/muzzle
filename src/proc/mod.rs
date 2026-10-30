@@ -118,6 +118,15 @@ pub fn logical_cores() -> io::Result<usize> {
     imp::logical_cores()
 }
 
+/// 1, 5 and 15 minute load averages, from libc's `getloadavg` on both
+/// platforms (bench probe, P12).
+pub fn loadavg() -> Option<[f64; 3]> {
+    let mut l = [0f64; 3];
+    // SAFETY: getloadavg writes at most 3 doubles into `l`.
+    let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
+    (n == 3).then_some(l)
+}
+
 /// Total RAM in bytes (D9). Linux: `/proc/meminfo` MemTotal. macOS:
 /// `hw.memsize`.
 pub fn total_ram() -> io::Result<u64> {

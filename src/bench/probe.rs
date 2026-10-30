@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use serde::Serialize;
 
+use crate::proc::loadavg;
 use crate::report::percentile;
 
 /// `git status` runs per burst: enough for a p95 to mean the slowest one.
@@ -58,14 +59,6 @@ impl Burst {
 
 pub fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
-}
-
-/// 1, 5 and 15 minute load averages.
-pub fn loadavg() -> Option<[f64; 3]> {
-    let mut l = [0f64; 3];
-    // SAFETY: getloadavg writes at most 3 doubles into `l`.
-    let n = unsafe { libc::getloadavg(l.as_mut_ptr(), 3) };
-    (n == 3).then_some(l)
 }
 
 /// A scratch git repo with a committed tree, reused when it already exists

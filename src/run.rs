@@ -418,7 +418,7 @@ impl Queue<'_> {
                 .map(|(_, unit)| format!("{unit}.scope"))
                 .collect();
             crate::runlog::append(self.store.dir(), &out.records, now)?;
-            if let Some(h) = s.holders.iter().find(|h| h.ticket == self.ticket) {
+            if let Some(h) = stamp_admission(s, self.ticket, || proc::loadavg().map(|l| l[0])) {
                 return Ok(Poll::Admitted(Box::new(h.clone()), budget));
             }
             let queue = admit::queue(s);
@@ -500,6 +500,25 @@ impl Queue<'_> {
         self.store.update(now_ms(), |s| Ok(s.remove(self.ticket)))?;
         Ok(())
     }
+}
+
+/// P12: the first poll that finds `ticket` admitted stamps `held` (slots
+/// the other holders have, in the state under the lock) and `load1` into
+/// its entry. Another waiter's pass may have admitted it, so this is done
+/// by the admitted muzzle, not in `admit` (which does no I/O). In the entry,
+/// a pruned holder's or a keeper's line carries them too.
+fn stamp_admission(
+    s: &mut State,
+    ticket: u64,
+    load1: impl FnOnce() -> Option<f64>,
+) -> Option<&Holder> {
+    let all = s.held();
+    let h = s.holder_mut(ticket)?;
+    if h.admit_held.is_none() {
+        h.admit_held = Some(all - h.claim.slots);
+        h.admit_load1 = load1().map(round3);
+    }
+    Some(h)
 }
 
 /// D19's message. Its ticket is not held for it.
@@ -1262,6 +1281,8 @@ impl Job<'_> {
             kept,
             budget,
             enforced_reason: h.enforced_reason,
+            load1: h.admit_load1,
+            held: h.admit_held,
         }
     }
 
@@ -1497,6 +1518,8 @@ mod tests {
             enforced_reason: None,
             scope: None,
             probe: None,
+            admit_load1: None,
+            admit_held: None,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,
@@ -1690,6 +1713,56 @@ mod tests {
             s.holders.push(holder(t, t as u32, 1, None));
         }
         assert!(progress_line(&s, 1, 1).ends_with(", …)"));
+    }
+
+    #[test]
+    fn admission_stamps_held_by_others_and_load_once() {
+        let mut s = State::default();
+        let mut other = holder(1, 1, 1, None);
+        other.claim.slots = 5;
+        s.holders = vec![other, holder(2, 2, 2, None)];
+        let h = stamp_admission(&mut s, 2, || Some(7.123_45)).unwrap();
+        assert_eq!((h.admit_held, h.admit_load1), (Some(5), Some(7.123)));
+        // A later poll keeps the admission-time figures.
+        s.holders[0].claim.slots = 1;
+        let h = stamp_admission(&mut s, 2, || Some(1.0)).unwrap();
+        assert_eq!((h.admit_held, h.admit_load1), (Some(5), Some(7.123)));
+        // No load average: held is still recorded.
+        let h = stamp_admission(&mut s, 1, || None).unwrap();
+        assert_eq!((h.admit_held, h.admit_load1), (Some(2), None));
+        assert!(stamp_admission(&mut s, 9, || Some(1.0)).is_none());
+    }
+
+    #[test]
+    fn container_records_carry_load1_and_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut h = holder(3, 1, 1, None);
+        h.enforced_reason = Some(EnforcedReason::Container);
+        h.admit_load1 = Some(9.5);
+        h.admit_held = Some(4);
+        let job = Job {
+            store: &store,
+            ticket: 3,
+            me: 1,
+            my_start: 1,
+            holder: h,
+            budget: Budget {
+                budget: 8,
+                cores: 10,
+                ram_per_slot: 1,
+            },
+            leader: true,
+        };
+        let ending = Ending {
+            code: 0,
+            killed: None,
+            exit: 0,
+        };
+        let r = job.record(1.0, &ending, Some(3.0), Some(10), false, Some(8));
+        // D16a nulls the scope's figures, not the admission ones.
+        assert_eq!((r.cpu_s, r.mem_peak_mb), (None, None));
+        assert_eq!((r.load1, r.held), (Some(9.5), Some(4)));
     }
 
     #[test]
