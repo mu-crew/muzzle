@@ -25,7 +25,9 @@ input" (Bash), "PreToolUse decision control"). See also
   evaluation; `allow` skips the permission prompt. muzzle sends `allow`
   only for one simple command (spec §Interface CLI `hook`).
 - `claude-bash-compound.json` (`&&` and `|`) gets no decision;
-  `claude-bash-quoted-operator.json` (`'a&&b'` quoted) is still simple.
+  `claude-bash-quoted-operator.json` (`'a&&b'` quoted) is still simple,
+  so it is wrapped, but it gets no decision either: Claude's `allow` needs
+  plain words only, and a quote isn't one (spec 0.2.1 R5).
 - Exit 2 blocks the call. Any other non-zero exit is a non-blocking error.
   That is why `muzzle hook` exits 1, never 2, when it can't answer.
 

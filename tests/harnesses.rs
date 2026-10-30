@@ -122,9 +122,14 @@ fn claude_snippet_replies_to_stored_payloads() {
             },
         }})
     );
-    assert_eq!(
-        reply(&cmd, "claude-bash-quoted-operator.json")["hookSpecificOutput"]["permissionDecision"],
-        "allow"
+    // Quoted: one simple command, still wrapped, but a quote fails the
+    // raw plain-word gate (spec 0.2.1 R5, fix-hook-plainwords): prompted.
+    let quoted = reply(&cmd, "claude-bash-quoted-operator.json");
+    assert!(quoted["hookSpecificOutput"]["updatedInput"].is_object());
+    assert!(
+        quoted["hookSpecificOutput"]
+            .get("permissionDecision")
+            .is_none()
     );
     // Compound: rewritten, but Claude's own permission check decides.
     assert_eq!(

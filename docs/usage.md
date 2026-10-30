@@ -264,9 +264,13 @@ snippets in [docs/harnesses/](harnesses/README.md).
 need `permissionDecision: "allow"` to rewrite a command, so `muzzle hook
 codex` approves every matched call, compound commands included:
 `cargo build && curl … | sh` matches a cargo rule. `muzzle hook claude`
-sends `allow` only for one simple command whose own command word (after
-assignments and `env`, `time`, `timeout [opts] N` or `nice`) is the
-rule's program, or `./` plus it, followed by its subcommand words, and
+sends `allow` only when the raw command text is plain words: letters,
+digits and `_ . / : = , + @ % -`, separated by single spaces. Any quote,
+backslash, `$`, brace, glob, redirection (`2>&1`), operator, tab or
+newline means no `allow`, because muzzle's lexer can't be proven to read
+quoting as bash does (spec 0.2.1 R5). Then it must be one simple
+command whose own command word (after assignments and `env`, `time`,
+`timeout [opts] N` or `nice`) is the rule's program, or `./` plus it, followed by its subcommand words, and
 only when every word after that is on the program's allowlist (spec 0.2.1
 R5): `cargo test -p x -- --nocapture` and `cargo clippy --all-targets --
 -D warnings` are allowed, but `npm test` takes no extra words, `cargo

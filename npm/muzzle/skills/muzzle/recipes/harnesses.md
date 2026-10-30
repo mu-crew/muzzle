@@ -92,7 +92,11 @@ harness doesn't ask you. muzzle's rules match anywhere in the string, so
   A matched call is approved by muzzle, compound commands included. Use
   the Codex hook only where you would approve those calls anyway, or keep
   the rules narrow.
-- **Claude Code gets `allow` only when the rule names the program**: one
+- **Claude Code gets `allow` only when the rule names the program**:
+  first, the raw text must be plain words only (letters, digits and
+  `_ . / : = , + @ % -`, single spaces between words), so any quote,
+  backslash, `$`, redirection such as `2>&1`, operator, tab or newline
+  gets no `allow`. Then it must be one
   simple command (no `;`, `&`, `&&`, `|`, `||`, newline, `$(…)`, backticks,
   process substitution or subshell outside quotes) whose matched pattern
   starts at the command word, after assignments and `env`, `time`,

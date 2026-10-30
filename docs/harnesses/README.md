@@ -41,7 +41,10 @@ with no prompt.
   compound commands included. Use the Codex hook only where you would
   approve those shell calls anyway, or keep your rules narrow.
 - **Claude Code gets `allow` only when the rule names the program that
-  runs:** one simple command (no `;`, `&`, `&&`, `|`, `||`, newline,
+  runs:** the raw text is plain words only (letters, digits and
+  `_ . / : = , + @ % -`, single spaces between words; no quote,
+  backslash, `$`, redirection such as `2>&1`, operator, tab or newline),
+  and it is one simple command (no `;`, `&`, `&&`, `|`, `||`, newline,
   `$(…)`, backticks, `<(…)`/`>(…)` or subshell parens outside quotes) whose
   matched pattern starts at its command word, after any leading
   assignments and `env`, `time`, `timeout [opts] N` or `nice`. So
