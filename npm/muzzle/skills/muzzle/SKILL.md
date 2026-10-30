@@ -60,6 +60,14 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
   `MUZZLE_SLOTS` from the claim and overwrites any it inherits. Drop
   hand-set caps from the command; an assignment inside the command string
   still wins.
+- **Wrap a script as a whole.** muzzle can't see inside a script, so a
+  script you write that runs builds or tests (`./check.sh`, `python3
+  /tmp/x.py`, a heredoc) matches no rule and runs unclaimed. Wrap the
+  whole script under the rule of the heaviest thing it runs:
+  `muzzle run --rule cargo-test -- ./check.sh`, or
+  `muzzle run --rule cargo-test -- bash -c 'cargo build && cargo test'`.
+  Don't move a gate into a script to skip the queue: the machine still
+  pays for it, and every other agent's gate slows down.
 - A background launch (`(gate > log 2>&1 &)`) keeps its slots: `muzzle run`
   returns at once and a keeper holds the claim until the job exits. Polling
   the log is fine. A poll that repeats the gate's command line would claim a
@@ -97,6 +105,30 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
   is logged `enforced: false`. If the caller is killed, the job may keep
   running in the container. Its slots stay held until it exits, so find
   and kill it there.
+
+## The config
+
+`~/.config/muzzle/config.toml` holds global `[[rule]]` entries. A
+`[path."<dir>"]` table changes rules for the repos under a directory, and
+`include = ["machine.toml"]` merges a per-machine file. Example:
+
+```toml
+include = ["machine.toml"]
+
+[[rule]]
+name  = "cargo-test"
+match = '\bcargo (test|nextest|clippy|build)\b'
+slots = 3
+
+[path."~/hacking/crew"]
+[[path."~/hacking/crew".rule]]
+name  = "cargo-test"
+slots = 2              # reweight only; match is inherited
+```
+
+There is no discovery mode. To set muzzle up on a machine, write the rules
+from the heavy commands you know, check them with `muzzle match`, and tune
+from the run log: [recipes/tune.md](recipes/tune.md).
 
 ## Recipes
 

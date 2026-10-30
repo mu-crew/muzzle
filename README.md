@@ -28,6 +28,25 @@ Rules in `~/.config/muzzle/config.toml` map commands to slots; the first
 run writes a template. In pi the extension wraps matching bash calls for
 you; Claude Code and Codex use a hook.
 
+```toml
+include = ["machine.toml"]     # per-machine file, merged after this one if it exists
+
+[[rule]]
+name  = "cargo-test"
+match = '\bcargo (test|nextest|clippy|build)\b'
+slots = 3
+
+[path."~/hacking/crew"]         # this directory's repos and their worktrees
+[[path."~/hacking/crew".rule]]
+name  = "cargo-test"
+slots = 2                      # reweight only
+```
+
+`muzzle report --by repo` shows which repos need their own weight. The
+run log keeps everything: each month moves into a gzip archive (about
+3–8 MB a month before compression). [docs/usage.md](docs/usage.md#config)
+has the details.
+
 **Never put `timeout` outside `muzzle run`**: it counts the queue wait. Use
 `--run-timeout S`.
 
@@ -47,7 +66,7 @@ it. Until then muzzle claims nothing about speed.
 | [docs/harnesses/](docs/harnesses/README.md) | Hook snippets for Claude Code, Codex, opencode, and the `allow` warning |
 | [skills/muzzle](npm/muzzle/skills/muzzle/SKILL.md) | The agent skill, with recipes for tuning, benchmarking and harnesses |
 | [bench/](bench/README.md) | Traces, the replay benchmark and the probe |
-| [spec](docs/specs/2026-10-29-muzzle.md) | Design and its numbered decisions |
+| [spec](docs/specs/2026-10-29-muzzle.md) | Design and its numbered decisions; [0.2 amendments](docs/specs/2026-10-30-muzzle-0.2-paths.md) for path tables, includes and the run log |
 | [CHANGELOG.md](CHANGELOG.md) | Releases |
 
 ## License

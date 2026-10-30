@@ -8,6 +8,19 @@ under, so `report --compare` can split by them later.
 Run on the host whose config you are changing. `runs.jsonl` is local machine
 state: read it here, and never publish it.
 
+## 0. A new machine: write the config, then trial it
+
+There is no discovery mode. Start from what you know:
+
+1. List the heavy commands agents run here: gates, `cargo test`, `npm test`,
+   e2e suites. museum helps (step 2).
+2. Write a rule for each, in the shared file, with a weight from the
+   command's usual job cap (`CARGO_BUILD_JOBS=4` means 4). Check each
+   pattern with `muzzle match -- 'contrib/gate --full'`.
+3. Put this machine's budget and weights in an untracked `machine.toml` next
+   to it (layout in step 3), so one shared file serves every machine.
+4. Run real work for a day or two, then start the loop at step 1.
+
 ## 1. Read the report, machine figures first
 
 ```sh
@@ -22,6 +35,7 @@ Read the machine section before the rows:
 | CPU efficiency (low) | claims are bigger than the jobs use: weights too big |
 | utilisation near 100% while the machine's CPU stays low | the budget is saturated but the cores aren't: the reserve is too big |
 | queue non-empty | how often anyone waited at all. Near 0% means the weights cost nothing yet |
+| unclaimed load (cores) | load that no claim accounts for: `load1 − held` at admission. High means heavy work runs outside muzzle. Find the unmatched heavy commands (step 2) and add rules, or raise `reserve` to leave room for them. It is rough: the load average lags, and on Linux it counts I/O wait |
 
 Then the rows. `suggest` names its evidence and carries a tag:
 
@@ -37,6 +51,24 @@ Then the rows. `suggest` names its evidence and carries a tag:
 
 Narrow to one rule with `--rule NAME`, or to a period with `--since D`
 and `--until D` (`now`, `7d`, `12h`, `30m`, `YYYY-MM-DD`, or RFC 3339).
+
+### Per repo
+
+One rule can behave very differently per repo: a `cargo test` that takes
+1 s in one repo can take 30 s in another. Split the rows by repo:
+
+```sh
+muzzle report --by repo --since 7d --rule cargo-test
+```
+
+Each row is one (rule, repo); `(none)` is runs outside any repo. The
+`now` column is the slots the **current** config gives that repo, and
+where they come from: `now 3 (from [path."~/hacking/crew"] in
+machine.toml)`. When the runs used a different weight, it adds `; runs used
+4`. `not in the current config here` means the rule is off or absent for
+that repo now, so there is no suggestion. When suggestions for one rule
+differ a lot between repos, give the outliers a path table (step 3).
+`--by repo` can't be combined with `--compare`.
 
 **Done when** you have written down, for the rule you will change, its
 current slots, run p50/p90, cores p50/p90 and the suggestion.
@@ -54,10 +86,52 @@ Check a candidate against the live config with
 `muzzle match -- 'contrib/gate --full'`. It prints the rule, or `no rule
 matches`.
 
+Heavy work inside a script (`./run.sh`, `python3 /tmp/x.py`) matches no
+rule, because muzzle only sees the script's name. A high unclaimed load
+with no unmatched commands in museum usually means this. The fix is
+wrapping such scripts with `muzzle run --rule cargo-test -- ./run.sh`
+(SKILL.md), not a rule for every script name.
+
 ## 3. Edit the config
 
 `~/.config/muzzle/config.toml`. Change one rule per round, so the next
 report shows what that change did.
+
+Where a change goes:
+
+```toml
+# ~/.config/muzzle/config.toml: shared, tracked in dotfiles
+include = ["machine.toml"]
+
+[[rule]]
+name  = "cargo-test"
+match = '\bcargo (test|nextest|clippy|build)\b'
+slots = 3
+
+[path."~/hacking/swayward-wm"]          # every repo under here, every worktree
+[[path."~/hacking/swayward-wm".rule]]
+name  = "cargo-test"
+slots = 6                               # reweight only; match inherited
+```
+
+```toml
+# ~/.config/muzzle/machine.toml: this machine only, untracked
+reserve = 2
+[[rule]]
+name  = "cargo-test"
+slots = 4                               # this machine's global weight
+```
+
+- **A weight for every repo on this machine**: the global rule in
+  `machine.toml`.
+- **A weight for some repos**: a `[path."<dir>"]` table with just `name`
+  and `slots`. The key is a directory; it covers every repo under it and
+  all their worktrees. A nearer table wins over a further one.
+- **A rule that should not fire in one repo**: `enabled = false` in its
+  table.
+- After the edit, `muzzle match --json --cwd ~/hacking/swayward-wm/swayward
+  -- 'cargo test'` shows the slots there and `slots_from`, the file and
+  table they came from.
 
 - **Weights**: set `slots` to the suggestion. For an `experiment`, that
   is the `try N` value, and step 5 decides whether it stays.
@@ -83,7 +157,9 @@ Check the edit loads, and note the new hash:
 muzzle doctor
 ```
 
-A bad config exits 2 and names the key.
+A bad config exits 2 and names the key and the file. `doctor` also lists
+each include as `found` or `not found`: a typo in an include path is
+skipped silently otherwise.
 
 **Hand-wrapped calls carry their own weight.** A `--slots` on
 `muzzle run` overrides the config, so editing the config changes nothing for briefs,
@@ -116,6 +192,10 @@ After a few days, or at least 5 clean runs at the new weight:
 ```sh
 muzzle report --compare 2026-11-01..2026-11-03 2026-11-04..now --rule cargo-test
 ```
+
+For a path-table change, compare per repo instead: run
+`muzzle report --by repo --since 2026-11-04 --rule cargo-test` and check
+the repo's row against the one you wrote down in step 1.
 
 The output shows both periods, split by config hash when it changed inside
 one, then an `A -> C` table of deltas. An experiment reads `confirmed` when

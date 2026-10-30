@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+Per-repo weights, a shared config with a machine file, and a run log that
+keeps its history (spec `docs/specs/2026-10-30-muzzle-0.2-paths.md`).
+
+**BREAKING.** There is no migration and no compatibility shim:
+
+- `[project."<glob>"]` tables are removed. They are now an unknown key and
+  exit 2. Use `[path."<dir>"]` tables.
+- `match --json` no longer has `"source": "project"` or the `"project"`
+  field. `source` is `"global"` or `"path"`, with `"path"` (the nearest
+  table that touched the rule) and `"slots_from"` (`{"file", "path"}`).
+- The config hash is version 2, computed over the merged config. Every
+  0.2 hash differs from every 0.1 hash, so `report --compare` splits at
+  the upgrade.
+
+Added and changed:
+
+- `[path."<dir>"]` tables apply to the repo a command runs in (its main
+  checkout, so all worktrees share them) and cascade from the outermost
+  directory to the nearest. An entry with a known name changes only the
+  fields it sets; a new name is a new rule. `enabled = false` turns a rule
+  off below a directory.
+- `include = ["machine.toml"]` in the root file merges per-machine files.
+  A missing include is skipped; `doctor` lists each as `found` or
+  `not found`, with the number of path tables.
+- `report --by repo` gives rows per rule and repo, with the slots the
+  current config gives that repo and the file and table they come from.
+- `runs.jsonl` is no longer pruned after 30 days. Each month, and past
+  16 MB, it rotates into a `runs-YYYY-MM.jsonl.gz` archive kept forever;
+  `report` reads the archives, and `doctor` shows them and warns when
+  they grow past 256 MB.
+- Run lines record `load1` and `held` at admission, and `report` shows
+  `unclaimed load: p50, p90` once 20 runs carry them: a rough figure for
+  load outside muzzle's claims.
+- The skill says to wrap a script that runs builds or tests as a whole,
+  and `tune.md` covers path tables, includes, `--by repo` and the
+  unclaimed-load figure.
+
 ## 0.1.2
 
 - `wrap`, `match` and `hook` leave a command that already runs muzzle
