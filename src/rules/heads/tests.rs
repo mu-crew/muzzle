@@ -121,6 +121,9 @@ fn commands_get_their_rule() {
         ("bash --init-file /r scripts/check.sh", Some("vtmux-check")),
         ("zsh -O -c 'cargo test'", Some("cargo-test")),
         ("zsh -xO -c 'cargo test'", Some("cargo-test")),
+        // zsh's glued `-o<name>` (review low_shell_args_gives_zsh_glued_o_name_a).
+        ("zsh -opipefail -c 'cargo test'", Some("cargo-test")),
+        ("zsh -xopipefail -c 'cargo test'", Some("cargo-test")),
         // f-ansi-c: `\'` doesn't close `$'…'`.
         ("echo $'it\\'s'; cargo test", Some("cargo-test")),
         ("echo $'cargo test'", None),

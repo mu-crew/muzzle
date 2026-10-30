@@ -771,8 +771,12 @@ const BASH_LONG_ARGS: [&str; 2] = ["rcfile", "init-file"];
 /// dash rejects `-O`); in zsh `-O` is the CORRECT_ALL flag. In a cluster
 /// each such letter takes one word in turn, so `bash -co pipefail 'x'`
 /// runs `x`. Long options ([`BASH_LONG_FLAGS`], [`BASH_LONG_ARGS`]) match
-/// whole words first. `--` or `-` ends options. One reader for both the
-/// `-c` script (rules and D16a container detection) and R1.1's script
+/// whole words first. zsh (and the other non-bash shells) take an option
+/// name glued on, `-opipefail`, `-xonomatch`: the rest of the word after
+/// `o` is its argument, not more flags, and the word consumes only itself
+/// (zsh 5.9 runs `zsh -f -opipefail -c x`; bash rejects `-opipefail`, so
+/// bash keeps taking the next word). `--` or `-` ends options. One reader
+/// for both the `-c` script (rules and D16a container detection) and R1.1's script
 /// file, so the two can't drift again.
 pub(super) fn shell_args<'a>(shell: &str, words: &'a [String]) -> ShellArgs<'a> {
     let arg_letters: &[char] = match base(shell) {
@@ -792,12 +796,21 @@ pub(super) fn shell_args<'a>(shell: &str, words: &'a [String]) -> ShellArgs<'a> 
             _ if long.is_some_and(|l| BASH_LONG_FLAGS.contains(&l)) => 1,
             _ if w.starts_with("--") => 1,
             _ if w.len() > 1 && w.starts_with(['-', '+']) => {
-                let opts = &w[1..];
+                let mut opts = &w[1..];
+                let mut takes = None;
+                if arg_letters == ['o']
+                    && let Some(i) = opts.find('o')
+                    && i + 1 < opts.len()
+                {
+                    // Review low_shell_args_gives_zsh_glued_o_name_a.
+                    opts = &opts[..i];
+                    takes = Some(1);
+                }
                 if w.starts_with('-') {
                     c |= opts.contains('c');
                     n |= opts.contains('n');
                 }
-                1 + opts.matches(arg_letters).count()
+                takes.unwrap_or_else(|| 1 + opts.matches(arg_letters).count())
             }
             _ => break,
         };
@@ -941,6 +954,12 @@ mod tests {
             ("zsh -O -c 'cargo test'", Some("cargo test")),
             ("zsh -xO -c 'cargo test'", Some("cargo test")),
             ("zsh -o pipefail -c 'cargo test'", Some("cargo test")),
+            // zsh takes a glued option name; bash takes the next word
+            // (review low_shell_args_gives_zsh_glued_o_name_a).
+            ("zsh -opipefail -c 'cargo test'", Some("cargo test")),
+            ("zsh -xopipefail -c 'cargo test'", Some("cargo test")),
+            ("zsh -onomatch -c 'cargo test'", Some("cargo test")),
+            ("bash -opipefail -c 'cargo test'", None),
             ("sh -O extglob -c 'cargo test'", Some("cargo test")),
             ("/bin/bash -O extglob -c 'cargo test'", Some("cargo test")),
         ] {
@@ -978,6 +997,7 @@ mod tests {
             "bash -noprofile -c 'podman exec x cargo test'",
             "bash -login -c 'podman exec box true'",
             "zsh -O -c 'podman exec x ls'",
+            "zsh -opipefail -c 'podman exec x cargo test'",
         ] {
             assert!(text_enters(cmd), "{cmd}");
         }
