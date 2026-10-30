@@ -6,9 +6,9 @@
 //! '…'` scripts, and past wrappers such as `env`, `timeout -s KILL 600`,
 //! `xargs` and `flatpak-spawn --host`. Quoted text, heredoc bodies,
 //! comments and arguments are not command position, so `echo "x; podman
-//! exec c"` and `git log -- distrobox enter` don't count. This isn't a shell parser: it errs towards
-//! finding an entry, because a miss leaves a container job unheld after a
-//! kill, which is the worse error.
+//! exec c"` and `git log -- distrobox enter` don't count. This isn't a
+//! shell parser: it errs towards finding an entry, because a miss leaves
+//! a container job unheld after a kill, which is the worse error.
 
 /// Split `text` into simple commands, each a list of unquoted words.
 /// Command substitutions come out as commands of their own.
@@ -741,21 +741,55 @@ pub(super) struct ShellArgs<'a> {
     pub rest: &'a [String],
 }
 
-/// f-shell-opts: `-o`/`-O`/`+o`/`+O`/`--rcfile`/`--init-file` take the
-/// next word as their argument; in a cluster each `o`/`O` takes one in
-/// turn, so `bash -co pipefail 'x'` runs `x`. `--` or `-` ends options.
-/// One reader for both the `-c` script (rules and D16a container
-/// detection) and R1.1's script file, so the two can't drift again.
-pub(super) fn shell_args(words: &[String]) -> ShellArgs<'_> {
+/// bash's long options, which it takes after one dash or two
+/// (`-noprofile`, `--login`). Matched as whole words before the cluster
+/// branch: read as a cluster, the `o` in `-login` would take `-c` as its
+/// argument and lose the script (D16a container detection missed `bash
+/// -login -c 'podman exec …'`).
+const BASH_LONG_FLAGS: [&str; 14] = [
+    "debug",
+    "debugger",
+    "dump-po-strings",
+    "dump-strings",
+    "help",
+    "login",
+    "noediting",
+    "noprofile",
+    "norc",
+    "posix",
+    "pretty-print",
+    "restricted",
+    "verbose",
+    "version",
+];
+
+/// The [`BASH_LONG_FLAGS`] counterparts that take the next word.
+const BASH_LONG_ARGS: [&str; 2] = ["rcfile", "init-file"];
+
+/// f-shell-opts: `-o`/`+o` take the next word as their argument, and so
+/// do `-O`/`+O` in bash (`sh` too: it is bash on Linux and macOS, and
+/// dash rejects `-O`); in zsh `-O` is the CORRECT_ALL flag. In a cluster
+/// each such letter takes one word in turn, so `bash -co pipefail 'x'`
+/// runs `x`. Long options ([`BASH_LONG_FLAGS`], [`BASH_LONG_ARGS`]) match
+/// whole words first. `--` or `-` ends options. One reader for both the
+/// `-c` script (rules and D16a container detection) and R1.1's script
+/// file, so the two can't drift again.
+pub(super) fn shell_args<'a>(shell: &str, words: &'a [String]) -> ShellArgs<'a> {
+    let arg_letters: &[char] = match base(shell) {
+        "bash" | "sh" => &['o', 'O'],
+        _ => &['o'],
+    };
     let (mut c, mut n, mut at) = (false, false, 0);
     while let Some(w) = words.get(at) {
         let w = w.as_str();
+        let long = w.strip_prefix("--").or_else(|| w.strip_prefix('-'));
         at += match w {
             "--" | "-" => {
                 at += 1;
                 break;
             }
-            "--rcfile" | "--init-file" => 2,
+            _ if long.is_some_and(|l| BASH_LONG_ARGS.contains(&l)) => 2,
+            _ if long.is_some_and(|l| BASH_LONG_FLAGS.contains(&l)) => 1,
             _ if w.starts_with("--") => 1,
             _ if w.len() > 1 && w.starts_with(['-', '+']) => {
                 let opts = &w[1..];
@@ -763,7 +797,7 @@ pub(super) fn shell_args(words: &[String]) -> ShellArgs<'_> {
                     c |= opts.contains('c');
                     n |= opts.contains('n');
                 }
-                1 + opts.matches(['o', 'O']).count()
+                1 + opts.matches(arg_letters).count()
             }
             _ => break,
         };
@@ -782,7 +816,7 @@ pub(super) fn shell_script(words: &[String]) -> Option<&str> {
     if !SHELLS.contains(&base(sh)) {
         return None;
     }
-    let args = shell_args(rest);
+    let args = shell_args(sh, rest);
     args.c.then(|| args.rest.first().map(String::as_str))?
 }
 
@@ -889,6 +923,26 @@ mod tests {
             ("bash -c -- 'cargo test'", Some("cargo test")),
             ("bash -o pipefail x.sh", None),
             ("bash -co", None),
+            // Single-dash long options are whole words, not clusters
+            // whose `o` takes `-c` (review medium_shell_args_reads_single_
+            // dash_long).
+            ("bash -noprofile -c 'cargo test'", Some("cargo test")),
+            ("bash -norc -c 'cargo test'", Some("cargo test")),
+            ("bash -login -c 'cargo test'", Some("cargo test")),
+            ("bash -posix -c 'cargo test'", Some("cargo test")),
+            ("bash -verbose -c 'cargo test'", Some("cargo test")),
+            ("bash --login -c 'cargo test'", Some("cargo test")),
+            ("bash -rcfile /r -c 'cargo test'", Some("cargo test")),
+            ("bash -init-file /r -c 'cargo test'", Some("cargo test")),
+            ("bash --init-file /r -c 'cargo test'", Some("cargo test")),
+            ("bash -rcfile -c 'cargo test'", None),
+            // zsh `-O` is CORRECT_ALL, no argument; `-o` still takes one
+            // (review low_shell_args_gives_zsh_o_an_argument).
+            ("zsh -O -c 'cargo test'", Some("cargo test")),
+            ("zsh -xO -c 'cargo test'", Some("cargo test")),
+            ("zsh -o pipefail -c 'cargo test'", Some("cargo test")),
+            ("sh -O extglob -c 'cargo test'", Some("cargo test")),
+            ("/bin/bash -O extglob -c 'cargo test'", Some("cargo test")),
         ] {
             let c = commands(cmd).remove(0);
             assert_eq!(shell_script(&c), script, "{cmd}");
@@ -921,6 +975,9 @@ mod tests {
             "bash -co pipefail 'podman exec x ls'",
             "bash -O extglob -c 'podman exec x ls'",
             "echo $'it\\'s'; podman exec x ls",
+            "bash -noprofile -c 'podman exec x cargo test'",
+            "bash -login -c 'podman exec box true'",
+            "zsh -O -c 'podman exec x ls'",
         ] {
             assert!(text_enters(cmd), "{cmd}");
         }

@@ -110,6 +110,17 @@ fn commands_get_their_rule() {
         ("bash -co 'cargo test' true", None),
         ("bash -O extglob scripts/check.sh", Some("vtmux-check")),
         ("bash -xo pipefail scripts/check.sh", Some("vtmux-check")),
+        // Review round 1: bash long options with one dash or two, and
+        // zsh's argument-less `-O`.
+        ("bash -noprofile -c 'cargo test'", Some("cargo-test")),
+        ("bash -norc -c 'cargo test'", Some("cargo-test")),
+        ("bash -login -c 'cargo test'", Some("cargo-test")),
+        ("bash -posix -c 'cargo test'", Some("cargo-test")),
+        ("bash -verbose -c 'cargo test'", Some("cargo-test")),
+        ("bash -rcfile /r scripts/check.sh", Some("vtmux-check")),
+        ("bash --init-file /r scripts/check.sh", Some("vtmux-check")),
+        ("zsh -O -c 'cargo test'", Some("cargo-test")),
+        ("zsh -xO -c 'cargo test'", Some("cargo-test")),
         // f-ansi-c: `\'` doesn't close `$'…'`.
         ("echo $'it\\'s'; cargo test", Some("cargo-test")),
         ("echo $'cargo test'", None),

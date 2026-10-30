@@ -410,7 +410,7 @@ fn script_program(words: &[String]) -> Option<(Option<&String>, &[String])> {
     if !SHELLS.contains(&base(prog)) {
         return None;
     }
-    let opts = shell::shell_args(rest);
+    let opts = shell::shell_args(prog, rest);
     // `bash -n <file>` only parses it: nothing runs. The museum check had
     // 4 `bash -n … contrib/gate` rows that R1.1 claimed for gate.
     if opts.n {
