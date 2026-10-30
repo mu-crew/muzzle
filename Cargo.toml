@@ -49,6 +49,10 @@ directories = "6.0"
 # runs.jsonl timestamps and report --since/--until.
 jiff = "0.2"
 
+# runs.jsonl monthly archives (P11): gzip via the pure-Rust miniz_oxide
+# backend, which builds for musl and macOS with no C library.
+flate2 = "1"
+
 # The config hash (D28): a short digest of the normalised rules.
 sha2 = "0.10"
 

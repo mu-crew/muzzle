@@ -1,9 +1,9 @@
 //! Unit `run` (spec §Architecture 4, D13-D19, D27, D30a): nesting, enqueue
 //! and poll, spawn (in a systemd scope when reachable), signals, the keeper
-//! handoff, release, `runs.jsonl`, `--report`, exit codes and stderr lines.
+//! handoff, release, `runs.jsonl` (through [`crate::runlog`]), `--report`,
+//! exit codes and stderr lines.
 
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -32,8 +32,6 @@ const TICK: Duration = Duration::from_millis(20);
 const PROGRESS: Duration = Duration::from_secs(30);
 /// D18: SIGTERM, then SIGKILL this much later.
 const KILL_GRACE: Duration = Duration::from_secs(10);
-/// D27: `runs.jsonl` lines older than this are pruned.
-const RUNS_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
 /// `--expand-environment=` arrived in systemd 254. From then on systemd-run
 /// expands `$VAR` in the command line, so `bash -c 'echo $HOME'` would be
 /// rewritten before bash sees it (checked on linuxpc, systemd 259).
@@ -419,7 +417,7 @@ impl Queue<'_> {
                 .filter(|(t, _)| !s.holders.iter().any(|h| h.ticket == *t))
                 .map(|(_, unit)| format!("{unit}.scope"))
                 .collect();
-            append_runs(self.store.dir(), &out.records, now)?;
+            crate::runlog::append(self.store.dir(), &out.records, now)?;
             if let Some(h) = s.holders.iter().find(|h| h.ticket == self.ticket) {
                 return Ok(Poll::Admitted(Box::new(h.clone()), budget));
             }
@@ -1284,7 +1282,7 @@ impl Job<'_> {
             // A keeper whose entry was pruned (it was SIGSTOPped, say) has
             // already had its line written by the pruning waiter.
             if s.remove(self.ticket) || !kept {
-                append_runs(self.store.dir(), &[rec], now)?;
+                crate::runlog::append(self.store.dir(), &[rec], now)?;
             }
             Ok(now)
         })
@@ -1460,62 +1458,6 @@ fn detach_stdio() {
             }
         }
     }
-}
-
-/// D27: append run lines to `runs.jsonl`, pruning lines older than 30 days
-/// first. Callers hold the state lock, so the rewrite can't race an append.
-pub fn append_runs(dir: &Path, records: &[RunRecord], now_ms: u64) -> anyhow::Result<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let path = dir.join("runs.jsonl");
-    let cutoff = admit::rfc3339(now_ms.saturating_sub(RUNS_TTL_MS));
-    prune_runs(&path, &cutoff)?;
-    let mut buf = Vec::new();
-    for r in records {
-        serde_json::to_writer(&mut buf, r)?;
-        buf.push(b'\n');
-    }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| f.write_all(&buf))
-        .with_context(|| format!("appending to {}", path.display()))
-}
-
-/// A line survives pruning when its `end` is at or after `cutoff`. Both are
-/// `YYYY-MM-DDTHH:MM:SSZ`, so string order is time order. A line without a
-/// readable `end` is kept: pruning is for age, not for repair.
-fn keep_line(line: &str, cutoff: &str) -> bool {
-    #[derive(serde::Deserialize)]
-    struct End {
-        end: String,
-    }
-    serde_json::from_str::<End>(line).map_or(true, |e| e.end.as_str() >= cutoff)
-}
-
-/// Lines are appended in time order, so only the first needs checking
-/// before deciding to rewrite.
-fn prune_runs(path: &Path, cutoff: &str) -> anyhow::Result<()> {
-    let Ok(file) = fs::File::open(path) else {
-        return Ok(());
-    };
-    let mut first = String::new();
-    BufReader::new(file).read_line(&mut first)?;
-    if keep_line(first.trim_end(), cutoff) {
-        return Ok(());
-    }
-    let text = fs::read_to_string(path)?;
-    let kept: String = text
-        .lines()
-        .filter(|l| keep_line(l, cutoff))
-        .flat_map(|l| [l, "\n"])
-        .collect();
-    let tmp = path.with_extension("jsonl.tmp");
-    fs::write(&tmp, kept)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1796,33 +1738,5 @@ mod tests {
         assert_eq!(mb(1), 1);
         assert_eq!(mb(1 << 20), 1);
         assert_eq!(mb((1 << 20) + 1), 2);
-    }
-
-    #[test]
-    fn old_run_lines_are_pruned() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("runs.jsonl");
-        let now = 100 * 24 * 3600 * 1000u64;
-        let line = |end: &str| format!("{{\"v\":1,\"end\":\"{end}\"}}\n");
-        let old = admit::rfc3339(now - RUNS_TTL_MS - 1000);
-        let fresh = admit::rfc3339(now - RUNS_TTL_MS + 1000);
-        fs::write(&path, line(&old) + &line(&fresh)).unwrap();
-        let mut rec: RunRecord = serde_json::from_value(json!({
-            "v":1,"end":"x","rule":null,"slots":1,"class":"high","cfg":null,"agent":null,
-            "cwd":"/","waited_s":0.0,"ran_s":0.0,"exit":0,"killed":null,"cpu_s":null,
-            "mem_peak_mb":null,"enforced":false,"nested":false,"kept":false,"budget":4
-        }))
-        .unwrap();
-        rec.end = admit::rfc3339(now);
-        append_runs(dir.path(), &[rec], now).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        let ends: Vec<String> = text
-            .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["end"].to_string())
-            .collect();
-        assert_eq!(ends.len(), 2, "{text}");
-        assert!(!text.contains(&old));
-        assert!(text.contains(&fresh));
-        assert!(keep_line("not json", &fresh));
     }
 }

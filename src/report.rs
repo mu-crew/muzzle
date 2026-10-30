@@ -4,7 +4,6 @@
 //! It never edits the config (D29).
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
@@ -866,21 +865,44 @@ fn host(store: &crate::state::Store) -> Host {
     }
 }
 
-fn read_runs(path: &Path) -> anyhow::Result<String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+/// The span `runlog::read` needs for `args`, so archives outside it stay
+/// unopened (P11); `None` reads everything. A run counts in the machine
+/// figures while it waits or holds, so a line that ends shortly after
+/// `until` can still matter: the end gets a day of slack.
+fn read_span(args: &ReportArgs, now: f64) -> Option<(f64, f64)> {
+    // A bad date reads everything; `render` then reports it.
+    let point = |s: &Option<String>, upper| match s {
+        Some(s) => parse_point(s, now, upper).map(Some).ok(),
+        None => Some(None),
+    };
+    let periods: Vec<Period> = match &args.compare {
+        Some(cmp) => cmp
+            .iter()
+            .map(|p| parse_range(p, now).ok())
+            .collect::<Option<_>>()?,
+        None => vec![Period {
+            since: point(&args.since, false)?,
+            until: point(&args.until, true)?,
+        }],
+    };
+    let since = periods
+        .iter()
+        .map(|p| p.since.unwrap_or(f64::NEG_INFINITY))
+        .fold(f64::INFINITY, f64::min);
+    let until = periods
+        .iter()
+        .map(|p| p.until.map_or(f64::INFINITY, |u| u + 86400.0))
+        .fold(f64::NEG_INFINITY, f64::max);
+    (since > f64::NEG_INFINITY || until < f64::INFINITY).then_some((since, until))
 }
 
 pub fn main(args: &ReportArgs) -> anyhow::Result<ExitCode> {
     let store = crate::state::Store::open_default()?;
-    let (runs, skipped) = parse(&read_runs(&store.dir().join("runs.jsonl"))?);
+    let now = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
+    let (runs, skipped) = parse(&crate::runlog::read(store.dir(), read_span(args, now))?);
     if skipped > 0 {
         eprintln!("muzzle: report: skipped {skipped} unreadable runs.jsonl lines");
     }
-    let now = jiff::Timestamp::now().as_millisecond() as f64 / 1000.0;
     match render(&runs, args, now, host(&store)) {
         Ok(out) => {
             print!("{out}");

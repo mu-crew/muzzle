@@ -355,10 +355,21 @@ fn doctor_reads_the_runs_log_and_exits_2_on_bad_config() {
         "{\"end\":\"2026-10-28T10:00:00Z\"}\n{\"end\":\"2026-10-20T10:00:00Z\"}\n",
     )
     .unwrap();
+    // P11: doctor sizes the archives without opening them.
+    std::fs::write(env.path("state/muzzle/runs-2026-08.jsonl.gz"), "12345").unwrap();
+    std::fs::write(env.path("state/muzzle/runs-2026-09.jsonl.gz"), "123").unwrap();
     let v = env.json(&["doctor", "--json"]);
     assert_eq!(v["runs"]["lines"], 2);
     assert_eq!(v["runs"]["oldest"], "2026-10-20T10:00:00Z");
     assert_eq!(v["runs"]["newest"], "2026-10-28T10:00:00Z");
+    assert_eq!(v["runs_archives"]["archives"], 2);
+    assert_eq!(v["runs_archives"]["archive_bytes"], 8);
+    assert_eq!(v["runs_archives"]["oldest_month"], "2026-08");
+    let text = String::from_utf8_lossy(&env.output(&["doctor"]).stdout).into_owned();
+    assert!(
+        text.contains("archives       2 files, 8 bytes, oldest 2026-08"),
+        "{text}"
+    );
 
     std::fs::write(env.path("config/muzzle/config.toml"), "bogus = 1\n").unwrap();
     let out = env.output(&["doctor"]);

@@ -15,5 +15,6 @@ pub mod repo;
 pub mod report;
 pub mod rules;
 pub mod run;
+pub mod runlog;
 pub mod state;
 pub mod status;

@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::cli::DoctorArgs;
 use crate::rules::config::{self, Config, ConfigError, TEMPLATE};
+use crate::runlog::{self, ARCHIVES_WARN_BYTES, LIVE_MAX_BYTES, Stats};
 use crate::state::{Budget, Store};
 
 /// The config at [`config::path`], without writing the template when it is
@@ -58,6 +59,8 @@ pub struct Facts {
     pub state_readable: Result<(), String>,
     pub systemd: bool,
     pub runs: Option<RunsLog>,
+    /// The live file and its monthly archives (P11); `None` when unreadable.
+    pub runlog: Option<Stats>,
     /// Rules that `runs.jsonl` shows entering a container (D16a).
     pub container_runs: Vec<String>,
     pub harnesses: Harnesses,
@@ -103,6 +106,8 @@ pub struct Report {
     pub rules: Option<usize>,
     pub config_hash: Option<String>,
     pub runs: Option<RunsLog>,
+    /// Added field (P11): `runs.jsonl`'s size and its monthly archives.
+    pub runs_archives: Option<Stats>,
     /// Added field (D16a): rules whose jobs enter a container, so muzzle
     /// admits them but can't cap or measure them. Empty when none.
     pub container_rules: Vec<String>,
@@ -261,6 +266,23 @@ pub fn check(f: &Facts) -> Report {
             f.config_path.display()
         ));
     }
+    if let Some(l) = &f.runlog {
+        if l.archive_bytes > ARCHIVES_WARN_BYTES {
+            warnings.push(format!(
+                "runs.jsonl archives total {} MB (over {} MB); they are kept forever, \
+                 so remove old runs-YYYY-MM.jsonl.gz files by hand",
+                mb(l.archive_bytes),
+                mb(ARCHIVES_WARN_BYTES)
+            ));
+        }
+        if l.live_bytes > LIVE_MAX_BYTES {
+            warnings.push(format!(
+                "runs.jsonl is {} MB (over {} MB): rotation is failing",
+                mb(l.live_bytes),
+                mb(LIVE_MAX_BYTES)
+            ));
+        }
+    }
     let systemd = f.systemd && f.os == "linux";
     let exit = if config_error.is_some() {
         crate::exit::USAGE
@@ -291,6 +313,7 @@ pub fn check(f: &Facts) -> Report {
         rules,
         config_hash: hash,
         runs: f.runs.clone(),
+        runs_archives: f.runlog.clone(),
         container_rules,
         container_maybe,
         pi_extension: found(&f.harnesses.pi_extension, "loaded", "not installed"),
@@ -353,6 +376,17 @@ pub fn render_text(r: &Report) -> String {
             ),
         },
     );
+    if let Some(l) = r.runs_archives.as_ref().filter(|l| l.archives > 0) {
+        line(
+            "archives",
+            format!(
+                "{} files, {} bytes, oldest {}",
+                l.archives,
+                l.archive_bytes,
+                l.oldest_month.as_deref().unwrap_or("?")
+            ),
+        );
+    }
     let mut containers = Vec::new();
     if !r.container_rules.is_empty() {
         containers.push(format!(
@@ -571,6 +605,7 @@ fn gather() -> Facts {
         config: config.map_err(|e| e.to_string()),
         stored,
         runs: runs_log(&state_dir.join("runs.jsonl")),
+        runlog: runlog::stats(&state_dir).ok(),
         container_runs: container_runs(&state_dir.join("runs.jsonl")),
         state_dir,
         state_writable,
@@ -615,6 +650,7 @@ mod tests {
             state_readable: Ok(()),
             systemd: true,
             runs: None,
+            runlog: None,
             container_runs: Vec::new(),
             harnesses: Harnesses::default(),
         }
@@ -811,6 +847,50 @@ mod tests {
         assert_eq!((l.lines, l.bytes), (3, 66));
         assert_eq!(l.oldest.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(l.newest.as_deref(), Some("2026-10-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn run_log_archives_are_shown_and_warned_on() {
+        let mut f = facts();
+        f.runlog = Some(Stats::default());
+        let r = check(&f);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(!render_text(&r).contains("archives"));
+
+        f.runlog = Some(Stats {
+            live_bytes: LIVE_MAX_BYTES,
+            archives: 3,
+            archive_bytes: ARCHIVES_WARN_BYTES,
+            oldest_month: Some("2026-08".into()),
+        });
+        let r = check(&f);
+        assert!(r.warnings.is_empty(), "at the limits: {:?}", r.warnings);
+        let t = render_text(&r);
+        assert!(
+            t.contains(&format!(
+                "archives       3 files, {ARCHIVES_WARN_BYTES} bytes, oldest 2026-08"
+            )),
+            "{t}"
+        );
+
+        f.runlog = Some(Stats {
+            live_bytes: LIVE_MAX_BYTES + 1,
+            archive_bytes: ARCHIVES_WARN_BYTES + 1,
+            ..f.runlog.unwrap()
+        });
+        let r = check(&f);
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("archives total 256 MB"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[1].contains("rotation is failing"),
+            "{:?}",
+            r.warnings
+        );
+        assert_eq!(r.exit, 0);
     }
 
     #[test]

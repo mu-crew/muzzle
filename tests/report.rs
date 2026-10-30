@@ -135,3 +135,50 @@ fn missing_log_is_an_empty_report() {
     assert!(v["machine"].is_null());
     assert_eq!(v["rules"], serde_json::json!([]));
 }
+
+/// P11: report reads the monthly archives that overlap the period plus
+/// `runs.jsonl`, and never opens one outside it. The September archive is
+/// not gzip, so opening it fails the report.
+#[test]
+fn since_skips_archives_outside_the_period() {
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("muzzle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let basic = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runs/basic.jsonl"),
+    )
+    .unwrap();
+    let (first, rest) = basic.split_once('\n').unwrap();
+    // November's first line lives in an archive and again in the live file
+    // (a crash between rename and truncate): it must count once.
+    let mut gz = flate2::write::GzEncoder::new(
+        std::fs::File::create(dir.join("runs-2026-11.jsonl.gz")).unwrap(),
+        flate2::Compression::default(),
+    );
+    writeln!(gz, "{first}").unwrap();
+    gz.finish().unwrap();
+    std::fs::write(dir.join("runs-2026-09.jsonl.gz"), "not gzip").unwrap();
+    std::fs::write(dir.join("runs.jsonl"), format!("{first}\n{rest}")).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_muzzle"))
+            .arg("report")
+            .args(args)
+            .env("XDG_STATE_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--json", "--since", "2026-11-01", "--until", "2026-11-01"]);
+    assert!(out.status.success(), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rule(&v, "gate")["runs"], 5, "{v}");
+    let all = run(&["--json"]);
+    assert!(
+        !all.status.success(),
+        "the bad archive is read with no period"
+    );
+    assert!(
+        String::from_utf8_lossy(&all.stderr).contains("runs-2026-09.jsonl.gz"),
+        "{all:?}"
+    );
+}

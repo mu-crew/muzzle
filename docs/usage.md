@@ -96,8 +96,9 @@ the wait.
   when only advisory.
 - `muzzle report` summarises `runs.jsonl`: machine figures, per-rule rows
   and a suggested weight per rule. `--compare A..B C..D` puts two periods
-  side by side. `runs.jsonl` keeps 30 days and is local state; it records
-  working directories, so don't publish it.
+  side by side. `runs.jsonl` rotates each month (and past 16 MB) into
+  `runs-YYYY-MM.jsonl.gz` beside it, kept forever; `zcat` reads them. It
+  is local state and records working directories, so don't publish it.
 
 ## Harnesses
 
