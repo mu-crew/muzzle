@@ -334,6 +334,26 @@ mod tests {
     }
 
     #[test]
+    fn a_high_head_that_does_not_fit_blocks_a_smaller_normal_waiter() {
+        // D10 + D11 (f-d11-test): the queue is one list across classes, so
+        // a blocked high head holds back a normal job that would fit.
+        let mut s = state(4);
+        let running = push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 1).state;
+        let normal = push(&mut s, 1, Class::Normal, 2);
+        let high = push(&mut s, 4, Class::High, 3);
+        let out = run(s, 4);
+        assert!(out.admitted.is_empty(), "{:?}", out.admitted);
+        let mut s = out.state;
+        s.remove(running);
+        let out = run(s, 5);
+        assert_eq!(out.admitted, vec![high]);
+        let mut s = out.state;
+        s.remove(high);
+        assert_eq!(run(s, 6).admitted, vec![normal]);
+    }
+
+    #[test]
     fn requests_above_the_budget_are_capped_and_run_alone() {
         let mut s = state(4);
         let huge = push(&mut s, 999, Class::Normal, 0);
@@ -564,14 +584,23 @@ mod tests {
 
     #[test]
     fn a_live_scope_does_not_hold_a_non_container_run() {
-        // Only a holder that names its scope is held by it.
+        // Only a holder that names its scope is held by it. f-scope-test:
+        // a host run has a scope too (D15), under the name `unit_name`
+        // gives it, `{prefix}-{pid}-{start}-{ticket}`. Mark that one live:
+        // a `holds` that derived a scope for a holder with none would keep
+        // the host run, while the container run beside it is kept by the
+        // scope it names.
         let mut s = state(2);
-        let t = push(&mut s, 2, Class::Normal, 0);
-        let s = run(s, 1).state;
+        push(&mut s, 1, Class::Normal, 0); // the host run, holders[0]
+        let container = push(&mut s, 1, Class::Normal, 0);
+        let mut s = run(s, 1).state;
+        let unit = |h: &Holder| format!("muzzle-{}-{}-{}.scope", h.pid, h.start, h.ticket);
         let mut live = Table::default();
-        live.scopes.insert(format!("muzzle-{}.scope", t));
+        live.scopes.extend(s.holders.iter().map(unit));
+        s.holders[1].scope = Some(unit(&s.holders[1]));
         let out = admit(s, 2, &live);
-        assert!(out.state.holders.is_empty());
+        assert_eq!(holder_tickets(&out.state), vec![container]);
+        assert_eq!(out.records.len(), 1);
     }
 
     #[test]

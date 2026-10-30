@@ -154,17 +154,24 @@ test("the result gets the D26 line and a muzzle custom entry, and the report is 
 
 test("parallel calls keep their own reports", async () => {
   const { emit, entries } = load();
-  const a: Record<string, unknown> = { command: "echo fake-gate a" };
-  const b: Record<string, unknown> = { command: "echo fake-gate b" };
+  // f-ts-parallel: the two runs exit differently, so a report fed to the
+  // wrong call shows up in the entry it lands in.
+  const a: Record<string, unknown> = { command: "echo fake-gate a; exit 3" };
+  const b: Record<string, unknown> = { command: "echo fake-gate b; exit 5" };
   await emit("tool_call", call("a", a));
   await emit("tool_call", call("b", b));
-  const outB = runBash(b.command as string);
-  const outA = runBash(a.command as string);
-  await emit("tool_result", result("b", b, outB));
-  await emit("tool_result", result("a", a, outA));
+  const sh = (c: string) => spawnSync("bash", ["-c", c], { encoding: "utf8" });
+  const runB = sh(b.command as string);
+  const runA = sh(a.command as string);
+  assert.deepEqual([runA.status, runB.status], [3, 5], runA.stderr + runB.stderr);
+  await emit("tool_result", result("b", b, runB.stdout));
+  await emit("tool_result", result("a", a, runA.stdout));
   assert.deepEqual(
-    entries.map((e) => e.data.toolCallId),
-    ["b", "a"],
+    entries.map((e) => [e.data.toolCallId, e.data.exit]),
+    [
+      ["b", 5],
+      ["a", 3],
+    ],
   );
 });
 

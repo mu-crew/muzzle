@@ -213,16 +213,28 @@ fn one_call(dir: &Path, rule: &str, role: &str, dur_s: f64) -> PathBuf {
 /// in both modes, even for a role whose cap (reviewer 2) is below the
 /// rule's slots (gate 3). It used to burn 3 x dur_s over 2 threads in
 /// none mode: 1.5 x dur_s. The burner counts CPU time, so it is never
-/// faster than dur_s; the upper bound leaves room for a busy machine.
+/// faster than its work over its threads: the bug can't run under 3 s
+/// however idle the host. Load only adds wall time (f-flake-bounds: a
+/// shared host stretched a 2 s call past 2.7 s), so a mode passes when any
+/// of a few tries lands under the bound, which a buggy run never can.
 #[test]
 fn an_uncontended_call_takes_its_duration_in_both_modes() {
     let dir = tempfile::tempdir().unwrap();
     let trace = one_call(dir.path(), "gate", "reviewer", 2.0);
     for mode in ["none", "muzzle"] {
-        let (_d, _out, r) = bench_trace(&trace, mode, "1", &[]);
-        assert_eq!(r["calls"]["failed"], 0, "{mode}: {r:#}");
-        let run = r["run_s"]["p50"].as_f64().unwrap();
-        assert!((1.9..2.7).contains(&run), "{mode}: run_s {run}, want ~2");
+        let mut runs = Vec::new();
+        for _ in 0..3 {
+            let (_d, _out, r) = bench_trace(&trace, mode, "1", &[]);
+            assert_eq!(r["calls"]["failed"], 0, "{mode}: {r:#}");
+            let run = r["run_s"]["p50"].as_f64().unwrap();
+            assert!(run >= 1.9, "{mode}: run_s {run}, want ~2");
+            runs.push(run);
+            if run < 2.8 {
+                break;
+            }
+        }
+        let best = runs.iter().copied().fold(f64::MAX, f64::min);
+        assert!(best < 2.8, "{mode}: run_s {runs:?}, want ~2");
     }
 }
 

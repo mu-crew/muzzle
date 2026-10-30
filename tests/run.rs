@@ -346,14 +346,21 @@ fn sigkill_of_the_whole_group_kills_the_job_and_frees_the_slots() {
 
 /// ran_s_lag_followup: a holder SIGKILLed with its job and pruned much
 /// later records about its real life, not the wait for the prune
-/// (smoke_final: 75 s for a 20 s job). The heartbeat is 2 s, so a 3 s life
-/// records 2 to 3 s; the prune comes 4 s after the kill.
+/// (smoke_final: 75 s for a 20 s job). The prune comes 4 s after the kill.
+///
+/// f-flake-bounds: the heartbeat starts after scope setup (up to 2 s), so
+/// a fixed 3 s life recorded anywhere from 0 to 4 s on a loaded host. The
+/// kill waits for the first beat instead, and ran_s is bounded by the life
+/// the test measured: at least one beat (2 s), at most the kill.
 #[test]
 fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
     let env = Env::new();
     let mut hog = env.hog("30");
-    std::thread::sleep(Duration::from_millis(3000));
+    let start = env.state().holders[0].run_start_ms;
+    let beaten = || env.state().holders[0].seen_ms.is_some_and(|s| s > start);
+    assert!(eventually(Duration::from_secs(10), beaten), "no heartbeat");
     kill(-(hog.id() as i32), libc::SIGKILL);
+    let life = (now_ms() - start) as f64 / 1000.0;
     hog.wait().unwrap();
     std::thread::sleep(Duration::from_millis(4000));
     let out = env.cmd(&["--slots", "1", "--", "true"]).output().unwrap();
@@ -361,7 +368,12 @@ fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
     let runs = env.runs();
     let r = runs.iter().find(|r| r["killed"] == "holder").unwrap();
     let ran = r["ran_s"].as_f64().unwrap();
-    assert!((1.9..3.6).contains(&ran), "ran_s {ran}: {r}");
+    // The old bug recorded life + 4 s. Both ends are ms on one clock, and
+    // the last beat came before the kill; 0.1 s covers a stepped clock.
+    assert!(
+        ran >= 1.9 && ran <= life + 0.1,
+        "ran_s {ran}, life {life}: {r}"
+    );
 }
 
 /// rv020r_rotation_failure_wedges: an archive that can't be written (a
@@ -667,7 +679,10 @@ fn a_scope_killed_during_setup_is_not_left_failed() {
 fn nested_run_through_ancestry_starts_at_once() {
     let env = Env::new();
     let me = env!("CARGO_BIN_EXE_muzzle");
-    let inner = format!("env -u MUZZLE_HOLD {me} run --slots 4 -- echo inner");
+    // f-test-hang: the inner run gets its own --timeout. The outer one's
+    // only bounds the outer queue wait; if D17.1 regresses, the inner run
+    // queues behind its own parent, and this must fail (75), not hang.
+    let inner = format!("env -u MUZZLE_HOLD {me} run --slots 4 --timeout 2 -- echo inner");
     let out = env
         .cmd(&["--slots", "4", "--timeout", "5", "--", "sh", "-c", &inner])
         .output()
@@ -821,8 +836,11 @@ fn run_timeout_escalates_to_sigkill_after_the_grace() {
         .unwrap();
     let took = started.elapsed();
     assert_eq!(out.status.code(), Some(124), "{out:?}");
+    // The KILL lands at 0.5 + 10 s; with none, `sleep 30` runs out at 30 s.
+    // f-flake-bounds: the upper bound leaves 7.5 s for startup, scope setup
+    // and release on a loaded host (12 s flaked) and still tells the two.
     assert!(
-        (Duration::from_secs(10)..Duration::from_secs(12)).contains(&took),
+        (Duration::from_secs(10)..Duration::from_secs(18)).contains(&took),
         "{took:?}"
     );
     assert_eq!(env.runs()[0]["killed"], "timeout");
@@ -839,15 +857,16 @@ fn queue_timeout_exits_75_and_drops_the_ticket() {
     hog.wait().unwrap();
 }
 
-#[test]
-fn sigterm_while_queued_prints_d19_and_drops_the_ticket() {
+/// D19 names SIGTERM and SIGINT (f-sigint-queued): both exit 128 + signal
+/// with the message, and drop the ticket.
+fn signal_while_queued_prints_d19_and_drops_the_ticket(sig: i32) {
     let env = Env::new();
     let mut hog = env.hog("30");
     let mut waiter = env.cmd(&["--", "true"]).spawn().unwrap();
     assert!(eventually(Duration::from_secs(5), || waiters(&env) == 1));
-    kill(waiter.id() as i32, libc::SIGTERM);
+    kill(waiter.id() as i32, sig);
     let status = wait_for(&mut waiter, Duration::from_secs(2)).unwrap();
-    assert_eq!(status.code(), Some(143));
+    assert_eq!(status.code(), Some(128 + sig), "{status:?}");
     let err = stderr_of(waiter);
     assert!(
         err.contains("muzzle: killed while queued (position 1/1, waited ")
@@ -857,6 +876,16 @@ fn sigterm_while_queued_prints_d19_and_drops_the_ticket() {
     assert_eq!(waiters(&env), 0);
     kill(-(hog.id() as i32), libc::SIGKILL);
     hog.wait().unwrap();
+}
+
+#[test]
+fn sigterm_while_queued_prints_d19_and_drops_the_ticket() {
+    signal_while_queued_prints_d19_and_drops_the_ticket(libc::SIGTERM);
+}
+
+#[test]
+fn sigint_while_queued_prints_d19_and_drops_the_ticket() {
+    signal_while_queued_prints_d19_and_drops_the_ticket(libc::SIGINT);
 }
 
 /// rv_skill_unknown_rule: a name the config lacks warns, and otherwise
@@ -1349,15 +1378,21 @@ fn container_job_outlives_a_graceful_stop(stop: &str) {
         .file("entered")
         .exists()));
     let started = Instant::now();
-    let h = &env.state().holders[0];
     // The probe is recorded at spawn: path, and the namespaces it's valid in.
-    let probe = h.probe.as_ref().expect("probe recorded");
+    // The path goes in by a second write, once muzzle has seen systemd-run
+    // move into the scope; `entered` is the job's own mark and can beat
+    // that write (1 in 3 to 6 runs read `cgroup: None` here), so wait.
+    let scope_path = || {
+        env.state().holders[0]
+            .probe
+            .as_ref()
+            .and_then(|p| p.cgroup.clone())
+            .is_some_and(|c| c.ends_with(".scope"))
+    };
     assert!(
-        probe
-            .cgroup
-            .as_deref()
-            .is_some_and(|c| c.ends_with(".scope")),
-        "{probe:?}"
+        eventually(Duration::from_secs(3), scope_path),
+        "{:?}",
+        env.state().holders[0].probe
     );
     match stop {
         "term" => kill(gate.id() as i32, libc::SIGTERM),
