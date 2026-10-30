@@ -48,9 +48,10 @@ jobs:
 
   publish:
     needs: build
-    # v0.1.0 was published by hand (first release); its tag push builds but
-    # must not republish. Later tags publish through trusted publishing.
-    if: github.event_name == 'push' && github.ref_name != 'v0.1.0'
+    # v0.1.0 and v0.1.1 were published by hand (before trusted publishing);
+    # their tag pushes build but must not republish. Later tags publish
+    # through trusted publishing.
+    if: github.event_name == 'push' && github.ref_name != 'v0.1.0' && github.ref_name != 'v0.1.1'
     runs-on: ubuntu-latest
     # id-token: trusted publishing to npm and crates.io. No tokens are stored;
     # both registries trust this repo's release.yml for muzzle's packages.
