@@ -338,8 +338,9 @@ struct Wrapper {
 const WRAPPERS: &[Wrapper] = &[
     Wrapper {
         name: "env",
-        short_args: "uCS",
-        long_args: &["--unset", "--chdir", "--split-string"],
+        // `-a`/`--argv0` (GNU) and `-P` (BSD) take an argument too.
+        short_args: "uCSaP",
+        long_args: &["--unset", "--chdir", "--split-string", "--argv0"],
         positional: 0,
     },
     Wrapper {
@@ -523,21 +524,141 @@ fn strip_options<'a>(wr: &Wrapper, env: bool, mut words: &'a [String]) -> &'a [S
     words
 }
 
+/// The options `hook claude` steps over for one prefix word: an
+/// allowlist, because here a wrong step approves a call unprompted. An
+/// option not listed, in any spelling (GNU's abbreviations `--ch=`, `--sp=`
+/// included), stops the allow: `env -S`/`--split-string` runs a command
+/// hidden in its argument, `env -C`/`--chdir` moves what a relative word
+/// resolves to, `env -a`/`--argv0` makes the next word an argument, and
+/// BSD `env -P` swaps the PATH that finds the command (R5).
+struct SafeOpts {
+    name: &'static str,
+    /// Short options that take no argument; they may cluster.
+    flags: &'static str,
+    /// Short options whose argument is the rest of the word or the next.
+    args: &'static str,
+    /// Long options (without `--`) that take no argument.
+    long_flags: &'static [&'static str],
+    /// Long options whose argument is `=value` or the next word.
+    long_args: &'static [&'static str],
+    /// Operands before the command (timeout's duration).
+    positional: usize,
+    /// `nice -5`: an adjustment written as the option.
+    numeric: bool,
+    /// env: assignments, and `-` meaning `-i`.
+    env: bool,
+}
+
 /// The prefixes `hook claude` steps over before the command word (spec
 /// §Integrations "Claude Code and Codex"): a narrower list than
-/// [`WRAPPERS`], because here a wrong step approves a call unprompted.
-const ALLOW_PREFIXES: [&str; 4] = ["env", "time", "timeout", "nice"];
+/// [`WRAPPERS`], with only their harmless options.
+const ALLOW_PREFIXES: [SafeOpts; 4] = [
+    SafeOpts {
+        name: "env",
+        flags: "iv0",
+        args: "u",
+        long_flags: &["ignore-environment", "debug", "null"],
+        long_args: &["unset"],
+        positional: 0,
+        numeric: false,
+        env: true,
+    },
+    SafeOpts {
+        name: "time",
+        // Not `-o`/`--output`, `-a`: they write to a file the user didn't
+        // approve.
+        flags: "pvq",
+        args: "f",
+        long_flags: &["portability", "verbose", "quiet"],
+        long_args: &["format"],
+        positional: 0,
+        numeric: false,
+        env: false,
+    },
+    SafeOpts {
+        name: "timeout",
+        flags: "v",
+        args: "sk",
+        long_flags: &["preserve-status", "foreground", "verbose"],
+        long_args: &["signal", "kill-after"],
+        positional: 1,
+        numeric: false,
+        env: false,
+    },
+    SafeOpts {
+        name: "nice",
+        flags: "",
+        args: "n",
+        long_flags: &[],
+        long_args: &["adjustment"],
+        positional: 0,
+        numeric: true,
+        env: false,
+    },
+];
+
+/// How many of `words` (after the prefix's name) are its options and
+/// operands, or `None` at an option not in `o`. Options end at the first
+/// operand, as with getopt's `+` mode these tools use: `env A=1 -u X`
+/// runs `-u`.
+fn skip_safe_opts(o: &SafeOpts, words: &[String]) -> Option<usize> {
+    let mut at = 0;
+    while let Some(w) = words.get(at).map(String::as_str) {
+        if w == "--" {
+            at += 1;
+            break;
+        }
+        // GNU env reads a lone `-` as `-i` after its options.
+        if o.env && w == "-" {
+            at += 1;
+            break;
+        }
+        let Some(opt) = w.strip_prefix('-').filter(|s| !s.is_empty()) else {
+            break;
+        };
+        at += match opt.strip_prefix('-') {
+            Some(long) => match long.split_once('=') {
+                Some((name, _)) if o.long_args.contains(&name) => 1,
+                None if o.long_flags.contains(&long) => 1,
+                None if o.long_args.contains(&long) => 2,
+                _ => return None,
+            },
+            None if o.numeric && opt.bytes().all(|b| b.is_ascii_digit()) => 1,
+            None => short_cluster(opt, o.flags, o.args)?,
+        };
+    }
+    at += o.positional;
+    while o.env && words.get(at).is_some_and(|w| is_assignment(w)) {
+        at += 1;
+    }
+    (at <= words.len()).then_some(at)
+}
+
+/// Words taken by short-option cluster `opt` (past its `-`): flags until
+/// the first option that takes an argument, which owns the rest of the
+/// word (`-uCARGO_HOME`) or, if none is left, the next word. `None` at a
+/// letter in neither set.
+fn short_cluster(opt: &str, flags: &str, args: &str) -> Option<usize> {
+    for (i, c) in opt.char_indices() {
+        if args.contains(c) {
+            return Some(if i + c.len_utf8() == opt.len() { 2 } else { 1 });
+        }
+        if !flags.contains(c) {
+            return None;
+        }
+    }
+    Some(1)
+}
 
 /// Where an [`ALLOW_PREFIXES`] word may live when written as a path
 /// (`/usr/bin/time -v cargo clippy`).
 const TRUSTED_DIRS: [&str; 2] = ["/usr/bin/", "/bin/"];
 
 /// The byte offset in `text` of the command word, when `text` lexes to one
-/// simple command: past assignments and leading `env`, `time`,
-/// `timeout [opts] N` and `nice` with their options. `None` for anything
-/// else, including `env -S`/`--split-string`, which would run a command
-/// hidden in its argument, `env -C`/`--chdir`, and a prefix at a path
-/// outside [`TRUSTED_DIRS`].
+/// simple command: past assignments and leading [`ALLOW_PREFIXES`] with
+/// their allowed options. `None` for anything else, including a prefix
+/// option outside the allowlist and a prefix at a path outside
+/// [`TRUSTED_DIRS`].
 pub fn command_word(text: &str) -> Option<usize> {
     let mut spans = command_spans(text);
     if spans.len() != 1 {
@@ -552,9 +673,9 @@ pub fn command_word(text: &str) -> Option<usize> {
             at += 1;
             continue;
         }
-        if !ALLOW_PREFIXES.contains(&base(w)) {
+        let Some(o) = ALLOW_PREFIXES.iter().find(|o| o.name == base(w)) else {
             break;
-        }
+        };
         // R5 (2026-10-30 amendment): a prefix counts by name or from the
         // system directories only; `/tmp/evil/env` or `./time` is some
         // other program, which could run anything.
@@ -565,24 +686,7 @@ pub fn command_word(text: &str) -> Option<usize> {
         {
             return None;
         }
-        // strip_prefix steps over exactly this wrapper and stops at the
-        // next word (which the loop above then looks at).
-        let rest = strip_one(&words[at..]);
-        let next = words.len() - rest.len();
-        // `env -S` runs a command hidden in its argument; `env -C`/`--chdir`
-        // changes what a relative command word (`./contrib/gate`) and the
-        // program's own config (`.cargo/config.toml`) resolve to (R5).
-        if base(w) == "env"
-            && words[at + 1..next].iter().any(|n| {
-                ["--split-string", "--chdir"]
-                    .iter()
-                    .any(|o| n.starts_with(o))
-                    || (n.starts_with('-') && !n.starts_with("--") && n.contains(['S', 'C']))
-            })
-        {
-            return None;
-        }
-        at = next;
+        at += 1 + skip_safe_opts(o, &words[at + 1..])?;
     }
     // A shell, another wrapper (`exec`, `sudo`, `xargs`) or a `*.sh`
     // script as the command word runs some other program, yet an anchored
@@ -618,18 +722,6 @@ pub fn runs_muzzle(text: &str) -> bool {
 }
 
 pub(super) const SHELLS: [&str; 6] = ["bash", "sh", "dash", "zsh", "ksh", "ash"];
-
-/// `words` past its first word, a known wrapper, and that wrapper's
-/// options and positional words.
-fn strip_one(words: &[String]) -> &[String] {
-    let Some(wr) = words
-        .first()
-        .and_then(|w| WRAPPERS.iter().find(|wr| wr.name == base(w)))
-    else {
-        return words;
-    };
-    strip_options(wr, base(&words[0]) == "env", &words[1..])
-}
 
 fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(name, _)| {
@@ -847,6 +939,10 @@ mod tests {
             ("flatpak-spawn --host a", "a"),
             ("systemd-inhibit --why x a", "a"),
             ("time -p a", "a"),
+            // env -a/--argv0 (GNU) and -P (BSD) take an argument.
+            ("env -a x a", "a"),
+            ("env --argv0 x a", "a"),
+            ("env -P /p a", "a"),
         ] {
             let c = commands(cmd).remove(0);
             assert_eq!(strip_prefix(&c).join(" "), rest, "{cmd}");
@@ -863,6 +959,13 @@ mod tests {
             ("/bin/env A=1 cargo test", "cargo"),
             ("A=1 env B=2 nice -n 5 timeout 9 cargo test", "cargo"),
             ("env -u X cargo test", "cargo"),
+            // low_cluster_scan_blocks_pcore_ucargo: `-u` owns the rest.
+            ("env -uCARGO_HOME cargo test", "cargo"),
+            ("env -iuCARGO_HOME --unset=X - A=1 cargo test", "cargo"),
+            ("timeout -s KILL --kill-after=5 600 cargo test", "cargo"),
+            ("timeout -sKILL 600 cargo test", "cargo"),
+            ("nice -5 time -p cargo test", "cargo"),
+            ("env -- cargo test", "cargo"),
         ] {
             let at = command_word(cmd).unwrap_or_else(|| panic!("{cmd}"));
             assert!(cmd[at..].starts_with(word), "{cmd}");
@@ -878,6 +981,26 @@ mod tests {
             "env --chdir=/e contrib/gate",
             "env --chdir /e contrib/gate",
             "env -S 'x' cargo test",
+            // high_env_long_opt_abbreviations_bypass_c: GNU abbreviations.
+            "env --ch=/tmp/evil contrib/gate",
+            "env --c=/e cargo test",
+            "env --chd=/e ./contrib/gate",
+            "env --sp='sh -c x' cargo test",
+            "env --spl='rm -rf ~' cargo test",
+            "/usr/bin/env --s=x cargo test",
+            "env --unse=X cargo test",
+            // high_env_a_argv0_and_p_spoof_the_command.
+            "env -a vitest /bin/sh -c 'echo PWNED'",
+            "env -avitest /bin/sh",
+            "env --argv0 contrib/gate /bin/sh -c x",
+            "env --argv0=cargo test",
+            "env -P/tmp/evil cargo test",
+            "env -P /tmp/evil cargo test",
+            "env -iP/tmp/evil cargo test",
+            // Unknown or file-writing options of the other prefixes.
+            "time -o /home/u/.bashrc cargo test",
+            "timeout --foo 5 cargo test",
+            "nice --adj=5 cargo test",
         ] {
             assert_eq!(command_word(cmd), None, "{cmd}");
         }

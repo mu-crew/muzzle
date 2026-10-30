@@ -85,44 +85,102 @@ pub fn head_matches(head: &[String], pattern: &[String]) -> bool {
         || word
             .match_indices('/')
             .any(|(i, _)| word_matches(&word[i + 1..], prog));
-    named && subcommands_match(&head[1..], pattern, true)
+    named && subcommands_match(&head[1..], pattern)
 }
 
 /// R5: the hook's exact form. The program word is the pattern's program
-/// or `./` plus it, never a path elsewhere (`/tmp/evil/cargo`).
+/// or `./` plus it, never a path elsewhere (`/tmp/evil/cargo`), and its
+/// options pass [`safe_before`] and [`safe_after`]: anything unknown is
+/// wrapped but left for the user to approve.
 pub fn head_matches_exactly(head: &[String], pattern: &[String]) -> bool {
     let (Some(word), Some(prog)) = (head.first(), pattern.first()) else {
         return false;
     };
-    let named = word == prog || word.strip_prefix("./") == Some(prog.as_str());
-    // No R4 option arguments here: `cargo -C /x test` and
-    // `cargo --config 'target.x.runner=…' test` name other code to run, so
-    // they are wrapped but left for the user to approve, in any spelling
-    // (`-C/x`, `--config=…`) and on either side of the subcommand.
-    named && !names_other_code(&head[1..], prog) && subcommands_match(&head[1..], pattern, false)
+    if !(word == prog || word.strip_prefix("./") == Some(prog.as_str())) {
+        return false;
+    }
+    // No R4 option arguments here: an option before the subcommand is one
+    // word from the allowlist, so `cargo -C /x test` stops the allow.
+    let mut rest = &head[1..];
+    for sub in &pattern[1..] {
+        while let Some(w) = rest.first().filter(|w| w.starts_with(['-', '+'])) {
+            if !safe_before(prog, w) {
+                return false;
+            }
+            rest = &rest[1..];
+        }
+        match rest.split_first() {
+            Some((w, tail)) if word_matches(w, sub) => rest = tail,
+            _ => return false,
+        }
+    }
+    // Words after `--` go to the test binary or script, not to `prog`.
+    rest.iter()
+        .take_while(|w| *w != "--")
+        .all(|w| safe_after(prog, w))
 }
 
-/// R5: options that make `prog` run code from somewhere else (another
-/// directory, manifest or config). Short options match inside a cluster.
-fn code_opts(prog: &str) -> &'static [&'static str] {
+/// R5: an option word before the subcommand that can't make `prog` run
+/// code from elsewhere. An allowlist: npm reads any unambiguous
+/// abbreviation (`--prefi=` is `--prefix`) and has options that run code
+/// (`--script-shell`, `--node-options`); cargo's `+toolchain` may be a
+/// path (`+/tmp/tc` runs `/tmp/tc/bin/cargo`). Other programs get none.
+fn safe_before(prog: &str, w: &str) -> bool {
     match prog {
-        "cargo" => &["-C", "--config", "--manifest-path"],
-        "npm" => &["-C", "--prefix"],
-        _ => &[],
+        "cargo" => {
+            if let Some(tc) = w.strip_prefix('+') {
+                // A toolchain name; rustup takes anything with a `/` as a path.
+                return !tc.is_empty()
+                    && tc
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._".contains(c));
+            }
+            matches!(
+                w,
+                "--locked" | "--frozen" | "--offline" | "--quiet" | "--verbose"
+            ) || w.strip_prefix("--color=").is_some()
+                || short_flags(w, "qv")
+        }
+        "npm" => matches!(w, "--silent" | "--quiet") || short_flags(w, "sqd"),
+        _ => false,
     }
 }
 
-/// True when a word before `--` in `rest` is one of `prog`'s
-/// [`code_opts`]: `--opt`, `--opt=…`, `-o`, `-o…` or a cluster with `o`.
-/// Words after `--` go to the test binary or script, not to `prog`.
-fn names_other_code(rest: &[String], prog: &str) -> bool {
-    let opts = code_opts(prog);
-    rest.iter().take_while(|w| *w != "--").any(|w| {
-        opts.iter().any(|o| match o.strip_prefix("--") {
-            Some(_) => w == o || w.strip_prefix(o).is_some_and(|v| v.starts_with('=')),
-            None => !w.starts_with("--") && w.starts_with('-') && w[1..].contains(&o[1..]),
-        })
-    })
+/// R5: an option word after the subcommand. npm reads these as config
+/// just as before it (`npm run test --script-shell=x`), so the same
+/// allowlist holds. cargo's clap takes no abbreviations, so its options
+/// that name other code (`--config`, `--manifest-path`, `-C`, `-Z`) can be
+/// refused by name; a short cluster is read up to its first letter that
+/// takes an argument, so `-pCore` and `-FCuda` are a package and a
+/// feature, not `-C`.
+fn safe_after(prog: &str, w: &str) -> bool {
+    match prog {
+        "npm" => !w.starts_with('-') || safe_before(prog, w),
+        "cargo" => {
+            if let Some(long) = w.strip_prefix("--") {
+                let name = long.split_once('=').map_or(long, |(n, _)| n);
+                return !matches!(name, "config" | "manifest-path");
+            }
+            let Some(opt) = w.strip_prefix('-') else {
+                return true;
+            };
+            for c in opt.chars() {
+                match c {
+                    'C' | 'Z' => return false,
+                    'p' | 'F' | 'j' => return true,
+                    _ => {}
+                }
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// `-x`, `-xy`: a cluster of only `flags`.
+fn short_flags(w: &str, flags: &str) -> bool {
+    w.strip_prefix('-')
+        .is_some_and(|o| !o.is_empty() && o.chars().all(|c| flags.contains(c)))
 }
 
 fn word_matches(word: &str, pat: &str) -> bool {
@@ -142,12 +200,8 @@ fn program_opts(prog: &str) -> &'static [&'static str] {
     }
 }
 
-fn subcommands_match(mut rest: &[String], pattern: &[String], option_args: bool) -> bool {
-    let takes: &[&str] = if option_args {
-        program_opts(base(&pattern[0]))
-    } else {
-        &[]
-    };
+fn subcommands_match(mut rest: &[String], pattern: &[String]) -> bool {
+    let takes = program_opts(base(&pattern[0]));
     for sub in &pattern[1..] {
         while let Some(w) = rest.first().filter(|w| w.starts_with(['-', '+'])) {
             let n = if takes.contains(&w.as_str()) { 2 } else { 1 };

@@ -207,6 +207,40 @@ fn head_matching_rules() {
     assert!(!x("cargo test --config=x.runner=/e", "cargo test"));
     assert!(!x("cargo test --config x.runner=/e", "cargo test"));
     assert!(!x("npm --prefix=/e run test", "npm run test"));
+    // high_npm_abbrev_unlisted_code_opts_still: options are an allowlist,
+    // so abbreviations and unlisted code options stop the allow.
+    for h in [
+        "npm --pref=/e run test",
+        "npm --prefi=/e run test",
+        "npm --script-shell=/tmp/evil run test",
+        "npm run test --script-shell=/tmp/evil",
+        "npm run --script-shell=/tmp/evil test",
+        "npm --node-options=--require_/tmp/e.js run test",
+        "npm --userconfig=/tmp/x run test",
+    ] {
+        assert!(!x(h, "npm run test"), "{h}");
+    }
+    for h in [
+        "cargo +/tmp/tc test",
+        "cargo +../tc test",
+        "cargo + test",
+        "cargo --manifest-pat=/x test",
+        "cargo -Zx test",
+        "cargo test -Zx",
+    ] {
+        assert!(!x(h, "cargo test"), "{h}");
+    }
+    assert!(x("npm run test", "npm run test"));
+    assert!(x("npm --silent run test -- --x=1", "npm run test"));
+    assert!(x("npm run test --silent file", "npm run test"));
+    assert!(x("cargo -q --locked --color=always test", "cargo test"));
+    assert!(x("cargo +nightly-2026-01-01 test", "cargo test"));
+    // low_cluster_scan_blocks_pcore_ucargo: `-p`/`-F` own the rest of the
+    // word, so a capital C there is a name, not `-C`.
+    assert!(x("cargo test -pCore", "cargo test"));
+    assert!(x("cargo build -pCrate", "cargo build"));
+    assert!(x("cargo test -FCuda", "cargo test"));
+    assert!(x("cargo test -j8 --release", "cargo test"));
     // rv021_glob_program: a `*` in the pattern's program is literal here.
     assert!(!x("cargo-evil", "cargo*"));
 }

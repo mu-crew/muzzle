@@ -370,6 +370,10 @@ mod tests {
             "A=1 env B=2 cargo test",
             "/usr/bin/time -v cargo test",
             "cargo +nightly test",
+            "npm run test",
+            "cargo test -pCore",
+            "cargo test -FCuda",
+            "env -uCARGO_HOME cargo test",
             "contrib/gate",
             "./contrib/gate --fast",
             "npm run test:fast",
@@ -399,8 +403,32 @@ mod tests {
             "npm --prefix=/e run test",
             "env -C /e ./contrib/gate",
             "env --chdir=/e contrib/gate",
+            // fix-rules-allow-2: every repro from review_fix-rules-allow.
+            "env --ch=/tmp/evil contrib/gate",
+            "env --c=/e cargo test",
+            "env --chd=/e ./contrib/gate",
+            "env --sp='sh -c \"echo PWNED\"' cargo test",
+            "/usr/bin/env --s='x' cargo test",
+            "env --spl='rm -rf ~' cargo test",
+            "env -P/tmp/evil cargo test",
+            "npm --pref=/e run test",
+            "npm --prefi=/e run test",
+            "npm --script-shell=/tmp/evil run test",
+            "npm run test --script-shell=/tmp/evil",
+            "npm --node-options='--require /tmp/e.js' run test",
+            "cargo +/tmp/tc test",
         ] {
             undecided(&claude(cmd, &c));
+        }
+        // env -a/--argv0 takes an argument (the wrapper table knows it), so
+        // the spoofed word is no command: these run `/bin/sh` and `test`,
+        // match no rule and get no reply at all.
+        for cmd in [
+            "env -a vitest /bin/sh -c 'echo PWNED'",
+            "env --argv0 contrib/gate /bin/sh -c 'echo PWNED'",
+            "env -a cargo test",
+        ] {
+            assert_eq!(claude(cmd, &c), json!({}), "{cmd}");
         }
     }
 
