@@ -39,6 +39,24 @@ Added and changed:
   and `tune.md` covers path tables, includes, `--by repo` and the
   unclaimed-load figure.
 
+Fixed:
+
+- A holder killed outright (muzzle and keeper gone) used to record `ran_s`
+  up to the moment a later run pruned it (75 s for a 20 s job). Holders now
+  write a heartbeat, so `ran_s` ends at the last time the job was seen
+  alive (within about 2 s). These lines were already left out of report
+  figures; the log is now accurate too.
+- `bench/check-trace` never echoes an unknown key, its value or a file
+  name in its errors, because CI logs are public. Symlinks under
+  `bench/traces` are refused, in CI mode and by the pre-commit hook.
+- The npm shim prints one stderr line when `execve` fails and it falls
+  back to spawn, instead of failing silently: a group kill may leak the job
+  in that mode.
+- CI runs the npm package and extension tests on macOS as well as Linux.
+
+Internal: the large modules (`run`, `report`, `doctor`, `rules/config`,
+`bench/replay`) are split into submodules, with no change in behaviour.
+
 ## 0.1.2
 
 - `wrap`, `match` and `hook` leave a command that already runs muzzle
