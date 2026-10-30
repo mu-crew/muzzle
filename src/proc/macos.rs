@@ -110,6 +110,12 @@ pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     }
 }
 
+/// No subreapers on macOS: an orphan goes to launchd.
+pub(super) fn adopt_orphans() {}
+
+/// Nothing is adopted, so muzzle's only child is the one it waits on.
+pub(super) fn reap_adopted(_keep: Pid) {}
+
 pub(super) fn all_pids() -> io::Result<Vec<Pid>> {
     // Sized as `group_members` is: grow and retry while the table fills
     // the buffer.

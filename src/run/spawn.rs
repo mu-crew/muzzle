@@ -92,15 +92,40 @@ pub(super) fn exit_code(status: ExitStatus) -> u8 {
     }
 }
 
-/// D18: the job is past `--run-timeout`: SIGTERM, and SIGKILL after 10 s.
+/// Why the [`Deadline`] ended the job.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum Fired {
+    /// D18: `--run-timeout`.
+    Timeout,
+    /// D16: a non-leader's job stopped for the terminal (SIGTTIN or
+    /// SIGTTOU); see [`terminal_stop`].
+    Terminal(libc::c_int),
+}
+
+impl Fired {
+    /// muzzle's exit: 124 for the timeout (D18); for the terminal, 128 +
+    /// the stop signal, the code a shell gives a job stopped that way.
+    pub(super) fn code(self) -> u8 {
+        match self {
+            Fired::Timeout => exit::RUN_TIMEOUT,
+            Fired::Terminal(sig) => 128u8.saturating_add(sig as u8),
+        }
+    }
+}
+
+/// D18: the job is past `--run-timeout`, or stuck waiting for the terminal
+/// (D16): SIGTERM, and SIGKILL after 10 s.
 pub(super) struct Deadline {
     pub(super) after: Option<Duration>,
     pub(super) termed: Option<Instant>,
     pub(super) killed: bool,
+    pub(super) why: Option<Fired>,
     /// A nested run's descendants (pid, start), tracked from the SIGTERM on.
     /// Remembered rather than re-read, because once the top command dies
     /// they are reparented and ancestry no longer finds them; the start
     /// stamp keeps a recycled pid from being signalled (f-nested-timeout).
+    /// Those orphaned before the SIGTERM are found because a nested run
+    /// with a timeout adopts orphans on Linux ([`proc::adopt_orphans`]).
     pub(super) tree: Vec<(Pid, proc::StartTime)>,
     /// When the tree was last rescanned: a scan reads every process on the
     /// host, so it runs every `POLL`, not every `TICK`, plus right before
@@ -114,18 +139,16 @@ impl Deadline {
             after,
             termed: None,
             killed: false,
+            why: None,
             tree: Vec::new(),
             scanned: None,
         }
     }
 
     fn check(&mut self, started: Instant, target: Target) {
-        let Some(after) = self.after else { return };
+        let due = self.after.is_some_and(|after| started.elapsed() >= after);
         match self.termed {
-            None if started.elapsed() >= after => {
-                self.hit(target, libc::SIGTERM);
-                self.termed = Some(Instant::now());
-            }
+            None if due => self.fire(target, Fired::Timeout),
             Some(at) if !self.killed && at.elapsed() >= KILL_GRACE => {
                 self.hit(target, libc::SIGKILL);
                 self.killed = true;
@@ -134,6 +157,17 @@ impl Deadline {
             Some(_) => self.track(target),
             _ => {}
         }
+    }
+
+    /// Start ending the job now: SIGTERM, and the grace runs from here.
+    fn fire(&mut self, target: Target, why: Fired) {
+        self.why = Some(why);
+        self.hit(target, libc::SIGTERM);
+        // A stopped process keeps a SIGTERM pending until it is continued,
+        // so it would only see the SIGKILL; continue it as a shell's `kill`
+        // does for a stopped job.
+        self.hit(target, libc::SIGCONT);
+        self.termed = Some(Instant::now());
     }
 
     /// The deadline's signal: the target, and for a nested run its tracked
@@ -152,13 +186,16 @@ impl Deadline {
     /// the tree have forked since. A no-op for a group target.
     fn track(&mut self, target: Target) {
         let Target::Child(child) = target else { return };
+        proc::reap_adopted(child);
         self.tree.retain(|&(p, s)| proc::is_alive(p, s));
         if self.scanned.is_some_and(|t| t.elapsed() < POLL) {
             return;
         }
         self.scanned = Some(Instant::now());
         let mut roots: Vec<Pid> = self.tree.iter().map(|t| t.0).collect();
-        roots.push(child);
+        // muzzle too: what it adopted (`adopt_orphans`) hangs off it, not
+        // off the child.
+        roots.extend([child, std::process::id() as Pid]);
         for d in proc::descendants(&roots) {
             if !self.tree.iter().any(|t| t.0 == d.0) {
                 self.tree.push(d);
@@ -217,38 +254,28 @@ impl Deadline {
 }
 
 /// Wait for the top command, forwarding signals, enforcing the deadline and
-/// sampling the scope, and beating for the holder if there is one. With
-/// `tty`, a job in its own group that stops is relayed to the shell (see
-/// [`relay_stop`]). Returns its status and rusage once reaped.
+/// sampling the scope, and beating for the holder if there is one. Returns
+/// its status and rusage once reaped.
 pub(super) fn supervise(
     pid: Pid,
     target: Target,
     deadline: &mut Deadline,
     mut sampler: Option<&mut Sampler>,
     mut beat: Option<&mut Heartbeat>,
-    tty: Option<&proc::Terminal>,
 ) -> anyhow::Result<(ExitStatus, proc::Rusage)> {
     let started = Instant::now();
-    // A job left stopped waiting for the terminal, resumed once it's ours.
-    let mut parked = false;
     loop {
         match proc::poll_child(pid).context("waiting for the command")? {
             proc::ChildState::Exited(status, ru) => return Ok((status, ru)),
             proc::ChildState::Stopped(sig) => {
-                if let (Target::Group(pgid), Some(t)) = (target, tty) {
-                    parked = !relay_stop(pgid, t, sig);
+                if let Some(why) = terminal_stop(target, sig, deadline) {
+                    deadline.fire(target, why);
                 }
             }
             proc::ChildState::Running => {}
         }
-        if let (true, Target::Group(pgid), Some(t)) = (parked, target, tty)
-            && t.ours()
-        {
-            // `fg` after `bg`: the shell gave muzzle the terminal back.
-            t.lend(pgid);
-            // SAFETY: plain syscall.
-            unsafe { libc::kill(-pgid, libc::SIGCONT) };
-            parked = false;
+        if let Target::Child(child) = target {
+            proc::reap_adopted(child);
         }
         if let Some(sig) = take_signal() {
             target.forward(sig);
@@ -264,35 +291,29 @@ pub(super) fn supervise(
     }
 }
 
-/// f-tcsetpgrp: the job, in its own group (D16 non-leader), was stopped
-/// (Ctrl-Z, or SIGTTIN reading a terminal it doesn't own). The shell only
-/// sees muzzle, so muzzle gives the terminal back and stops too, and the
-/// shell reports the job stopped. On `fg` or `bg` the shell continues
-/// muzzle, which lends the terminal again if it got it back (`fg`) and
-/// continues the job. Without this muzzle waited on a stopped job forever,
-/// holding its slots and the shell. Returns whether the job was continued.
-fn relay_stop(pgid: Pid, tty: &proc::Terminal, sig: libc::c_int) -> bool {
-    tty.give_back();
-    // SAFETY: plain syscall. SIGTSTP keeps its default action (muzzle
-    // never catches it), so this returns once muzzle is continued, or at
-    // once if the kernel discards it for an orphaned group.
-    unsafe {
-        libc::raise(libc::SIGTSTP);
+/// D16, f-tcsetpgrp: a non-leader runs its job in a group of its own,
+/// which is never the terminal's foreground: muzzle does not lend it the
+/// terminal. Handing it over and taking it back stopped callers that share
+/// muzzle's group, took the terminal from a shell that had reclaimed it, and
+/// sent Ctrl-C and Ctrl-Z to the job instead of the caller (review of
+/// a0e59fd). A job that reads (SIGTTIN) or sets up (SIGTTOU) the terminal
+/// therefore stops, and used to wait so forever, holding its slots. It
+/// can't go on without the terminal, so muzzle says why once and ends it:
+/// SIGTERM, then SIGKILL after D18's grace, exit 128 + the stop signal,
+/// what a shell reports for the stopped job. A plain SIGSTOP is left alone,
+/// as at 0036aa7: whoever sent it can continue the job. Ctrl-Z never lands
+/// here: it goes to the foreground group, the caller's, not the job's.
+fn terminal_stop(target: Target, sig: libc::c_int, deadline: &Deadline) -> Option<Fired> {
+    let ttin = matches!(sig, libc::SIGTTIN | libc::SIGTTOU);
+    if !ttin || !matches!(target, Target::Group(_)) || deadline.why.is_some() {
+        return None;
     }
-    if tty.ours() {
-        tty.lend(pgid);
-    } else if matches!(sig, libc::SIGTTIN | libc::SIGTTOU) {
-        // Still in the background (`bg`, or an orphaned group where the
-        // stop was discarded): continuing a job that waits for the terminal
-        // only stops it again, so it stays stopped, as a background reader
-        // does in a plain shell, until the terminal comes back.
-        return false;
-    }
-    // SAFETY: plain syscall.
-    unsafe {
-        libc::kill(-pgid, libc::SIGCONT);
-    }
-    true
+    eprintln!(
+        "muzzle: the command stopped waiting for the terminal: muzzle doesn't lead its \
+         process group, so the command runs in the background (D16). Run muzzle as \
+         the first command, or give it no terminal (< /dev/null). Ending it."
+    );
+    Some(Fired::Terminal(sig))
 }
 
 /// D17: a nested run starts at once, claims nothing and is not logged; its
@@ -302,6 +323,14 @@ pub(super) fn run_nested(
     run_timeout: Option<Duration>,
 ) -> anyhow::Result<ExitCode> {
     let started = Instant::now();
+    if run_timeout.is_some() {
+        // A descendant orphaned before the deadline (`(cmd &)`) reparents
+        // to init and ancestry loses it, so the timeout missed it
+        // (low_nested_run_timeout_misses). As a subreaper muzzle adopts it
+        // instead. Linux only; on macOS it still escapes this timeout,
+        // though not the outer claim's, whose group it stays in (D18 note).
+        proc::adopt_orphans();
+    }
     let child = match Command::new(&args.command[0])
         .args(&args.command[1..])
         .spawn()
@@ -312,14 +341,11 @@ pub(super) fn run_nested(
     let pid = child.id() as Pid;
     let target = Target::Child(pid);
     let mut deadline = Deadline::new(run_timeout);
-    let (status, _) = supervise(pid, target, &mut deadline, None, None, None)?;
+    let (status, _) = supervise(pid, target, &mut deadline, None, None)?;
     // D18's grace applies to the nested job's leftovers as to a group.
     deadline.drain(target, None, None);
-    let code = if deadline.fired() {
-        exit::RUN_TIMEOUT
-    } else {
-        exit_code(status)
-    };
+    proc::reap_adopted(pid);
+    let code = deadline.why.map_or(exit_code(status), Fired::code);
     if let Some(path) = &args.report {
         let ran = started.elapsed().as_secs_f64();
         let t = Times {

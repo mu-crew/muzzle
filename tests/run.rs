@@ -1667,35 +1667,284 @@ fn pty_output(master: &std::fs::File, within: Duration) -> std::sync::mpsc::Rece
     out_rx
 }
 
-/// f-tcsetpgrp: a non-leader muzzle (`muzzle run …; more` in an interactive
-/// shell) runs its job in a new group. That group gets the terminal for the
-/// run, so a job reading it isn't stopped on SIGTTIN for good, and the
-/// shell gets it back after. A job stopped outright (`kill -STOP`) doesn't
-/// leave muzzle waiting forever either: in this orphaned test group the
-/// shell can't stop muzzle in turn, so muzzle continues the job.
+/// f-tcsetpgrp (D16): a non-leader runs its job in a group of its own,
+/// which is not the terminal's foreground, and muzzle never hands it the
+/// terminal. A job that reads it stops on SIGTTIN; it used to wait so
+/// forever, holding its slots. muzzle now says why, ends it, exits
+/// 128 + SIGTTIN, and frees the slots. The original repro: `muzzle run …;
+/// more` as a terminal's foreground command.
 #[test]
-fn a_non_leader_job_owns_the_terminal_and_gives_it_back() {
+fn a_non_leader_job_stopped_for_the_terminal_is_ended_and_frees_its_slots() {
     use std::io::Write;
     let env = Env::new();
-    let script = r#""$MUZZLE" run -- sh -c 'kill -STOP $$; read x; echo got:$x'; echo rc=$?; read y; echo again:$y"#;
+    let script =
+        r#""$MUZZLE" run -- sh -c 'read x; echo got:$x'; echo rc=$?; read y; echo again:$y"#;
     let (mut child, mut master) = on_a_pty(env.shell(script));
     let out = pty_output(&master, Duration::from_secs(10));
-    // The tty buffers input until a reader asks for it.
-    master.write_all(b"hello\nworld\n").unwrap();
+    master.write_all(b"hello\n").unwrap();
     let status = wait_for(&mut child, Duration::from_secs(10));
     let text = out.recv().unwrap();
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();
     }
+    let ttin = 128 + libc::SIGTTIN;
+    assert!(text.contains(&format!("rc={ttin}")), "{text:?}");
     assert!(
-        text.contains("got:hello"),
-        "job never read the terminal: {text:?}"
+        text.contains("muzzle: the command stopped waiting for the terminal"),
+        "{text:?}"
     );
-    assert!(text.contains("rc=0"), "{text:?}");
-    assert!(
-        text.contains("again:world"),
-        "the shell never got the terminal back: {text:?}"
-    );
+    assert!(text.contains("first command"), "no hint: {text:?}");
+    // The terminal stayed with the caller, so the input went to it.
+    assert!(!text.contains("got:"), "{text:?}");
+    assert!(text.contains("again:hello"), "{text:?}");
     assert_eq!(status.map(|s| s.code()), Some(Some(0)), "{text:?}");
+    assert_eq!(env.state().held(), 0);
+    let last = env.runs().pop().unwrap();
+    assert_eq!(
+        (&last["killed"], &last["exit"]),
+        (&"signal".into(), &ttin.into())
+    );
+}
+
+/// An interactive `bash -i` on a pty, typed into as a user would, for the
+/// job-control repros of the review of a0e59fd (fix-run-signals-2).
+struct Interactive {
+    child: Child,
+    master: std::fs::File,
+    out: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+const PROMPT: &str = "READY> ";
+
+impl Interactive {
+    fn start(env: &Env) -> Interactive {
+        use std::io::Read;
+        let mut cmd = env.under("bash");
+        cmd.args(["--norc", "--noprofile", "-i"])
+            .env("PS1", PROMPT)
+            .env("HISTFILE", "/dev/null")
+            .env("TERM", "dumb")
+            .env("MUZZLE", env!("CARGO_BIN_EXE_muzzle"))
+            .current_dir(&env.scratch);
+        let (child, master) = on_a_pty(cmd);
+        let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let (mut m, o) = (master.try_clone().unwrap(), out.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            while let Ok(n) = m.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                o.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let sh = Interactive { child, master, out };
+        assert!(sh.expect(PROMPT, 0, Duration::from_secs(5)), "no prompt");
+        sh
+    }
+
+    fn text(&self) -> String {
+        self.out.lock().unwrap().clone()
+    }
+
+    /// The output's length, to look for something printed after it.
+    fn mark(&self) -> usize {
+        self.out.lock().unwrap().len()
+    }
+
+    fn send(&mut self, s: &str) {
+        use std::io::Write;
+        self.master.write_all(s.as_bytes()).unwrap();
+    }
+
+    /// Whether `pat` shows up after byte `from` within `within`.
+    fn expect(&self, pat: &str, from: usize, within: Duration) -> bool {
+        eventually(within, || self.text()[from..].contains(pat))
+    }
+
+    fn alive(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+}
+
+impl Drop for Interactive {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Every one of `n` claims has its job spawned: its group is recorded in
+/// the same write as the spawn (f-nonleader-pgid).
+fn jobs_running(env: &Env, n: usize) -> bool {
+    eventually(Duration::from_secs(5), || {
+        let s = env.state();
+        s.holders.len() == n && s.holders.iter().all(|h| h.pgid.is_some())
+    })
+}
+
+fn write_script(env: &Env, name: &str, body: &str) -> String {
+    let path = env.file(name);
+    std::fs::write(&path, body).unwrap();
+    path.display().to_string()
+}
+
+/// One Ctrl-Z stops a script that runs muzzle (which doesn't lead its
+/// group there), and `fg` finishes it, as without muzzle. With the tty
+/// lent to the job, the first Ctrl-Z stopped only the job and wedged the
+/// terminal (medium_tty_handoff_reroutes_ctrl_c_ctrl).
+#[test]
+fn ctrl_z_stops_a_script_running_muzzle_and_fg_finishes_it() {
+    let env = Env::new();
+    let script = write_script(
+        &env,
+        "script.sh",
+        "\"$MUZZLE\" run -- sh -c 'sleep 3; echo job-done'\necho after=$?\n",
+    );
+    let mut sh = Interactive::start(&env);
+    sh.send(&format!("bash {script}\n"));
+    assert!(jobs_running(&env, 1));
+    let at = sh.mark();
+    sh.send("\x1a");
+    assert!(
+        sh.expect("Stopped", at, Duration::from_secs(3)),
+        "{:?}",
+        sh.text()
+    );
+    assert!(sh.expect(PROMPT, at, Duration::from_secs(3)));
+    let at = sh.mark();
+    sh.send("fg\n");
+    assert!(
+        sh.expect("after=0", at, Duration::from_secs(10)),
+        "{:?}",
+        sh.text()
+    );
+    assert!(sh.text()[at..].contains("job-done"));
+    assert!(eventually(Duration::from_secs(3), || env.state().held() == 0));
+}
+
+/// Ctrl-C under `make -j2` with two muzzle-wrapped recipes ends both at
+/// once: it reaches make's group, and each muzzle forwards it to its job.
+/// With the tty lent, only one job got it and the other ran to the end.
+#[test]
+fn ctrl_c_under_make_ends_every_muzzle_recipe() {
+    let env = Env::new();
+    let recipe = "\t@\"$(MUZZLE)\" run --slots 1 -- sh -c 'sleep 30; echo X-done'";
+    std::fs::write(
+        env.file("Makefile"),
+        format!("all: a b\na:\n{recipe}\nb:\n{recipe}\n"),
+    )
+    .unwrap();
+    let mut sh = Interactive::start(&env);
+    sh.send("make -j2\n");
+    assert!(jobs_running(&env, 2));
+    let at = sh.mark();
+    sh.send("\x03");
+    // The prompt is back once make and both recipes are gone; a recipe
+    // that missed the Ctrl-C keeps it away for 30 s.
+    let back = || sh.text()[at..].ends_with(PROMPT);
+    assert!(eventually(Duration::from_secs(5), back), "{:?}", sh.text());
+    assert!(!sh.text().contains("X-done"), "{:?}", sh.text());
+    assert!(eventually(Duration::from_secs(3), || env.state().held() == 0));
+}
+
+/// A harness that runs muzzle in its own foreground group (Popen without
+/// setsid) and reads the terminal meanwhile keeps the terminal: muzzle
+/// never takes it for the job (high_tty_lent_from_a_shared_fg_group).
+#[test]
+fn a_harness_sharing_muzzles_group_keeps_the_terminal() {
+    let env = Env::new();
+    let harness = write_script(
+        &env,
+        "harness.py",
+        r#"import os, subprocess, sys, time
+p = subprocess.Popen(["sh", "-c", os.environ["MUZZLE"] + " run -- sh -c 'sleep 2; echo tool-done'; true"])
+time.sleep(0.5)
+print("harness got: " + sys.stdin.readline().strip(), flush=True)
+print("tool rc %d" % p.wait(), flush=True)
+"#,
+    );
+    let mut sh = Interactive::start(&env);
+    sh.send(&format!("python3 {harness}; echo harness-rc=$?\n"));
+    assert!(jobs_running(&env, 1));
+    let at = sh.mark();
+    sh.send("typed\n");
+    assert!(
+        sh.expect("harness-rc=0", at, Duration::from_secs(10)),
+        "{:?}",
+        sh.text()
+    );
+    let text = sh.text();
+    assert!(text[at..].contains("harness got: typed"), "{text:?}");
+    assert!(text[at..].contains("tool rc 0"), "{text:?}");
+    assert!(!text.contains("Stopped"), "{text:?}");
+}
+
+/// A script that backgrounds muzzle and reads the terminal keeps it, and
+/// the interactive shell survives a caller that exits before its job: the
+/// terminal was handed back to the dead caller's group and bash exited on
+/// the next keystroke (high_muzzle_steals_the_tty_back_after).
+#[test]
+fn a_backgrounded_muzzle_never_takes_the_terminal_from_its_caller_or_the_shell() {
+    let env = Env::new();
+    let reader = write_script(
+        &env,
+        "bg.sh",
+        "\"$MUZZLE\" run -- sh -c 'sleep 2' >/dev/null 2>&1 &\nsleep 0.5\nread x\necho script-read=$x\nwait\n",
+    );
+    let leaver = write_script(
+        &env,
+        "bg3.sh",
+        "\"$MUZZLE\" run -- sh -c 'sleep 2' >/dev/null 2>&1 &\nsleep 0.5\n",
+    );
+    let mut sh = Interactive::start(&env);
+    sh.send(&format!("bash {reader}; echo bg-rc=$?\n"));
+    assert!(jobs_running(&env, 1));
+    let at = sh.mark();
+    sh.send("hello\n");
+    assert!(
+        sh.expect("bg-rc=0", at, Duration::from_secs(10)),
+        "{:?}",
+        sh.text()
+    );
+    assert!(sh.text()[at..].contains("script-read=hello"));
+    let at = sh.mark();
+    sh.send(&format!("bash {leaver}\n"));
+    assert!(sh.expect(PROMPT, at, Duration::from_secs(5)));
+    // The caller is gone and the job ends after it.
+    assert!(eventually(Duration::from_secs(6), || env.state().held() == 0));
+    let at = sh.mark();
+    sh.send("echo typed-$((40+2))\n");
+    assert!(
+        sh.expect("typed-42", at, Duration::from_secs(3)),
+        "{:?}",
+        sh.text()
+    );
+    assert!(sh.alive(), "the interactive shell exited");
+}
+
+/// low_nested_run_timeout_misses: a nested run's descendant orphaned
+/// before the deadline (`(cmd &)`) is reparented away from the nested
+/// child, and ancestry lost it. On Linux muzzle adopts orphans as a
+/// subreaper, so the timeout still reaches it (D18 note).
+#[cfg(target_os = "linux")]
+#[test]
+fn nested_run_timeout_reaches_a_descendant_orphaned_before_the_deadline() {
+    let env = Env::new();
+    let leaked = env.file("leaked");
+    let script = format!(
+        r#""$MUZZLE" run --run-timeout 0.5 -- sh -c 'sh -c "(sleep 2; touch {l}) &"; sleep 10'; echo nested=$?; sleep 3"#,
+        l = leaked.display()
+    );
+    let out = env
+        .cmd(&["--", "sh", "-c", &script])
+        .env("MUZZLE", env!("CARGO_BIN_EXE_muzzle"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nested=124\n");
+    assert!(!leaked.exists(), "the orphan outlived the nested timeout");
 }

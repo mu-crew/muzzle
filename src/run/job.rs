@@ -7,10 +7,9 @@ use std::time::{Duration, Instant};
 use super::scope::{
     Sampler, cpu_weight, mb, scope_dir, scope_outcome, systemd_run_expands_env, unit_name,
 };
-use super::spawn::{Deadline, Target, exit_code, spawn_failed, supervise};
+use super::spawn::{Deadline, Fired, Target, exit_code, spawn_failed, supervise};
 use super::{Heartbeat, now_ms, scope_populated};
 use crate::cli::RunArgs;
-use crate::exit;
 use crate::proc::{self, Pid, StartTime};
 use crate::state::{Budget, EnforcedReason, Holder, Killed, ScopeProbe, Store};
 
@@ -96,25 +95,10 @@ impl Job<'_> {
                 "MUZZLE_HOLD",
                 format!("{}:{}:{}", self.ticket, self.me, self.my_start),
             );
-        // f-tcsetpgrp: a job in a group of its own is in the terminal's
-        // background, and reading the terminal stopped it on SIGTTIN for
-        // good. When muzzle's group is the foreground, the job's group takes
-        // it in `pre_exec` (after `process_group(0)`, before exec, so the
-        // first read already owns it) and gets it until it ends.
-        let tty = (!self.leader).then(proc::Terminal::open).flatten();
+        // D16: the new group is never given the terminal; a job that
+        // needs it is ended by `supervise` (see `terminal_stop`).
         if !self.leader {
             cmd.process_group(0);
-            if let Some(fd) = tty.as_ref().filter(|t| t.ours()).map(|t| t.fd()) {
-                // SAFETY: the hook only makes async-signal-safe syscalls.
-                unsafe {
-                    cmd.pre_exec(move || {
-                        // A terminal that refuses is no reason not to run.
-                        let _ = proc::Terminal::take_in_child(fd);
-                        Ok(())
-                    });
-                }
-                tty.as_ref().inspect(|t| t.mark_lent());
-            }
         }
         // D16a: until the path is known, a waiter in this pid namespace
         // finds the scope by scanning /proc, so the probe goes in at once.
@@ -127,7 +111,6 @@ impl Job<'_> {
         let child = match self.spawn_recorded(&mut cmd, enforced, reason, &scope, &probe)? {
             Ok(c) => c,
             Err(e) => {
-                tty.as_ref().inspect(|t| t.give_back());
                 return Ok(spawn_failed(&args.command[0], &e));
             }
         };
@@ -170,12 +153,7 @@ impl Job<'_> {
             &mut deadline,
             sampler.as_mut(),
             Some(&mut beat),
-            tty.as_ref(),
         )?;
-        // The top command is gone: the terminal goes back to the caller
-        // now, not after the grace or a keeper's wait, and the keeper must
-        // not inherit the fd.
-        drop(tty);
         deadline.drain(target, sampler.as_mut(), Some(&mut beat));
         let ran_s = started.elapsed().as_secs_f64();
         let mut ending = Ending {
@@ -183,10 +161,13 @@ impl Job<'_> {
             killed: None,
             exit: i32::from(exit_code(status)),
         };
-        if deadline.fired() {
-            ending.code = exit::RUN_TIMEOUT;
-            ending.exit = i32::from(exit::RUN_TIMEOUT);
-            ending.killed = Some(Killed::Timeout);
+        if let Some(why) = deadline.why {
+            ending.code = why.code();
+            ending.exit = i32::from(ending.code);
+            ending.killed = Some(match why {
+                Fired::Timeout => Killed::Timeout,
+                Fired::Terminal(_) => Killed::Signal,
+            });
         } else if status.signal().is_some() {
             ending.killed = Some(Killed::Signal);
         }

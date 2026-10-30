@@ -182,7 +182,7 @@ can kill the command before it starts. Use the flags:
 
 | flag | counts | on expiry |
 | --- | --- | --- |
-| `--run-timeout S` | from admission | the job's group (a nested run: its own process tree) gets SIGTERM, then SIGKILL after 10 s; exit 124 |
+| `--run-timeout S` | from admission | the job's group (a nested run: its own process tree; on macOS not a descendant orphaned before the deadline, which the outer claim still covers) gets SIGTERM, then SIGKILL after 10 s; exit 124 |
 | `--timeout S` | while queued | muzzle gives up, nothing runs; exit 75 |
 
 Waiting has no limit by default, and a progress line prints every 30 s.
@@ -295,9 +295,13 @@ group has no members left.
   wrapper. Put the pipe inside instead:
   `muzzle run --rule gate -- bash -c 'contrib/fast-gate 2>&1 | tail -50'`. It then starts the job in a new group of its own. **Killing the
   caller may leave the job running**, still holding its slots until it
-  exits. In an interactive terminal the job's group gets the terminal for
-  the run, so a job that reads it works, and Ctrl-Z and `fg` behave as
-  they would without muzzle. The npm `bin/muzzle` shim execs the binary for this reason (Node
+  exits. The job runs in the terminal's background: Ctrl-C and Ctrl-Z
+  reach the caller, and muzzle forwards Ctrl-C to the job. A job that
+  reads the terminal or changes its settings can't run like this, so
+  muzzle prints `muzzle: the command stopped waiting for the terminal…`,
+  ends the job (SIGTERM, SIGKILL after 10 s), frees its slots and exits
+  128 + the stop signal (149 for SIGTTIN). Run muzzle as the first
+  command, or give the job no terminal (`< /dev/null`). The npm `bin/muzzle` shim execs the binary for this reason (Node
   22.15 or later), and the pi extension calls the platform binary
   directly.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps

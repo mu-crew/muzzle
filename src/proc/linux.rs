@@ -41,6 +41,31 @@ pub(super) fn all_pids() -> io::Result<Vec<Pid>> {
         .collect())
 }
 
+pub(super) fn adopt_orphans() {
+    // SAFETY: plain syscall. A failure leaves orphans to init, as before.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+}
+
+pub(super) fn reap_adopted(keep: Pid) {
+    loop {
+        // SAFETY: a zeroed siginfo is valid; WNOWAIT only peeks, so `keep`
+        // is never reaped here.
+        let pid = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+            if libc::waitid(libc::P_ALL, 0, &mut info, flags) != 0 {
+                return;
+            }
+            info.si_pid()
+        };
+        if pid == 0 || pid == keep {
+            return;
+        }
+        // SAFETY: plain syscall on a child that has exited.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    }
+}
+
 pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     // Kernel threads sit in pgid 0 (269 on linuxpc); no real group is <= 0.
     if pgid <= 0 {
