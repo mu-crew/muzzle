@@ -203,6 +203,21 @@ fn wait_for(child: &mut Child, within: Duration) -> Option<ExitStatus> {
     }
 }
 
+/// low_sigint_test_fails_under_inherited_ign: muzzle keeps an inherited
+/// SIG_IGN (f-sigign), and `cargo test` launched in the background by a
+/// non-interactive shell, or under `trap '' INT`, ignores SIGINT. A test
+/// that sends SIGINT resets it in the child first.
+fn default_sigint(mut c: Command) -> Command {
+    // SAFETY: signal(2) is async-signal-safe; nothing else runs post-fork.
+    unsafe {
+        c.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    c
+}
+
 fn stderr_of(child: Child) -> String {
     let out = child.wait_with_output().unwrap();
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -350,15 +365,33 @@ fn sigkill_of_the_whole_group_kills_the_job_and_frees_the_slots() {
 ///
 /// f-flake-bounds: the heartbeat starts after scope setup (up to 2 s), so
 /// a fixed 3 s life recorded anywhere from 0 to 4 s on a loaded host. The
-/// kill waits for the first beat instead, and ran_s is bounded by the life
-/// the test measured: at least one beat (2 s), at most the kill.
+/// test waits for the first beat instead, then kills mid-period.
+///
+/// low_late_prune_loses_heartbeat_pin: it also pins `run::HEARTBEAT` (2 s),
+/// the most a pruned run under-records (admit.rs): the first beat lands
+/// within setup + one period, and ran_s is short of the life by at most one
+/// period. A 5 s beat fails the first bound, a 500 ms one passes both.
 #[test]
 fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
+    const HEARTBEAT_S: f64 = 2.0;
     let env = Env::new();
     let mut hog = env.hog("30");
     let start = env.state().holders[0].run_start_ms;
-    let beaten = || env.state().holders[0].seen_ms.is_some_and(|s| s > start);
+    let mut first = None;
+    let beaten = || {
+        first = env.state().holders[0].seen_ms.filter(|&s| s > start);
+        first.is_some()
+    };
     assert!(eventually(Duration::from_secs(10), beaten), "no heartbeat");
+    // Scope setup waits at most 2 s for systemd-run (scope_dir), then one
+    // period; 0.5 s more for the beat's own state write under load.
+    let first_s = (first.unwrap() - start) as f64 / 1000.0;
+    assert!(
+        first_s <= 2.0 + HEARTBEAT_S + 0.5,
+        "first beat at {first_s} s"
+    );
+    // Mid-period, so the last beat before the kill is not the first.
+    std::thread::sleep(Duration::from_millis(1000));
     kill(-(hog.id() as i32), libc::SIGKILL);
     let life = (now_ms() - start) as f64 / 1000.0;
     hog.wait().unwrap();
@@ -370,9 +403,10 @@ fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
     let ran = r["ran_s"].as_f64().unwrap();
     // The old bug recorded life + 4 s. Both ends are ms on one clock, and
     // the last beat came before the kill; 0.1 s covers a stepped clock.
+    // Below, 0.5 s covers the tick and state write between beats.
     assert!(
-        ran >= 1.9 && ran <= life + 0.1,
-        "ran_s {ran}, life {life}: {r}"
+        ran >= first_s && ran <= life + 0.1 && life - ran <= HEARTBEAT_S + 0.5,
+        "ran_s {ran}, life {life}, first beat {first_s}: {r}"
     );
 }
 
@@ -836,14 +870,16 @@ fn run_timeout_escalates_to_sigkill_after_the_grace() {
         .unwrap();
     let took = started.elapsed();
     assert_eq!(out.status.code(), Some(124), "{out:?}");
-    // The KILL lands at 0.5 + 10 s; with none, `sleep 30` runs out at 30 s.
-    // f-flake-bounds: the upper bound leaves 7.5 s for startup, scope setup
-    // and release on a loaded host (12 s flaked) and still tells the two.
-    assert!(
-        (Duration::from_secs(10)..Duration::from_secs(18)).contains(&took),
-        "{took:?}"
-    );
-    assert_eq!(env.runs()[0]["killed"], "timeout");
+    // With no KILL, `sleep 30` runs out at 30 s.
+    assert!(took < Duration::from_secs(25), "{took:?}");
+    // D18: the KILL lands at 0.5 + 10 s after the spawn. ran_s counts from
+    // the spawn, so startup and release on a loaded host stay out of it
+    // (low_escalation_bound_18_s_no_longer_pins: 10.64 s over 5 runs at
+    // load ~3.5). 2 s of slack still fails a 12.5 s grace.
+    let r = &env.runs()[0];
+    let ran = r["ran_s"].as_f64().unwrap();
+    assert!((10.4..12.5).contains(&ran), "{r}");
+    assert_eq!(r["killed"], "timeout");
 }
 
 #[test]
@@ -862,7 +898,7 @@ fn queue_timeout_exits_75_and_drops_the_ticket() {
 fn signal_while_queued_prints_d19_and_drops_the_ticket(sig: i32) {
     let env = Env::new();
     let mut hog = env.hog("30");
-    let mut waiter = env.cmd(&["--", "true"]).spawn().unwrap();
+    let mut waiter = default_sigint(env.cmd(&["--", "true"])).spawn().unwrap();
     assert!(eventually(Duration::from_secs(5), || waiters(&env) == 1));
     kill(waiter.id() as i32, sig);
     let status = wait_for(&mut waiter, Duration::from_secs(2)).unwrap();
@@ -1373,7 +1409,10 @@ fn container_job_outlives_a_graceful_stop(stop: &str) {
         args.extend(["--run-timeout", "0.5"]);
     }
     args.extend(["--", "podman", "exec", "box", "sleep", "3"]);
-    let mut gate = env.leader(&args).env("PATH", &path).spawn().unwrap();
+    let mut gate = default_sigint(env.leader(&args))
+        .env("PATH", &path)
+        .spawn()
+        .unwrap();
     assert!(eventually(Duration::from_secs(5), || env
         .file("entered")
         .exists()));
