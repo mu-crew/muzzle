@@ -131,6 +131,10 @@ fn commands_get_their_rule() {
         ("bash -n contrib/gate", None),
         ("bash -n contrib/PKGBUILD contrib/gate", None),
         ("sh -en scripts/check.sh", None),
+        // dash and ash take `-o`'s name from the next word, so `-on errexit`
+        // is `-n` and nothing runs (review low_glued_o_name_applied_to_dash_ash).
+        ("dash -on errexit contrib/gate", None),
+        ("ash -on errexit contrib/gate", None),
         // Refuter 5 / R3: a variable program.
         (
             "D=\"distrobox enter b --\"; $D bash -c 'contrib/gate'",

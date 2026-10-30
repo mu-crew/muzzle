@@ -805,11 +805,13 @@ const BASH_LONG_ARGS: [&str; 2] = ["rcfile", "init-file"];
 /// dash rejects `-O`); in zsh `-O` is the CORRECT_ALL flag. In a cluster
 /// each such letter takes one word in turn, so `bash -co pipefail 'x'`
 /// runs `x`. Long options ([`BASH_LONG_FLAGS`], [`BASH_LONG_ARGS`]) match
-/// whole words first. zsh (and the other non-bash shells) take an option
-/// name glued on, `-opipefail`, `-xonomatch`: the rest of the word after
-/// `o` is its argument, not more flags, and the word consumes only itself
-/// (zsh 5.9 runs `zsh -f -opipefail -c x`; bash rejects `-opipefail`, so
-/// bash keeps taking the next word). `--` or `-` ends options. One reader
+/// whole words first. Only zsh takes an option name glued on,
+/// `-opipefail`, `-xonomatch`: the rest of the word after `o` is its
+/// argument, not more flags, and the word consumes only itself (zsh 5.9
+/// runs `zsh -f -opipefail -c x`). bash, dash and busybox ash reject
+/// `-oerrexit` and take the next word (`dash -oc errexit 'x'` runs `x`,
+/// measured on ubuntu:24.04 dash and busybox ash); ksh is unmeasured and
+/// keeps the next word too. `--` or `-` ends options. One reader
 /// for both the `-c` script (rules and D16a container detection) and R1.1's script
 /// file, so the two can't drift again.
 pub(super) fn shell_args<'a>(shell: &str, words: &'a [String]) -> ShellArgs<'a> {
@@ -832,7 +834,7 @@ pub(super) fn shell_args<'a>(shell: &str, words: &'a [String]) -> ShellArgs<'a> 
             _ if w.len() > 1 && w.starts_with(['-', '+']) => {
                 let mut opts = &w[1..];
                 let mut takes = None;
-                if arg_letters == ['o']
+                if base(shell) == "zsh"
                     && let Some(i) = opts.find('o')
                     && i + 1 < opts.len()
                 {
@@ -994,6 +996,12 @@ mod tests {
             ("zsh -xopipefail -c 'cargo test'", Some("cargo test")),
             ("zsh -onomatch -c 'cargo test'", Some("cargo test")),
             ("bash -opipefail -c 'cargo test'", None),
+            // dash and ash take the next word, like bash (review
+            // low_glued_o_name_applied_to_dash_ash).
+            ("dash -oc errexit 'cargo test'", Some("cargo test")),
+            ("ash -oc errexit 'cargo test'", Some("cargo test")),
+            ("dash -ox errexit -c 'cargo test'", Some("cargo test")),
+            ("dash -oerrexit -c 'cargo test'", None),
             ("sh -O extglob -c 'cargo test'", Some("cargo test")),
             ("/bin/bash -O extglob -c 'cargo test'", Some("cargo test")),
         ] {
@@ -1032,6 +1040,8 @@ mod tests {
             "bash -login -c 'podman exec box true'",
             "zsh -O -c 'podman exec x ls'",
             "zsh -opipefail -c 'podman exec x cargo test'",
+            "ash -ox errexit -c 'podman exec box true'",
+            "dash -oc errexit 'podman exec box true'",
         ] {
             assert!(text_enters(cmd), "{cmd}");
         }
