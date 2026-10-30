@@ -33,7 +33,7 @@ include = ["machine.toml"]     # per-machine file, merged after this one if it e
 
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 3
 
 [path."~/hacking/crew"]         # this directory's repos and their worktrees

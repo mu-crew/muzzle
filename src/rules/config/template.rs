@@ -6,10 +6,23 @@ use std::path::{Path, PathBuf};
 /// The commented template written on first run. Its live rules are the
 /// defaults muzzle uses when the file is missing (spec §Config).
 pub const TEMPLATE: &str = r#"# muzzle config (spec: github.com/mu-crew/muzzle).
-# A command that matches no rule runs without a claim. Patterns are `regex`
-# crate syntax, matched against the whole shell string; the first match wins.
+# A command that matches no rule runs without a claim; the first match wins.
 # `name` is required and is the label in status, reports and runs.jsonl:
 # keep it when the pattern changes.
+#
+# `command` names a program and, optionally, subcommand words. It matches
+# the program in command position anywhere in the text: after `;`, `&&` or
+# `|`, inside `bash -c '...'`, past `env`, `timeout`, `nice`, `A=1`, and
+# through `npx`, `uv run`, `mise exec --`, `flock`, `distrobox enter`,
+# `toolbox run` and `podman|docker exec`. Option words such as `--locked`
+# or `+nightly` are skipped; a word ending in `*` matches by prefix. A
+# quoted argument, a heredoc or a comment is never a command:
+# `grep 'cargo test'` matches nothing. `contrib/gate` also matches
+# `./contrib/gate` and `/abs/repo/contrib/gate`.
+#
+# The escape hatch is `match = '<regex>'` instead of `command`: `regex`
+# crate syntax over the whole shell string, for shapes that aren't a
+# command word. A rule sets one of the two.
 
 reserve = 2            # budget = logical cores - reserve
 # slots = 12           # explicit budget; overrides reserve
@@ -20,30 +33,30 @@ reserve = 2            # budget = logical cores - reserve
 
 [[rule]]
 name  = "gate"
-match = 'contrib/(fast-)?gate'
+command = ["contrib/gate", "contrib/fast-gate"]
 slots = 6
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 2
 [[rule]]
 name  = "js-test"
-match = '\b(vitest|npm (run )?test)\b'
+command = ["vitest", "npm test", "npm run test*"]
 slots = 2
 
 # Path tables: a directory and everything under it. A command's target is
 # the repo of its cwd (the main checkout, so every worktree of a repo gets
 # the same rules), else the cwd. Tables apply from the outermost to the
 # nearest. An entry naming a rule in effect changes only the fields it sets;
-# a new name is a new rule (it needs `match`), tried before inherited ones.
+# a new name is a new rule (it needs `command`), tried before inherited ones.
 #
 # [path."~/hacking/crew"]
 # [[path."~/hacking/crew".rule]]
 # name  = "cargo-test"
-# slots = 3            # reweight only; match inherited
+# slots = 3            # reweight only; command inherited
 # [[path."~/hacking/crew".rule]]
 # name  = "oracle-sweep"
-# match = 'oracle-sweep'
+# command = "oracle-sweep"
 # slots = 999          # capped to the budget
 # # class = "high"
 # # enabled = false    # takes a rule out of matching under this path

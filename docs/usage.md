@@ -16,20 +16,62 @@ reserve = 2            # budget = logical cores - reserve
 
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 2
 ```
 
 - `name` is the label in `status`, reports and `runs.jsonl`. Keep it when
   you change the pattern, so history stays comparable.
-- Patterns are `regex` crate syntax matched against the whole shell string,
-  with no shell parsing. The first match wins.
+- The first rule that matches wins. `command` is described below; `match`
+  is the regex escape hatch.
 - A claim above the budget is capped to the whole budget, so the job runs
   alone. That replaces exclusive lock files.
-- An unknown key or a bad pattern exits 2 and names it, and the file it is
+- An unknown key, a bad pattern, or a rule with both or neither of
+  `command` and `match` exits 2 and names it, and the file it is
   in.
 - `muzzle doctor` shows the config's rule count, path tables, includes and
   hash. Each run records the hash, so reports can split by config.
+
+### Command rules
+
+`command = "<words>"`, or a list of them, names a program and optionally
+its subcommand words. muzzle tokenises the shell text and tries every
+simple command in it:
+
+- Commands after `;`, `&&`, `|`, in `$( )` and backticks, and inside
+  `bash -c '…'` (any shell, any `-lc` style flags) all count.
+- Assignments (`A=1`), keywords and wrappers are skipped first: `env`,
+  `time`, `timeout [opts] N`, `nice`, `nohup`, `exec`, `npx [opts]`,
+  `uv run [opts]`, `mise exec [opts] --`, and `flock [opts] <lock>` (or
+  its `-c '…'` script).
+- Container entry descends: the command after `distrobox enter … --`,
+  `toolbox run [-c box]` or `podman|docker exec [opts] <ctr>` is matched
+  too. The job still counts as a container job.
+- A `$VAR` as the program is stepped over. A script program (`x.sh`, or
+  `bash file` with no `-c`) matches as itself, and its arguments are tried
+  as a command and as shell text: `dbx.sh 2400 "contrib/gate | tail"`
+  matches `contrib/gate`.
+- The program matches a word that equals it or ends in `/<program>`:
+  `contrib/gate` matches `./contrib/gate` and `/abs/repo/contrib/gate`;
+  `cargo` matches `/usr/bin/cargo`.
+- Each subcommand word must equal the next word that doesn't start with
+  `-` or `+`, so `cargo +nightly test` and `cargo --locked test` match
+  `cargo test`. Extra words after the pattern are fine. `cargo -C dir`,
+  `npm --prefix dir` and `npm -w pkg` skip the option's argument too.
+- A pattern word ending in `*` matches by prefix: `npm run test*` matches
+  `npm run test:fast`. There is no other glob syntax.
+
+Quoted arguments, heredoc bodies and comments are never command words, so
+`pgrep -f 'contrib/gate'`, `cat contrib/gate` and `echo "cargo test"`
+claim nothing.
+
+**The escape hatch:** `match = '<regex>'` instead of `command`. It is
+`regex` crate syntax over the whole shell string, with no shell parsing,
+so it also hits commands that only mention the word. Use it for shapes
+that aren't a command word, such as `exec 9>>$L; flock 9`.
+[`bench/linuxpc-config.toml`](../bench/linuxpc-config.toml) has one.
+A rule sets exactly one of `command` and `match`. In a path table or an
+include, setting either replaces the inherited one.
 
 ### Weights per repo: path tables
 
@@ -39,13 +81,13 @@ table changes rules for a directory and everything under it:
 ```toml
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 3
 
 [path."~/hacking/crew"]
 [[path."~/hacking/crew".rule]]
 name  = "cargo-test"
-slots = 2              # only the weight changes; match is inherited
+slots = 2              # only the weight changes; command is inherited
 
 [path."~/hacking/crew/murmur"]
 [[path."~/hacking/crew/murmur".rule]]
@@ -53,7 +95,7 @@ name    = "cargo-test"
 enabled = false        # no claim for cargo in this repo
 [[path."~/hacking/crew/murmur".rule]]
 name  = "js-test"      # a new rule, only here
-match = '\b(vitest|npm (run )?test)\b'
+command = ["vitest", "npm test", "npm run test*"]
 slots = 2
 ```
 
@@ -64,9 +106,9 @@ slots = 2
   components: `~/hacking/crew` does not cover `~/hacking/crewmate`. A
   table can't target a subdirectory inside a repo.
 - Tables apply from the outermost key to the nearest. An entry whose
-  `name` is already in effect changes only the fields it sets (`match`,
-  `slots`, `class`, `enabled`). A new name is a new rule: it must set
-  `match`, and it is tried before the inherited rules.
+  `name` is already in effect changes only the fields it sets (`command`
+  or `match`, `slots`, `class`, `enabled`). A new name is a new rule: it
+  must set `command` (or `match`), and it is tried before the inherited rules.
 - `enabled = false` turns a rule off for that subtree. A deeper table can
   set `enabled = true` again.
 - `reserve` and `slots` (the budget) can't go in a path table.
@@ -85,7 +127,7 @@ include = ["machine.toml"]   # relative to this file; ~ works
 
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 2
 ```
 
@@ -100,15 +142,14 @@ slots = 4              # this machine's global weight
 - Includes are merged after the root, in list order. `reserve` and `slots`
   replace the root's. A global rule with a name already in effect changes
   only the fields it sets; a new name is appended to the global list and
-  must set `match`. Path
+  must set `command` (or `match`). Path
   tables with the same directory merge by rule name.
 - A missing include is skipped, and `doctor` lists it as `not found`. Any
   other read, parse or validation error exits and names the file.
 - An included file can't set `include` itself.
 
-A pattern that matches anywhere also matches commands that only mention
-the gate: a heredoc, a `grep`, a poll of its log. Anchor the command word
-in command position. [`bench/linuxpc-config.toml`](../bench/linuxpc-config.toml)
+Check a rule with `muzzle match -- '<command>'` on both a real call and a
+poll of it. [`bench/linuxpc-config.toml`](../bench/linuxpc-config.toml)
 has worked examples, and
 [tune.md](../npm/muzzle/skills/muzzle/recipes/tune.md) covers the loop for
 changing weights.
@@ -219,11 +260,16 @@ snippets in [docs/harnesses/](harnesses/README.md).
 need `permissionDecision: "allow"` to rewrite a command, so `muzzle hook
 codex` approves every matched call, compound commands included:
 `cargo build && curl … | sh` matches a cargo rule. `muzzle hook claude`
-sends `allow` only for one simple command whose matched pattern starts at
-its command word (after assignments and `env`, `time`, `timeout [opts] N`
-or `nice`). A compound command, or a pattern found only in an argument or
-a comment (`echo cargo test`, `rm -rf ~/x # cargo test`), goes to Claude's
-own permission check. Keep `Bash(muzzle run:*)` out of Claude's
+sends `allow` only for one simple command whose own command word (after
+assignments and `env`, `time`, `timeout [opts] N` or `nice`) is the
+rule's program, or `./` plus it, followed by its subcommand words. A
+path elsewhere doesn't count (`/tmp/evil/cargo test`), and neither does
+a match through a wrapper, a container, a script or a variable
+(`npx vitest run`, `mise exec -- cargo test`): those are wrapped, and the
+decision is left to Claude. For a `match` rule, the regex must match at
+the command word. A compound command, or a pattern found only in an
+argument or a comment (`echo cargo test`, `rm -rf ~/x # cargo test`),
+goes to Claude's own permission check. Keep `Bash(muzzle run:*)` out of Claude's
 allow rules, which would approve every wrapped string.
 
 ## Limits

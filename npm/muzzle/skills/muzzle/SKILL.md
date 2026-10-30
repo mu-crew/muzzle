@@ -85,7 +85,7 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 - **Light commands run without muzzle**: status checks, reads, `git`, a
   quick script. Leave them unwrapped when wrapping by hand; a command that
   matches no rule never queues. If muzzle claims slots for a command that
-  only names a gate (a `grep`, a heredoc), the rule pattern is too loose.
+  only names a gate (a `grep`, a heredoc), the rule is a loose `match` regex.
   Fix the config ([tune.md](recipes/tune.md), step 3) rather than working
   around it per call.
 
@@ -117,14 +117,21 @@ include = ["machine.toml"]
 
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 3
 
 [path."~/hacking/crew"]
 [[path."~/hacking/crew".rule]]
 name  = "cargo-test"
-slots = 2              # reweight only; match is inherited
+slots = 2              # reweight only; command is inherited
 ```
+
+`command` names a program and its subcommand words, and matches it in
+command position anywhere in the text: after `&&` or `|`, inside
+`bash -c '…'`, past `env`, `timeout`, `npx`, `mise exec --`, and through
+`distrobox enter … --`. A `grep`, a quoted argument or a heredoc never
+matches. `match = '<regex>'` is the escape hatch for shapes that aren't a
+command word (`docs/usage.md` in the muzzle repo has the full rules).
 
 There is no discovery mode. To set muzzle up on a machine, write the rules
 from the heavy commands you know, check them with `muzzle match`, and tune

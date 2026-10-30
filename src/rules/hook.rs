@@ -304,12 +304,16 @@ mod tests {
             "./evil.sh cargo build",
             "env -S 'rm -rf x' cargo test",
             "timeout 5 bash -c 'rm x' -- cargo test",
-            "'cargo' test",
         ];
         // The reviewer's repros per config: each matches a rule there, so
-        // the no-decision check below isn't vacuous.
+        // the no-decision check below isn't vacuous. The template's
+        // `command` rules (0.2.1 C7) don't match an argument or a comment
+        // at all, so its matched repros are the script and shell words.
+        for cmd in &repros[..3] {
+            assert_eq!(claude(cmd, &config()), json!({}), "template: {cmd}");
+        }
         for (name, c, matched) in [
-            ("template", config(), &repros[..3]),
+            ("template", config(), &repros[5..7]),
             ("linuxpc", linuxpc_config(), &repros[3..5]),
         ] {
             for cmd in matched {
@@ -329,6 +333,9 @@ mod tests {
                 "timeout -s KILL 600 cargo test",
                 "/usr/bin/time -v cargo clippy",
                 "cargo test -- 'a&&b'",
+                // Quoting doesn't change the word bash runs: a `command`
+                // rule (R5) sees `cargo`; a `match` regex misses it.
+                "'cargo' test",
             ] {
                 let r = claude(cmd, &c);
                 // linuxpc's anchors skip `timeout N` but not every option

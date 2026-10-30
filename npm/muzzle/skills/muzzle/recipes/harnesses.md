@@ -97,7 +97,9 @@ harness doesn't ask you. muzzle's rules match anywhere in the string, so
   process substitution or subshell outside quotes) whose matched pattern
   starts at the command word, after assignments and `env`, `time`,
   `timeout [opts] N` or `nice`. A match in an argument or a comment
-  (`echo cargo test`, `rm -rf ~/x # cargo test`) doesn't count. Anything
+  (`echo cargo test`, `rm -rf ~/x # cargo test`) doesn't count, nor, for a
+  `command` rule, a program path elsewhere (`/tmp/evil/cargo`) or a match
+  through a wrapper or container (`npx vitest run`). Anything
   else is rewritten with no decision, so
   Claude's own check runs on `muzzle run … -- bash -c '…'`, and since your
   `Bash(cargo build:*)` rules don't match that form, it prompts.

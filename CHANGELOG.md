@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+
+Rules that match command words (spec
+`docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`). Additive: every
+0.2.0 config still loads.
+
+- **`command` rules.** `command = "cargo test"` or a list of them names a
+  program and its subcommand words. muzzle tokenises the shell text and
+  matches the program in command position: after `;`, `&&` and `|`, in
+  `$( )`, inside `bash -c '…'`, past assignments, `env`, `timeout`, `nice`,
+  `nohup`, and through `npx`, `uv run`, `mise exec --`, `flock` and
+  container entry (`distrobox enter … --`, `toolbox run`,
+  `podman|docker exec`). Option words are skipped (`cargo +nightly test`
+  matches `cargo test`), a word ending in `*` matches by prefix, a
+  `$VAR` program is stepped over, and a script's arguments are tried as
+  commands. Quoted arguments, heredocs and comments never match, so polls
+  such as `pgrep -f 'contrib/gate'` claim nothing.
+- `match = '<regex>'` stays, as the escape hatch. A rule sets exactly one
+  of `command` and `match` (both, or neither on a new rule, exits 2); in a
+  path table or include, setting either replaces the inherited one.
+- The config hash covers `command` (whitespace normalised, a single string
+  as a one-element list). Switching a rule between `command` and `match`
+  changes the hash.
+- The template, `bench/linuxpc-config.toml`, the skill, `tune.md`, README
+  and usage use `command` rules.
+
+Changed:
+
+- **`muzzle hook claude` approves fewer calls.** For a `command` rule it
+  sends `allow` only when the one simple command's own word is the rule's
+  program (or `./` plus it) followed by its subcommand words. A program
+  path elsewhere (`/tmp/evil/cargo`) and a match through a wrapper,
+  container, script or variable are wrapped but left to Claude's
+  permission check. **`npx vitest run` loses auto-allow**, as do
+  `mise exec -- …` and `distrobox enter … -- …`.
+
 ## 0.2.0
 
 Per-repo weights, a shared config with a machine file, and a run log that

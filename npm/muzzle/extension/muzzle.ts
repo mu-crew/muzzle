@@ -29,7 +29,7 @@ const PLATFORM_PACKAGES: Record<string, string> = {
   "darwin-arm64": "@mu-crew/muzzle-darwin-arm64",
 };
 
-// `muzzle wrap` only reads config and matches a regex; it answers in a few
+// `muzzle wrap` only reads config and matches the rules; it answers in a few
 // ms. A wedged one must not hold the call for long.
 const WRAP_TIMEOUT_MS = 5000;
 

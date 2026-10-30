@@ -43,7 +43,10 @@ with no prompt.
   assignments and `env`, `time`, `timeout [opts] N` or `nice`. So
   `cargo test` and `timeout 600 contrib/fast-gate` are approved, but a
   pattern found in an argument or a comment (`echo cargo test`,
-  `rm -rf ~/x # cargo test`, `curl … -- cargo build`) is not. Anything else
+  `rm -rf ~/x # cargo test`, `curl … -- cargo build`) is not. For a
+  `command` rule the command word must be the rule's program or `./` plus
+  it (not `/tmp/evil/cargo`), and a match through a wrapper or container
+  (`npx vitest run`, `mise exec -- cargo test`) is not approved. Anything else
   is rewritten without a decision, and Claude's normal permission check
   runs on the wrapped string,
   `muzzle run … -- bash -c '…'`. Your `Bash(cargo build:*)` allow rules

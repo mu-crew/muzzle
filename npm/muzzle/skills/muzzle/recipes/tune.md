@@ -14,9 +14,10 @@ There is no discovery mode. Start from what you know:
 
 1. List the heavy commands agents run here: gates, `cargo test`, `npm test`,
    e2e suites. museum helps (step 2).
-2. Write a rule for each, in the shared file, with a weight from the
-   command's usual job cap (`CARGO_BUILD_JOBS=4` means 4). Check each
-   pattern with `muzzle match -- 'contrib/gate --full'`.
+2. Write a `command` rule for each, in the shared file, with a weight
+   from the command's usual job cap (`CARGO_BUILD_JOBS=4` means 4):
+   `command = "contrib/gate"`, `command = ["cargo test", "cargo build"]`.
+   Check each pattern with `muzzle match -- 'contrib/gate --full'`.
 3. Put this machine's budget and weights in an untracked `machine.toml` next
    to it (layout in step 3), so one shared file serves every machine.
 4. Run real work for a day or two, then start the loop at step 1.
@@ -87,7 +88,7 @@ Check a candidate against the live config with
 matches`.
 
 Heavy work inside a script (`./run.sh`, `python3 /tmp/x.py`) matches no
-rule, because muzzle only sees the script's name. A high unclaimed load
+rule, because muzzle only sees the script's name and arguments. A high unclaimed load
 with no unmatched commands in museum usually means this. The fix is
 wrapping such scripts with `muzzle run --rule cargo-test -- ./run.sh`
 (SKILL.md), not a rule for every script name.
@@ -105,13 +106,13 @@ include = ["machine.toml"]
 
 [[rule]]
 name  = "cargo-test"
-match = '\bcargo (test|nextest|clippy|build)\b'
+command = ["cargo test", "cargo nextest", "cargo clippy", "cargo build"]
 slots = 3
 
 [path."~/hacking/swayward-wm"]          # every repo under here, every worktree
 [[path."~/hacking/swayward-wm".rule]]
 name  = "cargo-test"
-slots = 6                               # reweight only; match inherited
+slots = 6                               # reweight only; command inherited
 ```
 
 ```toml
@@ -137,14 +138,13 @@ slots = 4                               # this machine's global weight
   is the `try N` value, and step 5 decides whether it stays.
 - **New rules**: give each a `name`. The name is the label in reports and
   history, so keep it when the pattern changes.
-- **False positives**: a pattern that matches anywhere in the string also
-  claims slots for commands that only *mention* the gate: a heredoc, a
-  `grep`, a `pgrep -f` poll, a `cat` of the script. A poll that claims
-  holds the gate's slots a second time while the real gate runs. Anchor the
-  command word in command position: start of the string, after `;`, `&`,
-  `|`, `(` or a newline, or just inside a `-c '…'` quote.
-  `bench/linuxpc-config.toml` in the muzzle repo has worked patterns.
-  Test both sides of the anchor:
+- **False positives**: a `command` rule matches only a command word, so a
+  heredoc, a `grep`, a `pgrep -f` poll or a `cat` of the script claims
+  nothing. A `match` regex (the escape hatch, for shapes that aren't a
+  command word) hits anywhere in the string, and a poll it claims holds
+  the gate's slots a second time while the real gate runs. Prefer
+  `command`; `bench/linuxpc-config.toml` in the muzzle repo has worked
+  rules. Test a real call and a poll:
 
   ```sh
   muzzle match -- 'cd repo && contrib/fast-gate'
@@ -224,7 +224,7 @@ date.
 ```toml
 [[rule]]
 name  = "cargo-test"
-match = '…'
+command = "cargo test"
 slots = 3
 # why: 4 -> 3, 2026-10-29: p90 cores 2.2 over 10 clean runs; run p50 22 -> 21 s at 3.
 ```
