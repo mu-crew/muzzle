@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0
 
 Per-repo weights, a shared config with a machine file, and a run log that
 keeps its history (spec `docs/specs/2026-10-30-muzzle-0.2-paths.md`).
