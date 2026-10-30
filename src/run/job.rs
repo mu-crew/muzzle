@@ -8,7 +8,7 @@ use super::scope::{
     Sampler, cpu_weight, mb, scope_dir, scope_outcome, systemd_run_expands_env, unit_name,
 };
 use super::spawn::{Deadline, Target, exit_code, spawn_failed, supervise};
-use super::{now_ms, scope_populated};
+use super::{Heartbeat, now_ms, scope_populated};
 use crate::cli::RunArgs;
 use crate::exit;
 use crate::proc::{self, Pid, StartTime};
@@ -143,8 +143,15 @@ impl Job<'_> {
             termed: None,
             killed: false,
         };
-        let (status, ru) = supervise(pid, target, &mut deadline, sampler.as_mut())?;
-        deadline.drain(target, sampler.as_mut());
+        let mut beat = Heartbeat::new(self.store, self.ticket);
+        let (status, ru) = supervise(
+            pid,
+            target,
+            &mut deadline,
+            sampler.as_mut(),
+            Some(&mut beat),
+        )?;
+        deadline.drain(target, sampler.as_mut(), &mut beat);
         let ran_s = started.elapsed().as_secs_f64();
         let mut ending = Ending {
             code: exit_code(status),

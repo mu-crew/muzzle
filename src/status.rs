@@ -303,6 +303,7 @@ mod tests {
             probe: None,
             admit_load1: None,
             admit_held: None,
+            seen_ms: None,
             claim: claim(slots, Class::High, agent),
         }
     }

@@ -35,6 +35,12 @@ const POLL: Duration = Duration::from_millis(250);
 const TICK: Duration = Duration::from_millis(20);
 /// D13: one progress line on stderr every 30 s while queued.
 const PROGRESS: Duration = Duration::from_secs(30);
+/// ran_s_lag_followup: how often a running muzzle or keeper stamps its
+/// holder's `seen_ms`, so a run whose muzzle is SIGKILLed with its job ends
+/// within this of the truth when no waiter was polling. One locked, fsynced
+/// state write per running job per period; waiters already write every
+/// `POLL`, so this is 1/8 of one waiter's I/O.
+const HEARTBEAT: Duration = Duration::from_secs(2);
 /// D18: SIGTERM, then SIGKILL this much later.
 const KILL_GRACE: Duration = Duration::from_secs(10);
 /// `--expand-environment=` arrived in systemd 254. From then on systemd-run
@@ -70,6 +76,39 @@ fn take_signal() -> Option<i32> {
     match SIGNAL.swap(0, Ordering::SeqCst) {
         0 => None,
         s => Some(s),
+    }
+}
+
+/// Stamps the holder's `seen_ms` every [`HEARTBEAT`] (ran_s_lag_followup).
+/// Best effort: a failed write only makes a later prune's ran_s shorter.
+struct Heartbeat<'a> {
+    store: &'a Store,
+    ticket: u64,
+    next: Instant,
+}
+
+impl<'a> Heartbeat<'a> {
+    /// Admission stamped `seen_ms`, so the first beat is one period on.
+    fn new(store: &'a Store, ticket: u64) -> Self {
+        Heartbeat {
+            store,
+            ticket,
+            next: Instant::now() + HEARTBEAT,
+        }
+    }
+
+    fn beat(&mut self) {
+        if Instant::now() < self.next {
+            return;
+        }
+        self.next = Instant::now() + HEARTBEAT;
+        let _ = self.store.update(now_ms(), |s| {
+            let now = now_ms();
+            if let Some(h) = s.holder_mut(self.ticket) {
+                h.seen_ms = Some(now);
+            }
+            Ok(())
+        });
     }
 }
 
@@ -413,6 +452,7 @@ mod tests {
             probe: None,
             admit_load1: None,
             admit_held: None,
+            seen_ms: None,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,

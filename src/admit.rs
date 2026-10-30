@@ -86,6 +86,11 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
         .into_iter()
         .partition(|h| holds(h, live));
     state.holders = kept;
+    // ran_s_lag_followup: a holder still in use now is seen now, so the
+    // record of a later prune ends here rather than at that prune.
+    for h in &mut state.holders {
+        h.seen_ms = Some(now_ms);
+    }
     let records = dead
         .into_iter()
         .map(|h| holder_record(h, now_ms, budget))
@@ -137,16 +142,31 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         probe: None,
         admit_load1: None,
         admit_held: None,
+        seen_ms: Some(now_ms),
         claim,
     }
 }
 
 /// The muzzle or keeper was killed and a waiter pruned the entry: no exit
 /// status and no CPU figures, since nobody was left to collect them.
+///
+/// The run ends when the claim was last seen in use (`seen_ms`), never
+/// after this prune (ran_s_lag_followup: smoke_final recorded 75 s for a
+/// 20 s job when the end was the prune). The true end lies between the two,
+/// so ran_s is short by at most the gap between sightings: one poll (250
+/// ms) while anyone waits, else the owner's heartbeat (`run::HEARTBEAT`).
+/// A muzzle SIGKILLed with its job left running has no heartbeat, so with
+/// no waiter either the gap runs to the prune. A state file from before
+/// `seen_ms` ends at the prune, as before. These lines carry `killed:
+/// "holder"`, so `report` never counts them as clean (D30): they feed the
+/// machine figures (D41) but not run p50/p90 or suggestions.
 fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
+    let end_ms = h
+        .seen_ms
+        .map_or(now_ms, |s| s.clamp(h.run_start_ms, now_ms));
     RunRecord {
         v: 1,
-        end: rfc3339(now_ms),
+        end: rfc3339(end_ms),
         rule: h.claim.rule,
         slots: h.claim.slots,
         class: h.claim.class,
@@ -155,7 +175,7 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         cwd: h.claim.cwd,
         repo: h.claim.repo,
         waited_s: h.waited_s,
-        ran_s: now_ms.saturating_sub(h.run_start_ms) as f64 / 1000.0,
+        ran_s: end_ms.saturating_sub(h.run_start_ms) as f64 / 1000.0,
         exit: None,
         killed: Some(Killed::Holder),
         cpu_s: None,
@@ -401,6 +421,8 @@ mod tests {
         let t = push(&mut s, 2, Class::High, 0);
         let mut s = run(s, 1_000).state;
         let w = push(&mut s, 2, Class::Normal, 2_000);
+        // Its heartbeat saw it in use until just before the prune.
+        s.holders[0].seen_ms = Some(61_000);
         // pi's group kill: the muzzle and the whole group are gone.
         let mut live = all_alive(&s);
         live.procs.remove(&(t as u32 + 100, START));
@@ -417,6 +439,60 @@ mod tests {
         assert_eq!(r.budget, Some(2));
         assert_eq!(r.end, "1970-01-01T00:01:01Z");
         assert_eq!((r.load1, r.held), (None, None));
+    }
+
+    #[test]
+    fn a_pruned_holder_ends_when_it_was_last_seen_not_at_the_prune() {
+        // ran_s_lag_followup: admitted at 1 s, last seen in use at 21 s,
+        // pruned by a waiter that turned up at 76 s.
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let s = run(s, 1_000).state;
+        assert_eq!(s.holders[0].seen_ms, Some(1_000), "admission is a sighting");
+        let mut s = run(s, 21_000).state;
+        assert_eq!(
+            s.holders[0].seen_ms,
+            Some(21_000),
+            "a pass that keeps it sees it"
+        );
+        // The heartbeat goes past the last pass.
+        s.holders[0].seen_ms = Some(21_500);
+        let mut live = all_alive(&s);
+        live.procs.remove(&(t as u32 + 100, START));
+        live.groups.clear();
+        let out = admit(s, 76_000, &live);
+        let r = &out.records[0];
+        assert_eq!(r.ran_s, 20.5);
+        assert_eq!(r.end, "1970-01-01T00:00:21Z");
+        assert_eq!(r.killed, Some(Killed::Holder));
+    }
+
+    #[test]
+    fn a_holder_from_an_older_state_file_still_prunes_at_the_prune_time() {
+        let json = r#"{"v":1,"next_ticket":2,"holders":[{"ticket":1,"pid":5,
+            "start":6,"pgid":5,"run_start_ms":1000,"waited_s":0.0,"slots":2,
+            "class":"normal","cwd":"/w"}]}"#;
+        let s: State = serde_json::from_str(json).unwrap();
+        assert_eq!(s.holders[0].seen_ms, None);
+        let out = admit(s, 61_000, &Table::default());
+        assert!(out.state.holders.is_empty());
+        assert_eq!(out.records[0].ran_s, 60.0);
+    }
+
+    #[test]
+    fn a_seen_time_outside_the_run_is_clamped() {
+        let mut s = state(2);
+        let t = push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 10_000).state;
+        let mut live = all_alive(&s);
+        live.procs.remove(&(t as u32 + 100, START));
+        live.groups.clear();
+        // A clock stepped back, or a hand edit: never a negative run.
+        s.holders[0].seen_ms = Some(5_000);
+        assert_eq!(admit(s.clone(), 20_000, &live).records[0].ran_s, 0.0);
+        // Never past the prune.
+        s.holders[0].seen_ms = Some(99_000);
+        assert_eq!(admit(s, 20_000, &live).records[0].ran_s, 10.0);
     }
 
     #[test]

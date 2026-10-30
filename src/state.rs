@@ -134,6 +134,12 @@ pub struct Holder {
     pub admit_load1: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admit_held: Option<u32>,
+    /// Last time the claim was seen in use: set at admission, by every
+    /// `admit` pass that keeps the holder, and by the owning muzzle's or
+    /// keeper's heartbeat. A pruned holder's run ends here, not at the
+    /// prune (ran_s_lag_followup). `None` in a state file written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_ms: Option<u64>,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,

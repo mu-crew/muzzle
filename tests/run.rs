@@ -331,6 +331,26 @@ fn sigkill_of_the_whole_group_kills_the_job_and_frees_the_slots() {
     assert_eq!(runs[0]["slots"], 4);
 }
 
+/// ran_s_lag_followup: a holder SIGKILLed with its job and pruned much
+/// later records about its real life, not the wait for the prune
+/// (smoke_final: 75 s for a 20 s job). The heartbeat is 2 s, so a 3 s life
+/// records 2 to 3 s; the prune comes 4 s after the kill.
+#[test]
+fn a_late_prune_records_the_holders_life_not_the_prune_delay() {
+    let env = Env::new();
+    let mut hog = env.hog("30");
+    std::thread::sleep(Duration::from_millis(3000));
+    kill(-(hog.id() as i32), libc::SIGKILL);
+    hog.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(4000));
+    let out = env.cmd(&["--slots", "1", "--", "true"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let runs = env.runs();
+    let r = runs.iter().find(|r| r["killed"] == "holder").unwrap();
+    let ran = r["ran_s"].as_f64().unwrap();
+    assert!((1.9..3.6).contains(&ran), "ran_s {ran}: {r}");
+}
+
 /// rv020r_rotation_failure_wedges: an archive that can't be written (a
 /// directory where its temp file goes) neither fails the run nor, through
 /// the pruning waiter's append, wedges the host after a holder is killed.

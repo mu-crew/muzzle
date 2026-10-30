@@ -7,7 +7,7 @@ use anyhow::bail;
 use super::job::{Ending, Job};
 use super::scope::{Sampler, mb, scope_outcome};
 use super::spawn::Target;
-use super::{POLL, now_ms};
+use super::{Heartbeat, POLL, now_ms};
 use crate::proc::{self, Pid};
 use crate::state::Killed;
 
@@ -94,7 +94,9 @@ impl Job<'_> {
         if !matches!(owned, Ok(Some(()))) {
             return;
         }
+        let mut beat = Heartbeat::new(self.store, self.ticket);
         loop {
+            beat.beat();
             let others = target.others();
             match others.first() {
                 Some(&member) => {

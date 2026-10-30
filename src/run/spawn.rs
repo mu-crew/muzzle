@@ -11,7 +11,7 @@ use anyhow::Context;
 
 use super::report::{Times, repo_str, write_report};
 use super::scope::Sampler;
-use super::{KILL_GRACE, TICK, take_signal};
+use super::{Heartbeat, KILL_GRACE, TICK, take_signal};
 use crate::cli::RunArgs;
 use crate::exit;
 use crate::proc::{self, Pid};
@@ -121,7 +121,12 @@ impl Deadline {
     /// of `KILL_GRACE` from the SIGTERM before the SIGKILL. A `bash -c` top
     /// dies on TERM at once, and its children's TERM handlers (a gate
     /// cleaning up worktrees) would otherwise have no time at all.
-    pub(super) fn drain(&mut self, target: Target, mut sampler: Option<&mut Sampler>) {
+    pub(super) fn drain(
+        &mut self,
+        target: Target,
+        mut sampler: Option<&mut Sampler>,
+        beat: &mut Heartbeat,
+    ) {
         let Some(termed) = self.termed else { return };
         loop {
             let others = target.others();
@@ -139,18 +144,20 @@ impl Deadline {
             if let Some(s) = sampler.as_deref_mut() {
                 s.sample(member);
             }
+            beat.beat();
             std::thread::sleep(TICK);
         }
     }
 }
 
 /// Wait for the top command, forwarding signals, enforcing the deadline and
-/// sampling the scope. Returns its status and rusage once reaped.
+/// sampling the scope, and beating for the holder if there is one. Returns its status and rusage once reaped.
 pub(super) fn supervise(
     pid: Pid,
     target: Target,
     deadline: &mut Deadline,
     mut sampler: Option<&mut Sampler>,
+    mut beat: Option<&mut Heartbeat>,
 ) -> anyhow::Result<(ExitStatus, proc::Rusage)> {
     let started = Instant::now();
     while !exited(pid) {
@@ -160,6 +167,9 @@ pub(super) fn supervise(
         deadline.check(started, target);
         if let Some(s) = sampler.as_deref_mut() {
             s.sample(pid);
+        }
+        if let Some(b) = beat.as_deref_mut() {
+            b.beat();
         }
         std::thread::sleep(TICK);
     }
@@ -186,7 +196,7 @@ pub(super) fn run_nested(
         termed: None,
         killed: false,
     };
-    let (status, _) = supervise(pid, Target::Child(pid), &mut deadline, None)?;
+    let (status, _) = supervise(pid, Target::Child(pid), &mut deadline, None, None)?;
     let code = if deadline.fired() {
         exit::RUN_TIMEOUT
     } else {
