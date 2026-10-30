@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.2 (unreleased)
+## 0.1.2
 
 - `wrap`, `match` and `hook` leave a command that already runs muzzle
   alone by its first command word's basename, so `/abs/bin/muzzle run …`,
