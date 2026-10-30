@@ -353,6 +353,32 @@ impl Store {
         Ok(out)
     }
 
+    /// [`Store::update`] for a pass that ends runs: `f` also returns their
+    /// `runs.jsonl` lines, appended after the save and still under the lock
+    /// (rotation relies on it). After, so a failed save writes no line and
+    /// the next pass, finding the same holder, can't write it twice
+    /// (f-dup-prune-line); a crash between the two loses the line instead,
+    /// and the log is statistics, so at most once is the right side.
+    /// An append failure only warns: it must neither wedge the queue (a
+    /// pruning waiter's pass would roll back) nor replace a job's exit code
+    /// (f-append-wedge), as with rotation (rv020r_rotation_failure_wedges).
+    pub fn update_logged<T>(
+        &self,
+        now_ms: u64,
+        f: impl FnOnce(&mut State) -> anyhow::Result<(T, Vec<RunRecord>)>,
+    ) -> anyhow::Result<T> {
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        state.budget = state.live_budget(now_ms);
+        let (out, records) = f(&mut state)?;
+        state.updated_ms = now_ms;
+        self.save(&state)?;
+        if let Err(e) = crate::runlog::append(&self.dir, &records, now_ms) {
+            eprintln!("muzzle: {e:#}; the run line is lost, the queue goes on");
+        }
+        Ok(out)
+    }
+
     fn load(&self) -> anyhow::Result<State> {
         let path = self.state_path();
         // Bytes, not a String: a crash-torn file can hold invalid UTF-8,
@@ -473,6 +499,48 @@ mod tests {
         });
         assert!(err.is_err());
         assert_eq!(store.read().unwrap().next_ticket, 1);
+    }
+
+    fn record() -> RunRecord {
+        serde_json::from_value(serde_json::json!({
+            "v":1,"end":"2026-10-30T00:00:00Z","rule":null,"slots":1,"class":"high",
+            "cfg":null,"agent":null,"cwd":"/","waited_s":0.0,"ran_s":0.0,"exit":0,
+            "killed":"holder","cpu_s":null,"mem_peak_mb":null,"enforced":false,
+            "nested":false,"kept":false,"budget":4
+        }))
+        .unwrap()
+    }
+
+    /// f-dup-prune-line: a pass whose save fails writes no run line, so the
+    /// next pass, pruning the same holder again, writes the only one.
+    #[test]
+    fn a_failed_save_writes_no_run_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        fs::create_dir(dir.path().join("state.json.tmp")).unwrap();
+        let r = store.update_logged(1, |_| Ok(((), vec![record()])));
+        assert!(r.is_err());
+        assert!(!dir.path().join("runs.jsonl").exists());
+        fs::remove_dir(dir.path().join("state.json.tmp")).unwrap();
+        store
+            .update_logged(1, |_| Ok(((), vec![record()])))
+            .unwrap();
+        let log = fs::read_to_string(dir.path().join("runs.jsonl")).unwrap();
+        assert_eq!(log.lines().count(), 1);
+    }
+
+    /// f-append-wedge: an append that fails still saves the pass.
+    #[test]
+    fn a_failed_append_still_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        fs::create_dir(dir.path().join("runs.jsonl")).unwrap();
+        let t = store
+            .update_logged(1, |s| {
+                Ok((s.enqueue(1, 1, None, claim(1), 1), vec![record()]))
+            })
+            .unwrap();
+        assert_eq!(store.read().unwrap().waiters[0].ticket, t);
     }
 
     #[test]

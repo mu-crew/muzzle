@@ -114,7 +114,9 @@ impl Job<'_> {
     }
 
     /// Free the slots and append the run line, in one locked update.
-    /// Returns when, read under the lock (see `Times::released_ms`).
+    /// Returns when, read under the lock (see `Times::released_ms`). A
+    /// failed append only warns, so the job keeps its exit code
+    /// (f-append-wedge).
     pub(super) fn release(
         &self,
         ran_s: f64,
@@ -123,16 +125,18 @@ impl Job<'_> {
         mem_peak_mb: Option<u64>,
         kept: bool,
     ) -> anyhow::Result<u64> {
-        self.store.update(now_ms(), |s| {
+        self.store.update_logged(now_ms(), |s| {
             let now = now_ms();
             let budget = s.budget.map(|b| b.budget.max(1));
             let rec = self.record(ran_s, ending, cpu_s, mem_peak_mb, kept, budget);
             // A keeper whose entry was pruned (it was SIGSTOPped, say) has
             // already had its line written by the pruning waiter.
-            if s.remove(self.ticket) || !kept {
-                crate::runlog::append(self.store.dir(), &[rec], now)?;
-            }
-            Ok(now)
+            let lines = if s.remove(self.ticket) || !kept {
+                vec![rec]
+            } else {
+                Vec::new()
+            };
+            Ok((now, lines))
         })
     }
 
@@ -202,6 +206,7 @@ mod tests {
                 ram_per_slot: 1,
             },
             leader: true,
+            spawned: false,
         };
         let ending = Ending {
             code: 0,

@@ -39,7 +39,9 @@ impl Queue<'_> {
     /// lines, and report where this ticket stands.
     fn poll(&self) -> anyhow::Result<Poll> {
         let mut pruned = Vec::new();
-        let poll = self.store.update(now_ms(), |s| {
+        // f-append-wedge, f-dup-prune-line: the pruned holders' lines are
+        // appended after the save, and a failed append only warns.
+        let poll = self.store.update_logged(now_ms(), |s| {
             // Read under the lock: an admission's `run_start_ms` then never
             // precedes the release that freed its slots, and `--report`'s
             // `admitted_ms` can be compared with another run's `released_ms`.
@@ -61,9 +63,9 @@ impl Queue<'_> {
                 .filter(|(t, _)| !s.holders.iter().any(|h| h.ticket == *t))
                 .map(|(_, unit)| format!("{unit}.scope"))
                 .collect();
-            crate::runlog::append(self.store.dir(), &out.records, now)?;
+            let records = out.records;
             if let Some(h) = stamp_admission(s, self.ticket, || proc::loadavg().map(|l| l[0])) {
-                return Ok(Poll::Admitted(Box::new(h.clone()), budget));
+                return Ok((Poll::Admitted(Box::new(h.clone()), budget), records));
             }
             let queue = admit::queue(s);
             let Some(at) = queue.iter().position(|w| w.ticket == self.ticket) else {
@@ -71,11 +73,12 @@ impl Queue<'_> {
                 // one is running; a hand-edited state file is the only way.
                 bail!("ticket {} vanished from the queue", self.ticket);
             };
-            Ok(Poll::Waiting {
+            let waiting = Poll::Waiting {
                 position: at + 1,
                 of: queue.len(),
                 line: progress_line(s, at + 1, queue.len()),
-            })
+            };
+            Ok((waiting, records))
         });
         // A group SIGKILLed while systemd-run was still setting up the scope
         // (pi on Esc) leaves it `failed` with Result=resources, and nobody

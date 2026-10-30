@@ -401,12 +401,18 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         holder,
         budget,
         leader,
+        spawned: false,
     };
     match job.run(args, run_timeout) {
         Ok(code) => Ok(ExitCode::from(code)),
         Err(e) => {
-            // Whatever failed, the slots go back.
-            let _ = store.update(now_ms(), |s| Ok(s.remove(ticket)));
+            // Before spawn the slots go back. After it, the entry may be a
+            // keeper's or the job may still run: leave it to liveness, so a
+            // waiter prunes it once this muzzle and its group are gone (D16,
+            // f-keeper-handoff).
+            if !job.spawned {
+                let _ = store.update(now_ms(), |s| Ok(s.remove(ticket)));
+            }
             Err(e)
         }
     }

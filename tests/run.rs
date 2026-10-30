@@ -443,6 +443,62 @@ fn background_child_hands_off_to_a_keeper() {
     assert!(runs[0]["ran_s"].as_f64().unwrap() >= 1.8, "{}", runs[0]);
 }
 
+/// f-keeper-handoff (D16): a `--report` that can't be written, after the
+/// keeper took the entry, neither frees the keeper's claim nor loses its
+/// run line, and the job's own code passes through (§Exit codes).
+#[test]
+fn a_failing_report_after_the_handoff_leaves_the_keeper_its_claim() {
+    let env = Env::new();
+    let report = env.file("no/such/dir/r.json");
+    let out = env
+        .leader(&[
+            "--slots",
+            "2",
+            "--report",
+            report.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            "sleep 2 >/dev/null 2>&1 & exit 3",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("r.json"),
+        "the report error is reported: {err}"
+    );
+    let s = env.state();
+    assert_eq!(s.held(), 2, "the keeper still holds the slots: {s:?}");
+    assert!(s.holders[0].kept);
+    assert!(eventually(Duration::from_secs(5), || env.state().held() == 0));
+    let runs = env.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["kept"], true);
+    assert_eq!(runs[0]["exit"], 3);
+}
+
+/// f-append-wedge: with runs.jsonl unwritable, a waiter warns and still
+/// prunes a dead holder and is admitted, and a finished job keeps its own
+/// exit code.
+#[test]
+fn an_unwritable_runs_jsonl_warns_and_never_wedges_the_queue() {
+    let env = Env::new();
+    let mut hog = env.hog("30");
+    kill(-(hog.id() as i32), libc::SIGKILL);
+    hog.wait().unwrap();
+    std::fs::create_dir_all(env.state.join("muzzle/runs.jsonl")).unwrap();
+    let out = env
+        .cmd(&["--slots", "1", "--", "sh", "-c", "exit 3"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("appending to"), "{err}");
+    assert!(env.state().holders.is_empty(), "pruned and released");
+}
+
 #[test]
 fn keeper_survives_a_group_kill_and_releases_when_the_group_empties() {
     let env = Env::new();

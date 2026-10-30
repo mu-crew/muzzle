@@ -23,6 +23,10 @@ pub(super) struct Job<'a> {
     pub(super) holder: Holder,
     pub(super) budget: Budget,
     pub(super) leader: bool,
+    /// Set once the command is spawned. From then on only [`Job::release`]
+    /// or a pruning waiter, judging liveness, may free the entry: a keeper
+    /// may own it, or the job may still run (D16, f-keeper-handoff).
+    pub(super) spawned: bool,
 }
 
 /// How the top command ended, before anything was released.
@@ -99,6 +103,7 @@ impl Job<'_> {
                 return Ok(spawn_failed(&args.command[0], &e));
             }
         };
+        self.spawned = true;
         let pid = child.id() as Pid;
         let target = if self.leader {
             Target::GroupButMe {
@@ -116,7 +121,7 @@ impl Job<'_> {
             cgroup_ns: proc::namespace("cgroup"),
             pid_ns: proc::namespace("pid"),
         });
-        self.set_spawned(pgid, enforced, reason, &scope, &probe)?;
+        self.set_spawned(pgid, enforced, reason, &scope, &probe);
         let mut sampler = scoped.then(|| Sampler {
             unit: unit.clone(),
             dir: None,
@@ -135,7 +140,7 @@ impl Job<'_> {
                     .map(|r| format!("/{}", r.display()))
             });
             if p.cgroup.is_some() {
-                self.set_spawned(pgid, enforced, reason, &scope, &probe)?;
+                self.set_spawned(pgid, enforced, reason, &scope, &probe);
             }
         }
         let mut deadline = Deadline {
@@ -200,11 +205,19 @@ impl Job<'_> {
             }
             released_ms = Some(self.release(ran_s, &ending, Some(cpu_s), Some(mb(peak)), false)?);
         }
-        self.finish(args, ran_s, released_ms, &ending, enforced, kept)?;
+        // The job ran and its slots are settled, so its code stands: a
+        // `--report` that can't be written is muzzle's error, said on stderr,
+        // not the command's (spec §Exit codes, 2026-10-30 note).
+        if let Err(e) = self.finish(args, ran_s, released_ms, &ending, enforced, kept) {
+            eprintln!("muzzle: {e:#}");
+        }
         Ok(ending.code)
     }
 
     /// Store what spawn learnt in the holder entry and in `self.holder`.
+    /// Best effort: the job is already running, and giving up here would
+    /// leave it unsupervised while muzzle's exit freed its slots. Without
+    /// the pgid a waiter still sees this muzzle alive until the job ends.
     fn set_spawned(
         &mut self,
         pgid: u32,
@@ -212,7 +225,7 @@ impl Job<'_> {
         reason: Option<EnforcedReason>,
         scope: &Option<String>,
         probe: &Option<ScopeProbe>,
-    ) -> anyhow::Result<()> {
+    ) {
         let apply = |h: &mut Holder| {
             h.pgid = Some(pgid);
             h.enforced = enforced;
@@ -220,14 +233,15 @@ impl Job<'_> {
             h.scope = scope.clone();
             h.probe = probe.clone();
         };
-        self.store.update(now_ms(), |s| {
+        if let Err(e) = self.store.update(now_ms(), |s| {
             if let Some(h) = s.holder_mut(self.ticket) {
                 apply(h);
             }
             Ok(())
-        })?;
+        }) {
+            eprintln!("muzzle: recording the spawned job: {e:#}");
+        }
         apply(&mut self.holder);
-        Ok(())
     }
 
     /// D16a: a container run's scope still has processes (conmon and the

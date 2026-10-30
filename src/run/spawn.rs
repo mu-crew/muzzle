@@ -211,7 +211,7 @@ pub(super) fn run_nested(
             released_ms: None,
         };
         let repo = repo_str(std::env::current_dir().ok().as_deref());
-        write_report(
+        if let Err(e) = write_report(
             path,
             &t,
             None,
@@ -222,7 +222,10 @@ pub(super) fn run_nested(
             false,
             None,
             false,
-        )?;
+        ) {
+            // As for an admitted run: the command's code stands.
+            eprintln!("muzzle: {e:#}");
+        }
     }
     Ok(ExitCode::from(code))
 }
