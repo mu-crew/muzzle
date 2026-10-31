@@ -270,7 +270,7 @@ pub fn recent(dir: &Path) -> anyhow::Result<String> {
     load(&newest, live)
 }
 
-/// 0.3 S2: how many recent clean runs of a `(repo, rule)` its typical time
+/// 0.2.3 S2: how many recent clean runs of a `(repo, rule)` its typical time
 /// is taken over, and how many it needs before it has one.
 const TYPICAL_WINDOW: usize = 50;
 const TYPICAL_MIN_RUNS: usize = 10;
@@ -280,7 +280,7 @@ pub type RuleKey = (String, String);
 /// Each key's typical run time in whole seconds, from [`typical`].
 pub type Typical = HashMap<RuleKey, u64>;
 
-/// 0.3 S2, S5: the typical run time, in whole seconds, of each of `keys`:
+/// 0.2.3 S2, S5: the typical run time, in whole seconds, of each of `keys`:
 /// the nearest-rank p90 of `ran_s` over its last [`TYPICAL_WINDOW`] runs
 /// with `exit == 0` and no `killed`, read from the live `runs.jsonl` only.
 /// A key with fewer than [`TYPICAL_MIN_RUNS`] such runs is absent. Lines

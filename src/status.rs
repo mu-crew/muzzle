@@ -32,7 +32,7 @@ pub struct Status {
     pub enforced: bool,
     pub holders: Vec<HolderView>,
     pub waiting: Vec<WaiterView>,
-    /// Added fields (0.3 S4): how many holders and waiters are `slow`.
+    /// Added fields (0.2.3 S4): how many holders and waiters are `slow`.
     pub slow_holders: usize,
     pub slow_waiters: usize,
 }
@@ -54,7 +54,7 @@ pub struct HolderView {
     pub enforced: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enforced_reason: Option<EnforcedReason>,
-    /// Added fields (0.3 S2, S4): the p90 of this `(repo, rule)`'s recent
+    /// Added fields (0.2.3 S2, S4): the p90 of this `(repo, rule)`'s recent
     /// clean runs, or null without enough history; and whether `run_s` is
     /// past it and past [`SLOW_HOLDER_FLOOR_S`].
     pub typical_s: Option<u64>,
@@ -69,13 +69,13 @@ pub struct WaiterView {
     pub agent: Option<String>,
     pub rule: Option<String>,
     pub age_s: u64,
-    /// Added field (0.3 S3): queued at least [`SLOW_WAITER_S`].
+    /// Added field (0.2.3 S3): queued at least [`SLOW_WAITER_S`].
     pub slow: bool,
 }
 
-/// 0.3 S2: a holder under this is never slow, however short its history.
+/// 0.2.3 S2: a holder under this is never slow, however short its history.
 const SLOW_HOLDER_FLOOR_S: u64 = 60;
-/// 0.3 S3: when `run` prints its first queued line (D13).
+/// 0.2.3 S3: when `run` prints its first queued line (D13).
 const SLOW_WAITER_S: u64 = 30;
 
 /// The `(repo, rule)` of each holder that has both: what `main` asks
@@ -179,7 +179,7 @@ pub fn view(
 }
 
 impl Status {
-    /// 0.3 S2, S6: fills each holder's `typical_s` from `typical` and marks
+    /// 0.2.3 S2, S6: fills each holder's `typical_s` from `typical` and marks
     /// it slow past that and [`SLOW_HOLDER_FLOOR_S`]. Pure: `main` reads
     /// the history; `view` stays as it was.
     pub fn mark_slow(mut self, typical: &Typical) -> Status {
@@ -291,7 +291,7 @@ pub fn main(args: &StatusArgs) -> anyhow::Result<ExitCode> {
     };
     let store = Store::open_default()?;
     let state = store.read()?;
-    // 0.3 S5: history is best effort; without it nothing is slow.
+    // 0.2.3 S5: history is best effort; without it nothing is slow.
     let typical = runlog::typical(store.dir(), &holder_keys(&state)).unwrap_or_else(|e| {
         eprintln!("muzzle: {e:#} (status shows no typical times)");
         Typical::new()

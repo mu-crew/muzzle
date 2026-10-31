@@ -217,7 +217,7 @@ fn status_json_shows_live_holders_and_waiters() {
     kill_group(&mut human);
 }
 
-/// 0.3 S5/S6 end to end: `main` reads the holder's `(repo, rule)` history
+/// 0.2.3 S5/S6 end to end: `main` reads the holder's `(repo, rule)` history
 /// from `runs.jsonl` and `status --json` carries its typical time. The job
 /// runs under 60 s, so it is not slow yet.
 #[test]
