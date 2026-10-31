@@ -217,6 +217,46 @@ fn status_json_shows_live_holders_and_waiters() {
     kill_group(&mut human);
 }
 
+/// 0.3 S5/S6 end to end: `main` reads the holder's `(repo, rule)` history
+/// from `runs.jsonl` and `status --json` carries its typical time. The job
+/// runs under 60 s, so it is not slow yet.
+#[test]
+fn status_json_reads_typical_times_from_the_run_log() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.path("cwd/.git")).unwrap();
+    let repo = env.path("cwd").canonicalize().unwrap();
+    let dir = env.path("state/muzzle");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = |ran_s: u32| {
+        format!(
+            "{{\"v\":1,\"end\":\"2026-10-30T00:00:00Z\",\"rule\":\"gate\",\"slots\":1,\
+             \"class\":\"normal\",\"cfg\":null,\"agent\":null,\"cwd\":\"/\",\"repo\":{repo:?},\
+             \"waited_s\":0,\"ran_s\":{ran_s},\"exit\":0,\"killed\":null,\"cpu_s\":null,\
+             \"mem_peak_mb\":null,\"enforced\":false,\"nested\":false,\"kept\":false,\"budget\":4}}\n"
+        )
+    };
+    // 1..=11 s: nearest-rank p90 of 11 is the 10th.
+    std::fs::write(
+        dir.join("runs.jsonl"),
+        (1..=11).map(line).collect::<String>(),
+    )
+    .unwrap();
+    let mut job = env.run("orch", "high", "1", "gate");
+    assert!(eventually(Duration::from_secs(5), || {
+        env.store().read().unwrap().holders.len() == 1
+    }));
+    let v = env.json(&["status", "--json"]);
+    let h = &v["holders"][0];
+    assert_eq!(h["repo"].as_str(), repo.to_str(), "{v}");
+    assert_eq!(h["typical_s"], 10, "{v}");
+    assert_eq!(h["slow"], false, "{v}");
+    assert_eq!(
+        (&v["slow_holders"], &v["slow_waiters"]),
+        (&Value::from(0), &Value::from(0))
+    );
+    kill_group(&mut job);
+}
+
 #[test]
 fn status_with_no_state_reports_this_hosts_budget() {
     let env = Env::new();

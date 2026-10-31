@@ -214,6 +214,12 @@ run …` survives a hangup.
 - `muzzle status` shows the budget, the holders (agent, rule, slots, run
   time, pid) and the queue. `--json` is a stable interface: fields are only
   ever added.
+- `status` marks a job **slow** when it has run past the p90 of its last
+  50 clean runs in the same repo and rule (it needs 10 to have one), and
+  for at least 60 s. A waiter is slow after 30 s in the queue. `--json`
+  carries `typical_s` and `slow` per holder, `slow` per waiter, and
+  `slow_holders` and `slow_waiters` overall. The mu-crew tmux pill shows
+  these counts.
 - `muzzle doctor` checks the budget, enforcement, the state directory, the
   config, the run log and each harness's setup. Exit 0 means usable, even
   when only advisory.

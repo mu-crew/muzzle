@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (0.3)
+
+Spec: `docs/specs/2026-10-31-muzzle-0.3-slow-status.md`.
+
+Added:
+
+- **`status` shows slow jobs.** A holder is slow once it has run longer
+  than the p90 of its `(repo, rule)`'s last 50 clean runs (given at least
+  10) and at least 60 s; a waiter once queued 30 s. `status --json` adds `typical_s` and `slow`
+  per holder, `slow` per waiter, and top-level `slow_holders` and
+  `slow_waiters`. Typical times come from the live `runs.jsonl` only, read
+  when someone holds slots.
+
 ## 0.2.2
 
 Fixes from a review panel (2026-10-30). Spec notes dated 2026-10-30 in

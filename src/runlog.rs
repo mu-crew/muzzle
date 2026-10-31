@@ -21,7 +21,7 @@
 //! one stderr line and the append still happens, because the append runs
 //! under the state lock inside a prune and failing it would wedge the host.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -270,6 +270,64 @@ pub fn recent(dir: &Path) -> anyhow::Result<String> {
     load(&newest, live)
 }
 
+/// 0.3 S2: how many recent clean runs of a `(repo, rule)` its typical time
+/// is taken over, and how many it needs before it has one.
+const TYPICAL_WINDOW: usize = 50;
+const TYPICAL_MIN_RUNS: usize = 10;
+
+/// A `(repo, rule)` key, as `status` looks it up.
+pub type RuleKey = (String, String);
+/// Each key's typical run time in whole seconds, from [`typical`].
+pub type Typical = HashMap<RuleKey, u64>;
+
+/// 0.3 S2, S5: the typical run time, in whole seconds, of each of `keys`:
+/// the nearest-rank p90 of `ran_s` over its last [`TYPICAL_WINDOW`] runs
+/// with `exit == 0` and no `killed`, read from the live `runs.jsonl` only.
+/// A key with fewer than [`TYPICAL_MIN_RUNS`] such runs is absent. Lines
+/// that don't parse are skipped; a missing file is no history.
+pub fn typical(dir: &Path, keys: &HashSet<RuleKey>) -> anyhow::Result<Typical> {
+    if keys.is_empty() {
+        return Ok(Typical::new());
+    }
+    let path = dir.join(LIVE);
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Typical::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut runs: HashMap<RuleKey, Vec<f64>> = HashMap::new();
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        let Ok(r) = serde_json::from_slice::<RunRecord>(&line) else {
+            continue;
+        };
+        if r.exit != Some(0) || r.killed.is_some() {
+            continue;
+        }
+        let (Some(repo), Some(rule)) = (r.repo, r.rule) else {
+            continue;
+        };
+        let key = (repo, rule);
+        if keys.contains(&key) {
+            runs.entry(key).or_default().push(r.ran_s);
+        }
+    }
+    Ok(runs
+        .into_iter()
+        .filter_map(|(key, mut all)| {
+            let mut last = all.split_off(all.len().saturating_sub(TYPICAL_WINDOW));
+            if last.len() < TYPICAL_MIN_RUNS {
+                return None;
+            }
+            last.sort_by(f64::total_cmp);
+            // Nearest rank: the ceil(0.9 n)-th smallest.
+            let p90 = last[(last.len() * 9).div_ceil(10) - 1];
+            // `as` saturates: a negative or NaN `ran_s` reads as 0.
+            Some((key, p90.ceil() as u64))
+        })
+        .collect())
+}
+
 /// Gunzips `archives`, then appends `live`, as one deduped text.
 fn load(archives: &[&Path], live: String) -> anyhow::Result<String> {
     let mut texts = Vec::new();
@@ -334,6 +392,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::state::Killed;
 
     const DAY: u64 = 86_400_000;
 
@@ -565,5 +624,74 @@ mod tests {
         fs::write(dir.path().join(LIVE), "torn\n").unwrap();
         append(dir.path(), &[rec(nov15())], nov15()).unwrap();
         assert_eq!(names(dir.path()), ["runs.jsonl"]);
+    }
+
+    fn run_line(repo: &str, rule: &str, ran_s: f64, exit: i32, killed: Option<Killed>) -> String {
+        let mut r = rec(nov15());
+        r.repo = Some(repo.into());
+        r.rule = Some(rule.into());
+        r.ran_s = ran_s;
+        r.exit = Some(exit);
+        r.killed = killed;
+        serde_json::to_string(&r).unwrap() + "\n"
+    }
+
+    fn key(repo: &str, rule: &str) -> RuleKey {
+        (repo.into(), rule.into())
+    }
+
+    #[test]
+    fn typical_is_the_p90_of_the_last_clean_runs_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        // 60 old slow runs fall out of the 50-run window.
+        for _ in 0..60 {
+            text += &run_line("/a", "gate", 1000.0, 0, None);
+        }
+        // Then 1..=50 s: nearest-rank p90 of 50 is the 45th, 45 s.
+        for s in 1..=50 {
+            text += &run_line("/a", "gate", s as f64 - 0.5, 0, None);
+        }
+        // Failed and killed runs never count, nor torn lines.
+        text += &run_line("/a", "gate", 9999.0, 1, None);
+        text += &run_line("/a", "gate", 9999.0, 0, Some(Killed::Timeout));
+        text += "torn\n";
+        // Same rule, other repo: its own key.
+        for _ in 0..10 {
+            text += &run_line("/b", "gate", 7.2, 0, None);
+        }
+        // 11 runs, 1..=11 s: nearest rank is the 10th (ceil 9.9), not the 9th.
+        for s in 1..=11 {
+            text += &run_line("/d", "gate", s as f64, 0, None);
+        }
+        // Nine runs: too few.
+        for _ in 0..9 {
+            text += &run_line("/c", "gate", 7.0, 0, None);
+        }
+        fs::write(dir.path().join(LIVE), text).unwrap();
+        let keys = [
+            key("/a", "gate"),
+            key("/b", "gate"),
+            key("/c", "gate"),
+            key("/d", "gate"),
+        ]
+        .into();
+        let t = typical(dir.path(), &keys).unwrap();
+        assert_eq!(t.get(&key("/a", "gate")), Some(&45));
+        assert_eq!(t.get(&key("/b", "gate")), Some(&8), "rounded up");
+        assert_eq!(t.get(&key("/c", "gate")), None);
+        assert_eq!(t.get(&key("/d", "gate")), Some(&10));
+        // Only asked-for keys are kept.
+        let only_b = [key("/b", "gate")].into();
+        assert_eq!(typical(dir.path(), &only_b).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn typical_without_a_log_or_keys_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = [key("/a", "gate")].into();
+        assert!(typical(dir.path(), &keys).unwrap().is_empty());
+        fs::write(dir.path().join(LIVE), run_line("/a", "gate", 1.0, 0, None)).unwrap();
+        assert!(typical(dir.path(), &HashSet::new()).unwrap().is_empty());
     }
 }
