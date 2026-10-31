@@ -1,6 +1,6 @@
 {
   "name": "@mu-crew/muzzle",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Per-host admission for heavy commands, with a run log that tunes itself",
   "license": "MIT",
   "repository": {
@@ -42,8 +42,8 @@
     }
   },
   "optionalDependencies": {
-    "@mu-crew/muzzle-linux-x64": "0.2.1",
-    "@mu-crew/muzzle-linux-arm64": "0.2.1",
-    "@mu-crew/muzzle-darwin-arm64": "0.2.1"
+    "@mu-crew/muzzle-linux-x64": "0.2.2",
+    "@mu-crew/muzzle-linux-arm64": "0.2.2",
+    "@mu-crew/muzzle-darwin-arm64": "0.2.2"
   }
 }

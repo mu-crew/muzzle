@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 Fixes from a review panel (2026-10-30). Spec notes dated 2026-10-30 in
 `docs/specs/2026-10-29-muzzle.md` and R5 amendments in
