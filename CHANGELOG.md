@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a review panel (2026-10-30). Spec notes dated 2026-10-30 in
+`docs/specs/2026-10-29-muzzle.md` and R5 amendments in
+`docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`.
+
+Changed:
+
+- **`muzzle hook claude` allows far less.** The raw command text must be
+  plain words first: `A-Z a-z 0-9 _ . / : = , + @ % -` separated by single
+  spaces. No quotes, `$`, braces, redirections, backslashes, tabs or
+  newlines. Then every word must be on an allowlist: prefixes and their
+  options, assignment names, the program, and per program every option,
+  value, positional and word after `--`. Prefixes must be bare or live in
+  `/usr/bin` or `/bin`. `env -C/-S/-a/-P` and abbreviations, glued
+  code-naming options (`--config=`, `-C/dir`, `--prefix=`), `cargo +/path`,
+  assignments such as `CARGO_TARGET_*_RUNNER=`, `PATH=` and
+  `NODE_OPTIONS=`, and any word after `npm test` no longer auto-allow.
+  Bare `time` (bash's keyword) takes only `-p`. Commands that used to
+  auto-allow and now prompt include `cargo build 2>&1`, anything quoted,
+  `vitest run <file>`, `npm run test -- <args>` and `contrib/gate <args>`.
+  They are still wrapped. Several of these bypasses were already in
+  0.2.1.
+- **A non-leader job that stops for the terminal is ended.** muzzle prints
+  a `muzzle:` hint, ends the job (SIGTERM, then SIGKILL after 10 s), frees
+  the slots and exits 128 + the signal (149 for SIGTTIN, 150 for SIGTTOU).
+  Before, it hung and kept the slots. muzzle never takes the terminal.
+- **Once the command has ended, muzzle exits with its code** even if a
+  later step fails: `--report` write, `runs.jsonl` append, keeper handoff,
+  release save. The error goes to stderr. Before, these exited 125.
+- `report` under config `slots =` sizes RAM per slot from this host and
+  caps suggestions at `slots`. Plain `report` reads `slots =` from an
+  existing config, silently, and never writes the template.
+- `bench run` results gain `matched_wait_s` and `matched_run_s`, which
+  leave out unmatched calls (D35). The existing fields are unchanged.
+
+Fixed:
+
+- An error after the keeper took over no longer frees the claim while the
+  job runs, and the keeper's `runs.jsonl` line is no longer lost (D16).
+- A failing `runs.jsonl` append no longer wedges the queue: waiters warn,
+  prune and admit. The append now comes after the state save, so a
+  failed save no longer duplicates the line.
+- `nohup muzzle run …` and `trap '' HUP` work: signals the caller ignores
+  stay ignored for muzzle and the job.
+- A nested `--run-timeout` now reaches the nested job's descendants. On
+  Linux that includes orphans in the outer claim's group, but not
+  `setsid` daemons. Before, only the direct child was signalled.
+- A non-leader job is recorded with its process group as it spawns, so a
+  SIGKILLed muzzle can't lose the claim while waiting for the lock.
+- `--timeout`/`--run-timeout` values too large for a duration exit 2
+  instead of panicking.
+- The shell reader finds the script in `bash -o pipefail -c …`, `-O`,
+  `--rcfile`, one-dash long options (`bash -login -c`) and zsh's glued
+  `-o<name>`, and lexes `$'…'` quotes. Rules and container detection
+  missed these before.
+- `doctor` under `slots =` shows this host's cores and RAM per slot. Its
+  runs-log count counts parseable runs. `report` honours the D17a budget
+  expiry.
+- Docs: the skill on nested runs and `cd repo && muzzle run` (it leads
+  only on bash 4.4 or later, not macOS `/bin/bash`), harness exit codes,
+  `linuxpc-config-021.toml` for command rules, the AGENTS.md layout, and
+  spec §Architecture 4.4 on the leader's SIGINT/SIGQUIT. Also two
+  documented limits: a terminal stop under `timeout` without
+  `--foreground` goes unseen, and so does a nested-timeout orphan on
+  macOS.
+- Tests: a nesting regression fails instead of hanging, new tests cover
+  D11 across classes and SIGINT while queued, timing bounds hold under
+  load and pin D18 and the heartbeat, the container-scope test no longer
+  flakes, and SIGINT tests survive an inherited ignore.
+
 ## 0.2.1
 
 Rules that match command words (spec
@@ -23,8 +94,9 @@ Rules that match command words (spec
 - The config hash covers `command` (whitespace normalised, a single string
   as a one-element list). Switching a rule between `command` and `match`
   changes the hash.
-- The template, `bench/linuxpc-config.toml`, the skill, `tune.md`, README
-  and usage use `command` rules.
+- The template, the new `bench/linuxpc-config-021.toml`, the skill,
+  `tune.md`, README and usage use `command` rules
+  (`bench/linuxpc-config.toml` stays the v1 snapshot).
 
 Changed:
 
