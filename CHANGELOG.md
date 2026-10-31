@@ -52,10 +52,10 @@ Fixed:
   SIGKILLed muzzle can't lose the claim while waiting for the lock.
 - `--timeout`/`--run-timeout` values too large for a duration exit 2
   instead of panicking.
-- The shell reader finds the script in `bash -o pipefail -c …`, `-O`,
-  `--rcfile`, one-dash long options (`bash -login -c`) and zsh's glued
-  `-o<name>`, and lexes `$'…'` quotes. Rules and container detection
-  missed these before.
+- The shell reader finds the script in `bash -o pipefail -c …`, `-O` and
+  `--rcfile`, and lexes `$'…'` quotes. Rules and container detection
+  missed these in 0.2.1. One-dash long options (`bash -login -c`) and
+  zsh's glued `-o<name>` keep working.
 - `doctor` under `slots =` shows this host's cores and RAM per slot. Its
   runs-log count counts parseable runs. `report` honours the D17a budget
   expiry.

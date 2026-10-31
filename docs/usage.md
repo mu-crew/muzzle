@@ -190,7 +190,11 @@ A waiter killed by SIGTERM or SIGINT prints `muzzle: killed while queued
 (…)`, which names the usual cause: a harness or outer `timeout` counting
 the wait.
 
-Signals muzzle catches (HUP, INT, QUIT, TERM) go on to the job. A signal
+Signals muzzle catches (HUP, INT, QUIT, TERM) go on to the job, with one
+exception: when muzzle leads its group it drops INT and QUIT, since a
+terminal's Ctrl-C or Ctrl-\ already reached the whole group. A `kill -INT`
+aimed at muzzle's pid alone is therefore dropped; signal the group
+(`kill -INT -<pgid>`) or send TERM (spec §Architecture 4.4). A signal
 the caller ignores stays ignored for muzzle and the job, so `nohup muzzle
 run …` survives a hangup.
 
@@ -321,8 +325,12 @@ group has no members left.
   stop when its own top command stops. `timeout` without `--foreground`
   runs its command in a process group of its own, so a reader under it
   stops in that group whether or not muzzle leads: no `muzzle:` line,
-  and the slots stay held until `timeout` ends it. Use `timeout
-  --foreground` or `< /dev/null`.
+  and the slots stay held until `timeout` ends it. When muzzle leads,
+  `timeout --foreground` lets the reader have the terminal. When it
+  doesn't, `--foreground` is worse: the reader stops in muzzle's
+  background group, `timeout` ignores the stop and its SIGTERM never
+  lands, so the slots stay held with no end. Give the job `< /dev/null`
+  there, or use muzzle's own `--run-timeout`, which also sends SIGCONT.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps
   its slots: `muzzle run` returns at once with the top command's status,
   and a detached keeper holds the claim until the group is empty, then
