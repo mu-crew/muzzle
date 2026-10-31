@@ -2037,7 +2037,16 @@ fn a_non_leader_job_stopped_by_sigstop_is_left_to_be_continued() {
             .trim_start()
             .starts_with('T')
     });
-    assert!(stopped, "the job never stopped");
+    if !stopped {
+        // Clean up before failing: a panic here would leave the pty shell,
+        // muzzle and the stopped job running after the test binary exits.
+        let _ = child.kill();
+        let _ = child.wait();
+        if pgid > 0 {
+            kill(-pgid, libc::SIGKILL);
+        }
+        panic!("the job never stopped");
+    }
     std::thread::sleep(Duration::from_millis(500));
     kill(-pgid, libc::SIGCONT);
     let status = wait_for(&mut child, Duration::from_secs(5));

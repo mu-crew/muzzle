@@ -314,13 +314,15 @@ group has no members left.
   muzzle prints `muzzle: the command stopped waiting for the terminal…`,
   ends the job (SIGTERM, SIGKILL after 10 s), frees its slots and exits
   128 + the stop signal (149 for SIGTTIN). Run muzzle as the first
-  command, or give the job no terminal (`< /dev/null`). muzzle only
-  sees this when its top command stops too: a top command that ignores
-  the terminal stop signals, like `timeout` in `muzzle run -- timeout N
-  …`, keeps running while the job under it waits, so there is no
-  `muzzle:` line and the slots stay held until `timeout` ends it. The npm `bin/muzzle` shim execs the binary for this reason (Node
-  22.15 or later), and the pi extension calls the platform binary
-  directly.
+  command, or give the job no terminal (`< /dev/null`). The npm
+  `bin/muzzle` shim execs the binary so that muzzle leads (Node 22.15 or
+  later), and the pi extension calls the platform binary directly.
+- **A stop under `timeout` is not seen.** muzzle only sees a terminal
+  stop when its own top command stops. `timeout` without `--foreground`
+  runs its command in a process group of its own, so a reader under it
+  stops in that group whether or not muzzle leads: no `muzzle:` line,
+  and the slots stay held until `timeout` ends it. Use `timeout
+  --foreground` or `< /dev/null`.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps
   its slots: `muzzle run` returns at once with the top command's status,
   and a detached keeper holds the claim until the group is empty, then
