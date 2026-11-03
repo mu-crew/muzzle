@@ -62,6 +62,11 @@ pub struct RunArgs {
     /// Write the run's figures as JSON to FILE on exit.
     #[arg(long, value_name = "FILE")]
     pub report: Option<PathBuf>,
+    /// While queued, keep FILE holding the current OSC 7501 program status
+    /// report, for a harness with no terminal to forward; cleared when the
+    /// wait ends.
+    #[arg(long, value_name = "FILE")]
+    pub status: Option<PathBuf>,
     /// The command and its arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,

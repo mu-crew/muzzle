@@ -13,6 +13,13 @@
 // GUARD on globalThis; later copies register nothing. The claim is released
 // on session_shutdown, so /reload and session replacement load it again.
 //
+// Program status (OSC 7501): pi's bash tool has no terminal, so `muzzle run`
+// can't tell the terminal it is queued. Each wrapped call also gets
+// `--status <tmp>/<id>.status`, which muzzle keeps holding its current
+// report while queued; in interactive mode in a terminal that supports the
+// protocol, this extension forwards changes to pi's own output, under a child
+// id per call (`muzzle/<n>`) so parallel calls and pi's root record stay apart.
+//
 // Nothing here may block a call: a missing binary or a failing wrap leaves
 // the call as it is. A throwing tool_call handler blocks the tool in pi, so
 // every path is caught.
@@ -95,6 +102,23 @@ export function findMuzzle(opts: FindOptions = {}): string | null {
   return null;
 }
 
+/** Terminals known to support OSC 7501, as muzzle's own sink checks. */
+const STATUS_TERMINALS = new Set(["rex"]);
+
+/** How often a queued call's status file is checked. muzzle polls every 250 ms. */
+const STATUS_POLL_MS = 250;
+
+/** Whether this pi should forward program status: interactive, in a supporting terminal. */
+export function forwardsStatus(mode: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
+  return mode === "tui" && STATUS_TERMINALS.has(env.TERM_PROGRAM ?? "");
+}
+
+/** muzzle's report with its record moved to this call's child id. */
+export function forCall(report: string, slot: number): string | null {
+  if (!report.startsWith("\x1b]7501;") || !report.includes(":id=muzzle")) return null;
+  return report.replace(/:id=muzzle(?=[:\x1b])/, `:id=muzzle/${slot}`);
+}
+
 /** POSIX single quoting, as `muzzle wrap` does it. */
 export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -146,6 +170,8 @@ export const GUARD = Symbol.for("@mu-crew/muzzle/extension");
 export interface Deps {
   findBinary?: () => string | null;
   tmpRoot?: string;
+  /** Where forwarded status goes: pi's terminal. */
+  writeTerminal?: (s: string) => void;
 }
 
 export function createExtension(deps: Deps = {}) {
@@ -160,6 +186,48 @@ export function createExtension(deps: Deps = {}) {
     const pending = new Map<string, string>();
     // A wrap-failure warning is on the footer; the next good wrap clears it.
     let wrapWarned = false;
+
+    // toolCallId -> the status file, its child slot and the last report sent.
+    const watched = new Map<string, { file: string; slot: number; sent: string }>();
+    let nextSlot = 0;
+    let poller: ReturnType<typeof setInterval> | undefined;
+    const writeTerminal = deps.writeTerminal ?? ((s: string) => process.stdout.write(s));
+    const send = (s: string) => {
+      try {
+        writeTerminal(s);
+      } catch {
+        // a closed terminal; status is a courtesy
+      }
+    };
+    const forward = () => {
+      for (const w of watched.values()) {
+        let report: string;
+        try {
+          report = readFileSync(w.file, "utf8");
+        } catch {
+          continue; // not queued (yet): muzzle writes it only while waiting
+        }
+        if (report === w.sent) continue;
+        const out = forCall(report, w.slot);
+        if (out === null) continue;
+        w.sent = report;
+        send(out);
+      }
+    };
+    const unwatch = (toolCallId: string) => {
+      const w = watched.get(toolCallId);
+      if (w === undefined) return;
+      watched.delete(toolCallId);
+      // Read once more, then make sure no record outlives the call (a killed
+      // muzzle never writes its clear).
+      forward();
+      if (w.sent !== "" && !w.sent.includes("state=clear")) send(`\x1b]7501;state=clear:id=muzzle/${w.slot}\x1b\\`);
+      rmSync(w.file, { force: true });
+      if (watched.size === 0 && poller !== undefined) {
+        clearInterval(poller);
+        poller = undefined;
+      }
+    };
 
     const warn = (ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, text: string | undefined) => {
       try {
@@ -192,7 +260,16 @@ export function createExtension(deps: Deps = {}) {
         reportDir ??= mkdtempSync(join(deps.tmpRoot ?? tmpdir(), "muzzle-pi-"));
         const report = join(reportDir, reportName(event.toolCallId));
         rmSync(report, { force: true });
-        input.command = `${shellQuote(bin)} run --report ${shellQuote(report)} ${wrapped.slice("muzzle run ".length)}`;
+        let status = "";
+        if (forwardsStatus(ctx.mode)) {
+          const file = `${report.slice(0, -".json".length)}.status`;
+          rmSync(file, { force: true });
+          watched.set(event.toolCallId, { file, slot: nextSlot++, sent: "" });
+          poller ??= setInterval(forward, STATUS_POLL_MS);
+          poller.unref?.();
+          status = `--status ${shellQuote(file)} `;
+        }
+        input.command = `${shellQuote(bin)} run --report ${shellQuote(report)} ${status}${wrapped.slice("muzzle run ".length)}`;
         delete input.timeout;
         pending.set(event.toolCallId, report);
       } catch (e) {
@@ -202,6 +279,7 @@ export function createExtension(deps: Deps = {}) {
     });
 
     pi.on("tool_result", async (event) => {
+      unwatch(event.toolCallId);
       const report = pending.get(event.toolCallId);
       if (report === undefined) return;
       pending.delete(event.toolCallId);
@@ -228,6 +306,7 @@ export function createExtension(deps: Deps = {}) {
     });
 
     pi.on("session_shutdown", async () => {
+      for (const id of [...watched.keys()]) unwatch(id);
       if (g[GUARD] === claim) delete g[GUARD];
       if (reportDir) rmSync(reportDir, { recursive: true, force: true });
       reportDir = undefined;

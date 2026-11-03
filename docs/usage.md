@@ -220,6 +220,11 @@ run …` survives a hangup.
   carries `typical_s` and `slow` per holder, `slow` per waiter, and
   `slow_holders` and `slow_waiters` overall. The mu-crew tmux pill shows
   these counts.
+- In a terminal that supports OSC 7501 program status (Rex), a queued
+  `muzzle run` marks its tab `working` with `queued 2/3 for 6 slots, 14/14
+  held` until it is admitted. pi's muzzle extension does the same for
+  wrapped bash calls. `--status FILE` writes the report to a file instead,
+  for a harness that wants to forward it.
 - `muzzle doctor` checks the budget, enforcement, the state directory, the
   config, the run log and each harness's setup. Exit 0 means usable, even
   when only advisory.
