@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.4
 
 Added:
 
@@ -12,7 +12,8 @@ Added:
   `--status FILE` keeps FILE holding the current report instead, for a
   harness with no terminal: the pi extension passes it and forwards changes
   to pi's own output under `muzzle/<n>`, in the TUI of a supporting
-  terminal only.
+  terminal only. Inside tmux nothing is reported: a pane's `TERM_PROGRAM`
+  is `tmux`, and tmux drops OSC 7501 unless it is wrapped in passthrough.
 
 ## 0.2.3
 

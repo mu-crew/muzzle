@@ -224,7 +224,9 @@ run …` survives a hangup.
   `muzzle run` marks its tab `working` with `queued 2/3 for 6 slots, 14/14
   held` until it is admitted. pi's muzzle extension does the same for
   wrapped bash calls. `--status FILE` writes the report to a file instead,
-  for a harness that wants to forward it.
+  for a harness that wants to forward it. Inside tmux nothing shows: a pane's
+  `TERM_PROGRAM` is `tmux`, and tmux drops the sequence (only DCS
+  passthrough would carry it, which muzzle does not use).
 - `muzzle doctor` checks the budget, enforcement, the state directory, the
   config, the run log and each harness's setup. Exit 0 means usable, even
   when only advisory.
