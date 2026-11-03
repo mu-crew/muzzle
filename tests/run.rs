@@ -2065,3 +2065,82 @@ fn a_non_leader_job_stopped_by_sigstop_is_left_to_be_continued() {
     assert_eq!(status.map(|s| s.code()), Some(Some(0)), "{text:?}");
     assert_eq!(env.state().held(), 0);
 }
+
+#[test]
+fn a_queued_run_reports_program_status_and_clears_it_when_admitted() {
+    let env = Env::new();
+    let mut hog = env.hog("30");
+    let status = env.file("status");
+    let mut waiter = env
+        .cmd(&[
+            "--status",
+            status.to_str().unwrap(),
+            "--slots",
+            "2",
+            "--",
+            "true",
+        ])
+        .spawn()
+        .unwrap();
+    let read = || std::fs::read_to_string(&status).unwrap_or_default();
+    assert!(
+        eventually(Duration::from_secs(5), || read().contains("state=working")),
+        "{:?}",
+        read()
+    );
+    let working = read();
+    assert!(
+        working.starts_with("\x1b]7501;state=working:id=muzzle:app=muzzle:"),
+        "{working:?}"
+    );
+    // "queued 1/1 for 2 slots, 4/4 held", base64.
+    assert!(
+        working.contains(":msg=cXVldWVkIDEvMSBmb3IgMiBzbG90cywgNC80IGhlbGQ="),
+        "{working:?}"
+    );
+    kill(-(hog.id() as i32), libc::SIGKILL);
+    hog.wait().unwrap();
+    assert!(
+        wait_for(&mut waiter, Duration::from_secs(5))
+            .unwrap()
+            .success()
+    );
+    assert_eq!(read(), "\x1b]7501;state=clear:id=muzzle\x1b\\");
+}
+
+#[test]
+fn a_queued_run_that_gives_up_clears_its_status() {
+    let env = Env::new();
+    let mut hog = env.hog("30");
+    let status = env.file("status");
+    let out = env
+        .cmd(&[
+            "--status",
+            status.to_str().unwrap(),
+            "--timeout",
+            "1",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&status).unwrap(),
+        "\x1b]7501;state=clear:id=muzzle\x1b\\"
+    );
+    kill(-(hog.id() as i32), libc::SIGKILL);
+    hog.wait().unwrap();
+}
+
+#[test]
+fn an_admitted_run_writes_no_status() {
+    let env = Env::new();
+    let status = env.file("status");
+    let out = env
+        .cmd(&["--status", status.to_str().unwrap(), "--", "true"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(!status.exists());
+}

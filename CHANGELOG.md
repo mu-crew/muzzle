@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- **A queued run shows on the terminal tab.** While `muzzle run` waits, it
+  reports OSC 7501 program status (`working`, `queued 2/3 for 6 slots,
+  14/14 held`) under the record id `muzzle`, and clears it on admission or
+  when it gives up. It writes to `/dev/tty`, and only when `TERM_PROGRAM`
+  names a terminal known to support the protocol (Rex today). New
+  `--status FILE` keeps FILE holding the current report instead, for a
+  harness with no terminal: the pi extension passes it and forwards changes
+  to pi's own output under `muzzle/<n>`, in the TUI of a supporting
+  terminal only.
+
 ## 0.2.3
 
 Spec: `docs/specs/2026-10-31-muzzle-0.2.3-slow-status.md`.

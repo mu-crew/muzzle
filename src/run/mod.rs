@@ -5,6 +5,7 @@
 
 mod job;
 mod keeper;
+mod osc;
 mod queue;
 mod report;
 mod scope;
@@ -401,6 +402,7 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         ticket,
         reading,
         config_slots: config.slots,
+        status: std::cell::RefCell::new(osc::Sink::open(args.status.as_deref())),
     };
     let (holder, budget) = match q.wait(enqueued, queue_timeout)? {
         Turn::Admitted(h, b) => (*h, b),

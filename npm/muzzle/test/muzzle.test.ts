@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createExtension, findMuzzle, GUARD, reportName, resultLine } from "../extension/muzzle.ts";
+import { createExtension, findMuzzle, forCall, forwardsStatus, GUARD, reportName, resultLine } from "../extension/muzzle.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = process.env.MUZZLE_BIN ?? resolve(here, "../../../target/debug/muzzle");
@@ -39,7 +39,11 @@ beforeEach(() => {
 type Handler = (event: any, ctx: any) => any;
 
 /** Just enough of ExtensionAPI and ExtensionContext for this extension. */
-function load(findBinary: () => string | null = () => BIN, handlers: Record<string, Handler[]> = {}) {
+function load(
+  findBinary: () => string | null = () => BIN,
+  handlers: Record<string, Handler[]> = {},
+  opts: { mode?: string; terminal?: string[] } = {},
+) {
   const entries: { type: string; data: any }[] = [];
   const status: (string | undefined)[] = [];
   const pi = {
@@ -50,8 +54,8 @@ function load(findBinary: () => string | null = () => BIN, handlers: Record<stri
       entries.push({ type, data });
     },
   };
-  createExtension({ findBinary, tmpRoot: home })(pi as any);
-  const ctx = { cwd: home, ui: { setStatus: (_k: string, t: string | undefined) => status.push(t) } };
+  createExtension({ findBinary, tmpRoot: home, writeTerminal: (s) => opts.terminal?.push(s) })(pi as any);
+  const ctx = { cwd: home, mode: opts.mode, ui: { setStatus: (_k: string, t: string | undefined) => status.push(t) } };
   const emit = async (name: string, event: any) => {
     let out;
     for (const h of handlers[name] ?? []) out = await h(event, ctx);
@@ -419,3 +423,59 @@ test(
     }
   },
 );
+
+test("program status is forwarded only in the TUI of a supporting terminal", () => {
+  assert.equal(forwardsStatus("tui", { TERM_PROGRAM: "rex" }), true);
+  assert.equal(forwardsStatus("tui", { TERM_PROGRAM: "ghostty" }), false);
+  assert.equal(forwardsStatus("tui", {}), false);
+  assert.equal(forwardsStatus("rpc", { TERM_PROGRAM: "rex" }), false);
+  assert.equal(forwardsStatus(undefined, { TERM_PROGRAM: "rex" }), false);
+});
+
+test("forCall moves muzzle's record to the call's child id", () => {
+  assert.equal(
+    forCall("\x1b]7501;state=working:id=muzzle:app=muzzle:msg=eA==\x1b\\", 3),
+    "\x1b]7501;state=working:id=muzzle/3:app=muzzle:msg=eA==\x1b\\",
+  );
+  assert.equal(forCall("\x1b]7501;state=clear:id=muzzle\x1b\\", 0), "\x1b]7501;state=clear:id=muzzle/0\x1b\\");
+  assert.equal(forCall("garbage", 0), null);
+});
+
+test("outside a supporting terminal the wrapped call carries no --status", async () => {
+  delete process.env.TERM_PROGRAM;
+  const { emit } = load(undefined, {}, { mode: "tui" });
+  const input: Record<string, unknown> = { command: "fake-gate" };
+  await emit("tool_call", call("c", input));
+  assert.doesNotMatch(input.command as string, /--status/);
+});
+
+test("a queued call's status reaches pi's terminal under its own id, and is cleared at the result", async () => {
+  process.env.TERM_PROGRAM = "rex";
+  try {
+    const terminal: string[] = [];
+    const { emit } = load(undefined, {}, { mode: "tui", terminal });
+    // --slots 64 is capped to the whole budget, so the call behind it queues.
+    const hog = spawn(BIN, ["run", "--slots", "64", "--", "sleep", "30"], { detached: true, stdio: "ignore" });
+    try {
+      await until("the hog to hold", () => held() > 0);
+      const input: Record<string, unknown> = { command: "echo fake-gate" };
+      await emit("tool_call", call("q", input));
+      assert.match(input.command as string, / --status '[^']+\.status' /);
+      const run = spawn("bash", ["-c", input.command as string], { stdio: "ignore" });
+      await until("a forwarded working record", () => terminal.some((s) => s.includes("state=working:id=muzzle/0:")));
+      process.kill(-hog.pid!, "SIGKILL");
+      await new Promise((r) => run.on("exit", r));
+      await emit("tool_result", result("q", input, "fake-gate"));
+      assert.equal(terminal.at(-1), "\x1b]7501;state=clear:id=muzzle/0\x1b\\");
+      assert.equal(terminal.filter((s) => s.includes("state=clear")).length, 1, JSON.stringify(terminal));
+    } finally {
+      try {
+        process.kill(-hog.pid!, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  } finally {
+    delete process.env.TERM_PROGRAM;
+  }
+});

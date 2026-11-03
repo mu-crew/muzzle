@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 
+use super::osc::{Sink, queued_msg};
 use super::report::round3;
 use super::scope::{reset_failed, scope_loaded, stop_unit, unit_name};
 use super::{POLL, PROGRESS, ProcLive, TICK, now_ms, scope_known_empty, take_signal};
@@ -17,6 +18,8 @@ pub(super) struct Queue<'a> {
     pub(super) ticket: u64,
     pub(super) reading: Budget,
     pub(super) config_slots: Option<u32>,
+    /// Program status while queued (OSC 7501), cleared when the wait ends.
+    pub(super) status: std::cell::RefCell<Sink>,
 }
 
 pub(super) enum Turn {
@@ -31,6 +34,8 @@ pub(super) enum Poll {
         position: usize,
         of: usize,
         line: String,
+        /// The program status message, from the same locked read.
+        msg: String,
     },
 }
 
@@ -73,10 +78,18 @@ impl Queue<'_> {
                 // one is running; a hand-edited state file is the only way.
                 bail!("ticket {} vanished from the queue", self.ticket);
             };
+            let b = budget.budget.max(1);
             let waiting = Poll::Waiting {
                 position: at + 1,
                 of: queue.len(),
                 line: progress_line(s, at + 1, queue.len()),
+                msg: queued_msg(
+                    at + 1,
+                    queue.len(),
+                    admit::cap(queue[at].claim.slots, b),
+                    s.held(),
+                    b,
+                ),
             };
             Ok((waiting, records))
         });
@@ -104,10 +117,14 @@ impl Queue<'_> {
     ) -> anyhow::Result<Turn> {
         let mut polls = 0u32;
         let mut next_progress = enqueued + PROGRESS;
+        // Reported only when it changes: a poll every 250 ms must not mean a
+        // terminal write every 250 ms.
+        let mut last_msg = String::new();
         loop {
             polls += 1;
             let (position, of) = match self.poll()? {
                 Poll::Admitted(h, budget) => {
+                    self.status.borrow_mut().clear();
                     if polls > 1 {
                         eprintln!(
                             "muzzle: admitted after {:.0}s ({} slots)",
@@ -117,7 +134,16 @@ impl Queue<'_> {
                     }
                     return Ok(Turn::Admitted(h, budget));
                 }
-                Poll::Waiting { position, of, line } => {
+                Poll::Waiting {
+                    position,
+                    of,
+                    line,
+                    msg,
+                } => {
+                    if msg != last_msg {
+                        self.status.borrow_mut().queued(&msg);
+                        last_msg = msg;
+                    }
                     if Instant::now() >= next_progress {
                         eprintln!("{line}");
                         next_progress += PROGRESS;
@@ -148,6 +174,7 @@ impl Queue<'_> {
     /// Drop the ticket, whether still waiting or admitted since the last
     /// poll: either way this muzzle won't run the job.
     fn leave(&self) -> anyhow::Result<()> {
+        self.status.borrow_mut().clear();
         self.store.update(now_ms(), |s| Ok(s.remove(self.ticket)))?;
         Ok(())
     }
