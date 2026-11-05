@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- **cursor-agent and Muse Code** (mu's every-harness spec D14).
+  `muzzle hook cursor` answers cursor-agent's `beforeShellExecution`: it
+  can't rewrite, so a matched command is denied with a reason that ends in
+  the exact `muzzle run …` line, and the rerun of that line passes.
+  `muzzle hook claude` also serves Muse Code, whose shell tool is `bash`:
+  `timeout_ms` becomes `--run-timeout`, and path rules follow `workdir`
+  (`/workspace` and relative paths resolved as Muse does). Snippets and
+  derived payloads in `docs/harnesses/` and `tests/fixtures/hooks/`.
+
 ## 0.2.4
 
 Added:

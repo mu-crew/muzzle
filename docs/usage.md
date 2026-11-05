@@ -273,7 +273,7 @@ it without any CPU use. Read it as a trend, not a measurement.
 
 ## Harnesses
 
-pi, Claude Code, Codex, opencode and hand-wrapping:
+pi, Claude Code, Codex, Muse Code, cursor-agent, opencode and hand-wrapping:
 [harnesses.md](../npm/muzzle/skills/muzzle/recipes/harnesses.md), with the
 snippets in [docs/harnesses/](harnesses/README.md).
 

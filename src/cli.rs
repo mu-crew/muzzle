@@ -25,7 +25,8 @@ pub enum Command {
     Match(MatchArgs),
     /// Print the `muzzle run …` rewrite of a shell string, as JSON.
     Wrap(WrapArgs),
-    /// Answer a harness PreToolUse hook: payload on stdin, reply on stdout.
+    /// Answer a harness shell hook (PreToolUse, or cursor-agent's
+    /// beforeShellExecution): payload on stdin, reply on stdout.
     Hook(HookArgs),
     /// Show the budget, holders and queue.
     Status(StatusArgs),
@@ -99,8 +100,13 @@ pub struct WrapArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Harness {
+    /// Claude Code, and Muse Code, whose `PreToolUse` payloads Claude's
+    /// format covers once its `bash` tool is mapped (every-harness D14).
     Claude,
     Codex,
+    /// cursor-agent's `beforeShellExecution`: deny with the rewrite as the
+    /// reason, since it can't rewrite (every-harness D14).
+    Cursor,
 }
 
 #[derive(Debug, Args)]

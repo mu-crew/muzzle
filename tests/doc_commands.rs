@@ -308,7 +308,7 @@ fn planted_drift_is_caught() {
             "a span wrapped across lines",
         ),
         (
-            "```json\n\"command\": \"muzzle hook cursor\"\n```",
+            "```json\n\"command\": \"muzzle hook aider\"\n```",
             "a quoted hook command",
         ),
         (

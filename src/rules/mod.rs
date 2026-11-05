@@ -206,10 +206,13 @@ pub fn wrap_main(args: &WrapArgs) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Exit code for a hook that can't answer. Not 2: both Claude Code and
-/// Codex read exit 2 as "block this tool call", and a broken muzzle must
-/// never block every Bash call. 1 is a non-blocking hook error in both, so
-/// the call runs unwrapped and the user sees the notice.
+/// Exit code for a hook that can't answer. Not 2: Claude Code, Codex and
+/// cursor-agent all read exit 2 as "block this tool call", and a broken
+/// muzzle must never block every Bash call. 1 is a non-blocking hook error
+/// in all three, so the call runs unwrapped and the user sees the notice.
+/// Nothing goes to stdout then: cursor-agent blocks a permission hook's
+/// call when stdout is not JSON, but treats empty stdout as a failed hook
+/// (cursor-agent 2026.10.22's hook executor).
 const HOOK_FAILED: u8 = 1;
 
 pub fn hook_main(args: &HookArgs) -> anyhow::Result<ExitCode> {
