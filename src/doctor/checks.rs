@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use super::{BudgetView, ConfigFile, Facts, Report};
+use crate::init::CheckState;
 use crate::rules::config::Config;
 use crate::runlog::{ARCHIVES_WARN_BYTES, LIVE_MAX_BYTES};
 use crate::state::Budget;
@@ -171,6 +172,31 @@ pub fn check(f: &Facts) -> Report {
             ));
         }
     }
+    for c in &f.hook_entries {
+        let path = c.path.display();
+        match c.state {
+            CheckState::Drift => warnings.push(format!(
+                "{} hook entry in {path} differs from what `muzzle init` writes ({}); \
+                 run `muzzle init`",
+                c.harness,
+                c.drift()
+            )),
+            CheckState::Unreadable => warnings.push(format!(
+                "{} settings {path} unreadable: {}; `muzzle init` leaves it alone",
+                c.harness,
+                c.error.as_deref().unwrap_or("?")
+            )),
+            CheckState::Ok | CheckState::Unhooked => {}
+        }
+        if let (true, Some(toml)) = (c.doubled(), &c.also_in) {
+            warnings.push(format!(
+                "{} hook runs from both {path} and the inline hooks in {}, so each \
+                 shell call is matched twice; remove the inline one",
+                c.harness,
+                toml.display()
+            ));
+        }
+    }
     let systemd = f.systemd && f.os == "linux";
     let exit = if config_error.is_some() {
         crate::exit::USAGE
@@ -210,6 +236,7 @@ pub fn check(f: &Facts) -> Report {
         claude_hook: found(&f.harnesses.claude_hook, "installed", "not found"),
         codex_hook: found(&f.harnesses.codex_hook, "installed", "not found"),
         harness_files: f.harnesses.clone(),
+        hook_entries: f.hook_entries.clone(),
         warnings,
         exit,
     }
@@ -247,6 +274,7 @@ mod tests {
             runlog: None,
             container_runs: Vec::new(),
             harnesses: Harnesses::default(),
+            hook_entries: Vec::new(),
         }
     }
 
@@ -559,5 +587,68 @@ mod tests {
             r.warnings
         );
         assert_eq!(r.exit, 0);
+    }
+
+    #[test]
+    fn hook_entries_are_listed_and_drift_warns_with_the_fix() {
+        use crate::init::{CheckState, HookCheck, plan::Plan};
+        let entry = |harness, state, plan: Plan, error: Option<&str>| HookCheck {
+            harness,
+            path: format!("/h/{harness}.json").into(),
+            state,
+            plan,
+            error: error.map(String::from),
+            also_in: None,
+        };
+        let mut f = facts();
+        assert!(render_text(&check(&f)).contains("hook entries   no harness set up"));
+        f.hook_entries = vec![
+            entry("claude", CheckState::Ok, Plan::default(), None),
+            entry("codex", CheckState::Unhooked, Plan::default(), None),
+            entry(
+                "muse",
+                CheckState::Drift,
+                Plan {
+                    owned: 1,
+                    removed: vec!["Stop: muzzle hook claude".into()],
+                    ..Plan::default()
+                },
+                None,
+            ),
+            entry(
+                "cursor-agent",
+                CheckState::Unreadable,
+                Plan::default(),
+                Some("it is not a JSON object"),
+            ),
+        ];
+        let r = check(&f);
+        assert_eq!(r.exit, 0, "advisory");
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("muse hook entry in /h/muse.json")
+                && r.warnings[0].contains("(stray Stop: muzzle hook claude); run `muzzle init`"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[1].contains("not a JSON object"),
+            "{:?}",
+            r.warnings
+        );
+        let t = render_text(&r);
+        assert!(
+            t.contains(
+                "hook entries   claude ok, codex none (`muzzle init` adds it), muse drift, \
+                 cursor-agent unreadable"
+            ),
+            "{t}"
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["hook_entries"][2]["state"], "drift");
+        assert_eq!(
+            v["hook_entries"][2]["removed"][0],
+            "Stop: muzzle hook claude"
+        );
     }
 }

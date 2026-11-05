@@ -9,11 +9,16 @@ First, for every harness:
 
 ```sh
 npm i -g @mu-crew/muzzle
+muzzle init
 muzzle doctor
 ```
 
-`doctor` must show the config with its rule count and hash, and
-`enforced` or `advisory`. It also reports each harness as found or not.
+`init` writes muzzle's hook entry for each harness whose config directory
+exists (`--hooks all` for every one), touching only handlers whose command
+starts with `muzzle hook`; a second run changes nothing. `doctor` must show the
+config with its rule count and hash, and `enforced` or `advisory`. Its
+`hook entries` line must read `ok` for each harness you use. The snippets
+below are what `init` writes, for merging by hand or into a project file.
 
 ## Limits
 
@@ -197,7 +202,9 @@ slots for `cargo fmt` and `cargo --version` too.
 ## Checking a hook by hand
 
 `muzzle doctor` reports `claude hook` and `codex hook` as `installed` when
-it finds `muzzle hook` in that harness's config. To see a reply:
+it finds `muzzle hook` in that harness's config, and `hook entries` as
+`drift` when a global entry differs from what `muzzle init` writes. To see
+a reply:
 
 ```sh
 echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}' | muzzle hook claude

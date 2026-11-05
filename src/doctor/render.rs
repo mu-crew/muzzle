@@ -1,6 +1,7 @@
 //! The text rendering of a [`Report`]; `--json` serialises it as is.
 
 use super::Report;
+use crate::init::CheckState;
 
 pub fn render_text(r: &Report) -> String {
     let opt = |v: Option<u64>| v.map_or("?".to_string(), |v| v.to_string());
@@ -99,6 +100,29 @@ pub fn render_text(r: &Report) -> String {
     line("pi extension", r.pi_extension.into());
     line("claude hook", r.claude_hook.into());
     line("codex hook", r.codex_hook.into());
+    line(
+        "hook entries",
+        if r.hook_entries.is_empty() {
+            "no harness set up".into()
+        } else {
+            r.hook_entries
+                .iter()
+                .map(|c| {
+                    let state = match c.state {
+                        CheckState::Ok if c.also_in.is_some() && !c.doubled() => {
+                            "ok (inline in config.toml)"
+                        }
+                        CheckState::Ok => "ok",
+                        CheckState::Drift => "drift",
+                        CheckState::Unhooked => "none (`muzzle init` adds it)",
+                        CheckState::Unreadable => "unreadable",
+                    };
+                    format!("{} {state}", c.harness)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
     line("platform", r.platform.clone());
     for w in &r.warnings {
         out.push_str(&format!("warning: {w}\n"));

@@ -391,6 +391,7 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
             .unwrap_or_default(),
         repo: repo_str(cwd.as_deref()),
         cfg: Some(config.hash()),
+        pane: std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()),
     };
     let enqueued = Instant::now();
     let ticket = store.update(now_ms(), |s| {
@@ -490,6 +491,7 @@ mod tests {
                 cwd: "/w".into(),
                 repo: None,
                 cfg: None,
+                pane: None,
             },
         }
     }

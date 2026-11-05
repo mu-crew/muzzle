@@ -63,7 +63,7 @@ it. Until then muzzle claims nothing about speed.
 | --- | --- |
 | [docs/why.md](docs/why.md) | The overload, what muzzle does about it, the trade |
 | [docs/usage.md](docs/usage.md) | Config, running, timeouts, exit codes, and the limits: process groups, `setsid`, advisory mode, containers |
-| [docs/harnesses/](docs/harnesses/README.md) | Hook snippets for Claude Code, Codex, Muse Code, cursor-agent, opencode, and the `allow` warning |
+| [docs/harnesses/](docs/harnesses/README.md) | `muzzle init`, hook snippets for Claude Code, Codex, Muse Code, cursor-agent, opencode, and the `allow` warning |
 | [skills/muzzle](npm/muzzle/skills/muzzle/SKILL.md) | The agent skill, with recipes for tuning, benchmarking and harnesses |
 | [bench/](bench/README.md) | Traces, the replay benchmark and the probe |
 | [spec](docs/specs/2026-10-29-muzzle.md) | Design and its numbered decisions; [0.2 amendments](docs/specs/2026-10-30-muzzle-0.2-paths.md) for path tables, includes and the run log |

@@ -12,6 +12,7 @@ pub mod bench;
 pub mod cli;
 pub mod doctor;
 pub mod exit;
+pub mod init;
 pub mod proc;
 pub mod repo;
 pub mod report;

@@ -16,6 +16,7 @@ mod render;
 
 pub use checks::check;
 pub use gather::harnesses;
+pub(crate) use gather::hook_in;
 pub use render::render_text;
 
 use std::path::PathBuf;
@@ -24,6 +25,7 @@ use std::process::ExitCode;
 use serde::Serialize;
 
 use crate::cli::DoctorArgs;
+use crate::init::HookCheck;
 use crate::rules::config::{self, Config, ConfigError, TEMPLATE};
 use crate::runlog::Stats;
 use crate::state::Budget;
@@ -71,6 +73,9 @@ pub struct Facts {
     /// Rules that `runs.jsonl` shows entering a container (D16a).
     pub container_runs: Vec<String>,
     pub harnesses: Harnesses,
+    /// muzzle's entry in each set-up harness's settings, against what
+    /// `muzzle init` writes (every-harness D13).
+    pub hook_entries: Vec<HookCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -135,6 +140,10 @@ pub struct Report {
     pub claude_hook: &'static str,
     pub codex_hook: &'static str,
     pub harness_files: Harnesses,
+    /// Added field (every-harness D13): each set-up harness's settings
+    /// file, with `state` `ok`, `drift`, `unhooked` or `unreadable` against
+    /// what `muzzle init` writes, and what `init` would add, fix or remove.
+    pub hook_entries: Vec<HookCheck>,
     pub warnings: Vec<String>,
     /// Exit status: 0 usable, 2 bad config, 125 state unwritable or
     /// unreadable.

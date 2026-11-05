@@ -75,7 +75,7 @@ fn names_hook(v: &Value) -> bool {
 /// The `hooks` value of a JSON or TOML harness config names `muzzle hook`.
 /// Only `hooks` is searched, so a description or comment elsewhere that
 /// mentions muzzle doesn't count as installed.
-fn hook_in(path: &Path) -> bool {
+pub(crate) fn hook_in(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -221,6 +221,7 @@ pub(super) fn gather() -> Facts {
         state_readable,
         systemd: crate::proc::systemd_user_reachable(),
         harnesses: harnesses(&home, &cwd),
+        hook_entries: crate::init::check(&crate::init::Dirs::from_env(&home)),
     }
 }
 

@@ -12,6 +12,21 @@ Added:
   `timeout_ms` becomes `--run-timeout`, and path rules follow `workdir`
   (`/workspace` and relative paths resolved as Muse does). Snippets and
   derived payloads in `docs/harnesses/` and `tests/fixtures/hooks/`.
+- **`muzzle init`** writes muzzle's hook entry into each harness's settings
+  file (`~/.claude/settings.json`, `~/.codex/hooks.json`,
+  `~/.cursor/hooks.json`, the `hooks` key of `~/.config/muse/settings.json`)
+  for each harness whose config directory exists; `--hooks LIST|all`
+  writes others. The files are shared with mu, murmur, museum and the
+  user, so muzzle touches only handlers whose command starts
+  `muzzle hook` (a `muzzle run` gate in a hook is the user's), keeps every other key in place and in order, and leaves a file
+  already right untouched: a second run changes nothing (every-harness
+  D13). codex hooked inline in `config.toml` gets no second entry. `muzzle doctor` checks the same plan: a new `hook entries` line,
+  `hook_entries` in `--json`, and a warning naming `muzzle init` on drift.
+- **`status --json` names each entry's pid and pane.** Waiters gain `pid`
+  and `pane`, holders `pane`: the `$TMUX_PANE` the run started from, or
+  null. A worker queued here fires no harness hook, so mu reads these to
+  report it waiting rather than stalled (every-harness D14). `state.json`
+  stores `pane` only when set.
 
 ## 0.2.4
 
