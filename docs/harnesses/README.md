@@ -14,6 +14,23 @@ extension ships in the npm package and isn't covered here.
 | opencode | [`examples/opencode-muzzle.ts`](../../examples/opencode-muzzle.ts) | **no** (D23) |
 | aider, cron, humans | wrap by hand | n/a |
 
+`muzzle init` writes each snippet into the harness's own settings file for
+you: every harness whose config directory exists, or the ones
+`--hooks claude,codex,cursor-agent,muse` (or `all`) names. Those files are
+shared with mu, murmur, museum and your own hooks (mu's every-harness spec
+D13), so `init` touches only handlers whose command starts `muzzle hook`;
+one that runs a gate through `muzzle run` or `muzzle wrap` is yours, and
+stays. It adds a missing entry, sets a missing `"type": "command"`, drops
+an `async` (an async handler can't rewrite), and removes its own stale
+ones: a duplicate, or a `muzzle hook` handler under another matcher or on
+another event. Every other handler, group, matcher and key stays where it
+was, in order. A file already right is not rewritten, so a second run
+changes nothing; a symlinked file keeps its link; a file that is not a
+JSON object is reported, left alone, and `init` exits 125. A handler that
+runs muzzle by absolute path is yours, so `init` adds its own beside it.
+Codex asks you to trust the new hook once (`/hooks`). `tests/init.rs`
+checks that a fresh `init` writes exactly these snippets.
+
 `tests/harnesses.rs` reads the JSON files and runs the `command` string
 from each with `sh -c`. It pipes each stored payload from
 `tests/fixtures/hooks/` into that command and checks the reply. Edit a
@@ -120,7 +137,10 @@ Merge [`codex.hooks.json`](codex.hooks.json) into `~/.codex/hooks.json`
 }
 ```
 
-The inline form in `config.toml` is equivalent:
+The inline form in `config.toml` is equivalent. Use one or the other:
+with both, each shell call is matched twice. `muzzle init` adds no
+`hooks.json` entry when `config.toml` already runs `muzzle hook`, and
+`muzzle doctor` warns when both do.
 
 ```toml
 [[hooks.PreToolUse]]
@@ -261,8 +281,11 @@ use and nested cargo calls, which is why muzzle doesn't ship one.
 ## Checking
 
 `muzzle doctor` reports `claude hook` and `codex hook` as `installed` when
-it finds `muzzle hook` in that harness's hook config. It doesn't look at
-Muse Code's or cursor-agent's config yet. To check by hand:
+it finds `muzzle hook` in that harness's hook config, user or project. Its
+`hook entries` line checks the global file of each harness set up here
+against what `muzzle init` writes: `ok`, `drift` (with a warning naming
+what differs and `muzzle init` as the fix), `none` or `unreadable`. To
+check by hand:
 
 ```sh
 muzzle hook claude < tests/fixtures/hooks/claude-bash-match.json

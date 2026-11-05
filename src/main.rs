@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use muzzle::cli::{BenchCommand, Cli, Command};
-use muzzle::{bench, doctor, exit, report, rules, run, status};
+use muzzle::{bench, doctor, exit, init, report, rules, run, status};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -13,6 +13,7 @@ fn main() -> ExitCode {
         Command::Hook(args) => rules::hook_main(args),
         Command::Status(args) => status::main(args),
         Command::Doctor(args) => doctor::main(args),
+        Command::Init(args) => init::main(args),
         Command::Report(args) => report::main(args),
         Command::Bench(args) => match &args.command {
             BenchCommand::Run(args) => bench::run_main(args),

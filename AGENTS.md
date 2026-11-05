@@ -44,6 +44,7 @@ dependency is pre-declared, so a unit edits only its own files.
 | `src/repo.rs` | which repo a run belongs to (D27a) |
 | `src/rules/` | `config/` (load, merge, template, hash), `resolve.rs` (what applies at a cwd), `shell.rs`, `heads.rs` (command rules), `hook.rs`; `match`, `wrap` |
 | `src/status.rs` | `status` |
+| `src/init/` | `init` (every-harness D13): `plan.rs` (pure), `json.rs` (order-keeping JSON), `mod.rs` (I/O, check for doctor) |
 | `src/doctor/` | `doctor`: `gather.rs` (I/O), `checks.rs` (pure), `render.rs` |
 | `src/report/` | `report`: `period.rs`, `rows.rs`, `by_repo.rs`, `machine.rs`, `render.rs` |
 | `src/bench/` | `bench run` and `bench burn` (`replay/`), `bench probe` (`probe.rs`) |

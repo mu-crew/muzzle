@@ -66,6 +66,7 @@ impl Env {
             .env_remove("MUZZLE_CLASS")
             .env_remove("MU_MANAGED_AGENT")
             .env_remove("MU_AGENT_NAME")
+            .env_remove("TMUX_PANE")
             .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("CODEX_HOME")
             .env_remove("PI_CODING_AGENT_DIR")
@@ -85,15 +86,30 @@ impl Env {
 
     /// `muzzle run` as agent `agent`, leading its own group as pi runs it.
     fn run(&self, agent: &str, class: &str, slots: &str, rule: &str) -> Child {
-        self.cmd(&[
+        self.run_in(agent, class, slots, rule, None)
+    }
+
+    /// [`Env::run`] from tmux pane `pane`, when given.
+    fn run_in(
+        &self,
+        agent: &str,
+        class: &str,
+        slots: &str,
+        rule: &str,
+        pane: Option<&str>,
+    ) -> Child {
+        let mut c = self.cmd(&[
             "run", "--slots", slots, "--class", class, "--rule", rule, "--", "sleep", "30",
-        ])
-        .env("MU_AGENT_NAME", agent)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .unwrap()
+        ]);
+        if let Some(p) = pane {
+            c.env("TMUX_PANE", p);
+        }
+        c.env("MU_AGENT_NAME", agent)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap()
     }
 
     fn copy(&self, from: &str, to: &str) {
@@ -141,7 +157,7 @@ fn status_json_shows_live_holders_and_waiters() {
     }));
     // 1 slot free. A normal 2-slot waiter, then a high 2-slot one: neither
     // fits, and the later high one is listed first (D10).
-    let mut worker = env.run("worker-7", "normal", "2", "gate");
+    let mut worker = env.run_in("worker-7", "normal", "2", "gate", Some("%7"));
     let mut human = env.run("human", "high", "2", "cargo-test");
     assert!(eventually(Duration::from_secs(5), || {
         env.store().read().unwrap().waiters.len() == 2
@@ -194,6 +210,22 @@ fn status_json_shows_live_holders_and_waiters() {
         })
         .collect();
     assert_eq!(w, [(1, "human", "high", 2), (2, "worker-7", "normal", 2)]);
+    // every-harness D14: each entry names its muzzle's pid and pane, so mu
+    // can tell a worker queued here from a stalled one.
+    let who: Vec<(u64, &Value)> = v["waiting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| (w["pid"].as_u64().unwrap(), &w["pane"]))
+        .collect();
+    assert_eq!(
+        who,
+        [
+            (u64::from(human.id()), &Value::Null),
+            (u64::from(worker.id()), &Value::from("%7"))
+        ]
+    );
+    assert_eq!(h.get("pane"), Some(&Value::Null), "{h}");
 
     // Text form names the same entries.
     let text = String::from_utf8(env.output(&["status"]).stdout).unwrap();

@@ -80,6 +80,11 @@ pub struct Claim {
     pub repo: Option<String>,
     /// The config hash (D28), copied into the run record.
     pub cfg: Option<String>,
+    /// The tmux pane the run was started from (`$TMUX_PANE`), so mu can
+    /// tell a worker queued here from a stalled one (every-harness D14).
+    /// Added field: absent in a state file an older muzzle wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +476,7 @@ mod tests {
             cwd: "/tmp".into(),
             repo: None,
             cfg: Some("a1b2c3".into()),
+            pane: None,
         }
     }
 
