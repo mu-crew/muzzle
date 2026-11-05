@@ -1,0 +1,12 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "subagent_spawn",
+  "tool_input": {"command_id": "count-files-1", "objective": "Count the files in the workspace.", "role": "Count files in directory"},
+  "session_id": "00000000-0000-7000-8000-000000000001",
+  "turn_id": "00000000-0000-7000-8000-000000000003",
+  "cwd": "/home/user/my-project",
+  "transcript_path": null,
+  "model": "example-model",
+  "permission_mode": "default",
+  "model_provider": "example"
+}

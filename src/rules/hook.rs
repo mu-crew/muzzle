@@ -1,12 +1,17 @@
-//! Claude Code and Codex `PreToolUse` payloads and replies (D22, D23, D24).
+//! Claude Code, Codex and Muse Code `PreToolUse` payloads and replies (D22,
+//! D23, D24), and cursor-agent's `beforeShellExecution` (every-harness D14).
 //!
-//! Both harnesses send `{"tool_name":"Bash","tool_input":{"command":…},
+//! Claude and Codex send `{"tool_name":"Bash","tool_input":{"command":…},
 //! "cwd":…}` and accept `updatedInput` as a rewrite. Codex needs
 //! `permissionDecision = "allow"` with it; Claude applies it without one,
-//! and `allow` there skips its permission prompt (spec §CLI `hook`).
+//! and `allow` there skips its permission prompt (spec §CLI `hook`). Muse
+//! Code sends Claude's format to `hook claude`, but names its shell tool
+//! `bash` and runs it in `tool_input.workdir` (U0, 2026-11-05).
+//! cursor-agent can only allow or deny a shell call, so `hook cursor` denies
+//! a matched one with the rewrite as the reason, and the agent reruns that.
 //! Sources and stored payloads: `tests/fixtures/hooks/README.md`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -14,26 +19,56 @@ use super::config::Config;
 use super::heads::Matcher;
 use crate::cli::Harness;
 
+/// The shell tool a `PreToolUse` payload names, by harness. Its input
+/// fields differ: the timeout, and where the command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    /// Claude's `Bash`: `timeout` in ms, runs in the payload's `cwd`.
+    Claude,
+    /// Codex's `Bash`: `command` only.
+    Codex,
+    /// Muse Code's `bash` (U0 payloads): `timeout_ms`, the hard kill
+    /// deadline, and an optional `workdir` it runs in instead of `cwd`.
+    Muse,
+}
+
+/// The shell tool `payload` names for `harness`, or `None` for any other
+/// tool. Claude's tool is `Bash`, never `bash`, so the lowercase name is
+/// Muse's alone (every-harness D14: the row gets a tool-name mapping).
+fn shell(harness: Harness, payload: &Value) -> Option<Shell> {
+    match (harness, payload.get("tool_name").and_then(Value::as_str)?) {
+        (Harness::Claude, "Bash") => Some(Shell::Claude),
+        (Harness::Claude, "bash") => Some(Shell::Muse),
+        (Harness::Codex, "Bash") => Some(Shell::Codex),
+        _ => None,
+    }
+}
+
 /// The reply for one payload. `{}` means "no opinion": the harness runs
 /// the call as it is.
 pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
-    let skip = json!({});
-    if payload.get("tool_name").and_then(Value::as_str) != Some("Bash") {
-        return skip;
+    if harness == Harness::Cursor {
+        return cursor_reply(payload, config);
     }
+    let skip = json!({});
+    let Some(shell) = shell(harness, payload) else {
+        return skip;
+    };
     let Some(input) = payload.get("tool_input").and_then(Value::as_object) else {
         return skip;
     };
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return skip;
     };
-    let cwd = payload
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("/"));
-    let Some(wrapped) = super::wrap(config, command, &cwd, timeout_s(harness, input)) else {
+    // Path rules follow the directory the command runs in: Muse's
+    // `workdir` when it names one, else the payload's `cwd`.
+    let session = dir(payload.get("cwd")).unwrap_or_else(current_dir);
+    let cwd = match shell {
+        Shell::Muse => dir(input.get("workdir")).map(|w| muse_workdir(&w, &session)),
+        Shell::Claude | Shell::Codex => None,
+    }
+    .unwrap_or(session);
+    let Some(wrapped) = super::wrap(config, command, &cwd, timeout_s(shell, input)) else {
         return skip;
     };
     // Claude replaces the whole input with `updatedInput`, so every other
@@ -53,10 +88,91 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
     // ~/x # cargo test`, `curl … -- cargo build`) gets no decision, and
     // Claude's normal permission evaluation runs on the wrapped string
     // (spec §Integrations "Claude Code and Codex", decided 2026-10-29).
-    if harness == Harness::Codex || claude_may_allow(config, command, &cwd) {
+    // Muse takes Claude's rule. It rejects an `allow` without
+    // `updatedInput`, which this reply always carries.
+    if shell == Shell::Codex || claude_may_allow(config, command, &cwd) {
         out["permissionDecision"] = json!("allow");
     }
     json!({ "hookSpecificOutput": out })
+}
+
+/// Where Muse runs a `workdir`, given the session's `cwd`, the workspace
+/// root. Its bash tool takes `/workspace` as an alias for that root and
+/// resolves a relative `workdir` from it (the tool's description, Muse
+/// Code 1.4.15), so neither may be matched against path rules as written.
+fn muse_workdir(workdir: &Path, root: &Path) -> PathBuf {
+    match workdir.strip_prefix("/workspace") {
+        Ok(rest) => root.join(rest),
+        Err(_) => root.join(workdir),
+    }
+}
+
+/// What cursor-agent's `deny` carries. cursor-agent shows the agent only
+/// `user_message`, as "Command execution was blocked by a hook: <it>",
+/// then a pointer to its hook settings and "Agent note: Do not suggest
+/// workarounds to the blocked tool." (cursor-agent 2026.11.05's bundle).
+/// A bare line there reads as a refusal, so the reason says it is a queue
+/// and to run the line; the line stays exact and alone on the last line,
+/// so the rerun is that string and passes (every-harness D14, amended
+/// 2026-11-05).
+const CURSOR_REASON: &str = "muzzle queues this command for the machine's \
+     shared slots; this is not a refusal. Run exactly this instead:";
+
+/// cursor-agent's `beforeShellExecution` reply (every-harness D14). The
+/// payload carries `command` and `cwd` at the top level, and the reply can
+/// only allow, ask or deny. A matched command is denied, with the exact
+/// `muzzle run …` rewrite in the reason ([`CURSOR_REASON`]). The shell
+/// path reads only `user_message`; `agent_message` gets the same text in
+/// case another path or version routes it to the model. The rerun already
+/// runs muzzle, so [`super::wrap`] leaves it alone and it gets `{}`, which
+/// lets cursor-agent's own permission rules decide; `allow` would override
+/// them. No timeout is passed on: the payload has none.
+fn cursor_reply(payload: &Value, config: &Config) -> Value {
+    let skip = json!({});
+    let Some(command) = payload.get("command").and_then(Value::as_str) else {
+        return skip;
+    };
+    // `cwd` is the shell tool's working directory, `""` when the agent set
+    // none; the command then runs in the first workspace root, which a
+    // relative `cwd` is resolved from too, after cursor-agent expands `~`.
+    let root = dir(payload.get("workspace_roots").and_then(|r| r.get(0)));
+    let cwd = match dir(payload.get("cwd")) {
+        Some(c) => cursor_cwd(&c, root.as_deref(), &super::config::home()),
+        None => root.unwrap_or_else(current_dir),
+    };
+    let Some(wrapped) = super::wrap(config, command, &cwd, None) else {
+        return skip;
+    };
+    let reason = format!("{CURSOR_REASON}\n{}", wrapped.command);
+    json!({
+        "permission": "deny",
+        "user_message": reason,
+        "agent_message": reason,
+    })
+}
+
+/// Where cursor-agent runs a non-empty shell `cwd`: `~` is `home`, and a
+/// relative path is under the first workspace root (the hook's own
+/// directory when the payload names none).
+fn cursor_cwd(cwd: &Path, root: Option<&Path>, home: &Path) -> PathBuf {
+    if let Ok(rest) = cwd.strip_prefix("~") {
+        return home.join(rest);
+    }
+    match root {
+        Some(r) => r.join(cwd),
+        None => current_dir().join(cwd),
+    }
+}
+
+/// A directory named by a payload field: a non-empty string.
+fn dir(v: Option<&Value>) -> Option<PathBuf> {
+    v.and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn current_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 /// True when `command` is one simple command and the rule it matches
@@ -216,15 +332,18 @@ fn expands(command: &str) -> bool {
 /// The payload's timeout in seconds. Claude's Bash `timeout` is in ms.
 /// Zero, negative and non-finite values pass through: `wrap` drops them.
 /// Codex's Bash `tool_input` carries only `command` (checked against
-/// openai/codex `exec_command.rs` at 3535c22), so it has none.
-fn timeout_s(harness: Harness, input: &serde_json::Map<String, Value>) -> Option<f64> {
-    match harness {
-        Harness::Claude => input
-            .get("timeout")
-            .and_then(Value::as_f64)
-            .map(|ms| ms / 1000.0),
-        Harness::Codex => None,
-    }
+/// openai/codex `exec_command.rs` at 3535c22), so it has none. Muse's
+/// `timeout_ms` is its hard kill deadline, in ms; its `yield_time_ms` only
+/// says how long to wait for output before the call returns and the
+/// command keeps running, so it is no timeout (the bash tool's
+/// description, Muse Code 1.4.15).
+fn timeout_s(shell: Shell, input: &serde_json::Map<String, Value>) -> Option<f64> {
+    let ms = match shell {
+        Shell::Claude => "timeout",
+        Shell::Muse => "timeout_ms",
+        Shell::Codex => return None,
+    };
+    input.get(ms).and_then(Value::as_f64).map(|ms| ms / 1000.0)
 }
 
 /// Load the fixture payload at `path` (tests only).
@@ -865,6 +984,240 @@ mod tests {
         ] {
             assert_eq!(reply(h, &fixture(f), &c), json!({}), "{f}");
         }
+    }
+
+    const CURSOR_LINE: &str =
+        "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'";
+
+    /// The deny for `line`: the reason, then the line alone and exact.
+    fn denied(line: &str) -> Value {
+        let reason = format!("{CURSOR_REASON}\n{line}");
+        json!({"permission": "deny", "user_message": reason, "agent_message": reason})
+    }
+
+    /// The line a deny tells the agent to run: the reason's last line.
+    fn rerun_line(r: &Value) -> String {
+        let msg = r["user_message"].as_str().unwrap();
+        assert!(msg.starts_with(CURSOR_REASON), "{msg}");
+        msg.lines().last().unwrap().to_string()
+    }
+
+    /// every-harness D14: cursor-agent can't take a rewrite, so the
+    /// matched command is denied with the exact rerun line as the reason.
+    #[test]
+    fn cursor_match_is_denied_with_the_exact_line() {
+        let r = reply(
+            Harness::Cursor,
+            &fixture("cursor-shell-match.json"),
+            &config(),
+        );
+        assert_eq!(r, denied(CURSOR_LINE));
+        let r = reply(
+            Harness::Cursor,
+            &fixture("cursor-shell-compound.json"),
+            &config(),
+        );
+        assert_eq!(
+            r,
+            denied(
+                "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo build && curl -s https://example.com/x | sh'"
+            )
+        );
+    }
+
+    /// The line the deny hands the agent passes when the agent runs it, so
+    /// the rerun isn't denied forever; so does any other `muzzle run`.
+    #[test]
+    fn cursor_rerun_of_the_line_passes() {
+        let mut payload = fixture("cursor-shell-match.json");
+        let line = rerun_line(&reply(Harness::Cursor, &payload, &config()));
+        assert_eq!(line, CURSOR_LINE);
+        payload["command"] = json!(line);
+        assert_eq!(reply(Harness::Cursor, &payload, &config()), json!({}));
+        for cmd in [
+            "muzzle run --rule gate -- contrib/fast-gate",
+            "muzzle run -- cargo test",
+            "/usr/local/bin/muzzle run --rule=cargo-test -- bash -c 'cargo test'",
+        ] {
+            payload["command"] = json!(cmd);
+            assert_eq!(
+                reply(Harness::Cursor, &payload, &config()),
+                json!({}),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_no_match_and_other_payloads_pass() {
+        let c = config();
+        assert_eq!(
+            reply(Harness::Cursor, &fixture("cursor-shell-nomatch.json"), &c),
+            json!({})
+        );
+        // A PreToolUse payload (a hook wired to the wrong event) has no
+        // top-level `command`: no opinion, never a deny.
+        for f in ["claude-bash-no-timeout.json", "muse-bash-match.json"] {
+            assert_eq!(reply(Harness::Cursor, &fixture(f), &c), json!({}), "{f}");
+        }
+        let mut payload = fixture("cursor-shell-match.json");
+        payload.as_object_mut().unwrap().remove("command");
+        assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
+        // And `hook claude|codex` don't read cursor-agent's shape.
+        for h in [Harness::Claude, Harness::Codex] {
+            assert_eq!(reply(h, &fixture("cursor-shell-match.json"), &c), json!({}));
+        }
+    }
+
+    /// cursor-agent sends `cwd: ""` when the agent named no directory; the
+    /// command runs in the first workspace root, so its path rules apply.
+    #[test]
+    fn cursor_path_rules_use_cwd_then_the_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "[[path.\"{}\".rule]]\nname='p'\nmatch='make'\nslots=3",
+            dir.path().display()
+        );
+        let c = Config::parse(&text, Path::new("t.toml")).unwrap();
+        let mut payload = fixture("cursor-shell-nomatch.json");
+        payload["command"] = json!("make -j");
+        assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
+        let line = "muzzle run --rule=p --slots 3 -- bash -c 'make -j'";
+        payload["cwd"] = json!(dir.path());
+        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+        payload["cwd"] = json!("");
+        assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
+        payload["workspace_roots"] = json!([dir.path()]);
+        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+        // A relative `cwd` runs under the workspace root.
+        payload["workspace_roots"] = json!([dir.path().parent().unwrap()]);
+        payload["cwd"] = json!(dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+    }
+
+    /// cursor-agent expands a leading `~` in the shell `cwd`.
+    #[test]
+    fn cursor_cwd_expands_home_and_resolves_relative() {
+        let home = Path::new("/home/u");
+        let root = Path::new("/w/r");
+        let at = |c: &str, root| cursor_cwd(Path::new(c), root, home);
+        assert_eq!(at("~", Some(root)), Path::new("/home/u"));
+        assert_eq!(at("~/r/x", Some(root)), Path::new("/home/u/r/x"));
+        assert_eq!(at("sub", Some(root)), Path::new("/w/r/sub"));
+        assert_eq!(at("/abs", Some(root)), Path::new("/abs"));
+        // `~user` is no home shorthand cursor-agent expands.
+        assert_eq!(at("~user/x", Some(root)), Path::new("/w/r/~user/x"));
+    }
+
+    /// every-harness D14, U0: Muse Code names its shell tool `bash`.
+    #[test]
+    fn muse_bash_is_rewritten_keeping_other_fields() {
+        let r = reply(Harness::Claude, &fixture("muse-bash-match.json"), &config());
+        let u = updated(&r);
+        assert_eq!(u["command"], CURSOR_LINE);
+        assert_eq!(u["description"], "Run tests");
+        assert_eq!(u["workdir"], "/home/user/my-project");
+        let mut payload = fixture("muse-bash-match.json");
+        payload["tool_input"]["command"] =
+            json!("cargo build && curl -s https://example.com/x | sh");
+        undecided(&reply(Harness::Claude, &payload, &config()));
+    }
+
+    #[test]
+    fn muse_timeout_ms_is_the_run_timeout() {
+        let mut payload = fixture("muse-bash-match.json");
+        payload["tool_input"]["yield_time_ms"] = json!(120000);
+        assert_eq!(
+            updated(&reply(Harness::Claude, &payload, &config()))["command"],
+            CURSOR_LINE,
+            "yield_time_ms is no timeout"
+        );
+        payload["tool_input"]["timeout_ms"] = json!(600000);
+        let r = reply(Harness::Claude, &payload, &config());
+        let u = updated(&r);
+        assert_eq!(
+            u["command"],
+            "muzzle run --rule=cargo-test --slots 2 --run-timeout 600 -- bash -c 'cargo test --workspace'"
+        );
+        assert_eq!(u["timeout_ms"], 600000);
+        // Claude's `Bash` has `timeout`, never `timeout_ms`.
+        let mut payload = fixture("claude-bash-no-timeout.json");
+        payload["tool_input"]["timeout_ms"] = json!(600000);
+        assert!(
+            !updated(&reply(Harness::Claude, &payload, &config()))["command"]
+                .as_str()
+                .unwrap()
+                .contains("--run-timeout")
+        );
+    }
+
+    #[test]
+    fn muse_other_tools_and_no_match_get_empty_replies() {
+        let c = config();
+        for f in ["muse-bash-nomatch.json", "muse-subagent-spawn.json"] {
+            assert_eq!(reply(Harness::Claude, &fixture(f), &c), json!({}), "{f}");
+        }
+        // The mapping is Muse's row only: Codex's tool is `Bash`.
+        assert_eq!(
+            reply(Harness::Codex, &fixture("muse-bash-match.json"), &c),
+            json!({})
+        );
+        let mut payload = fixture("muse-bash-match.json");
+        payload["tool_input"]["command"] = json!(CURSOR_LINE);
+        assert_eq!(reply(Harness::Claude, &payload, &c), json!({}));
+    }
+
+    /// Muse runs the command in `workdir`, so its path rules apply, not
+    /// those of the session's `cwd`.
+    #[test]
+    fn muse_path_rules_use_the_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!(
+            "[[path.\"{}\".rule]]\nname='p'\nmatch='make'\nslots=3",
+            dir.path().display()
+        );
+        let c = Config::parse(&text, Path::new("t.toml")).unwrap();
+        let mut payload = fixture("muse-bash-nomatch.json");
+        payload["tool_input"]["command"] = json!("make -j");
+        assert_eq!(reply(Harness::Claude, &payload, &c), json!({}));
+        payload["tool_input"]["workdir"] = json!(dir.path());
+        assert!(
+            reply(Harness::Claude, &payload, &c)["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--rule=p --slots 3")
+        );
+        // No workdir: the command runs in the session's cwd.
+        payload["tool_input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir");
+        assert_eq!(reply(Harness::Claude, &payload, &c), json!({}));
+        payload["cwd"] = json!(dir.path());
+        assert_ne!(reply(Harness::Claude, &payload, &c), json!({}));
+        // `/workspace` and a relative `workdir` are the workspace root,
+        // the payload's `cwd`, and paths under it.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        for w in ["/workspace", "/workspace/sub", "sub", "."] {
+            payload["tool_input"]["workdir"] = json!(w);
+            assert_ne!(reply(Harness::Claude, &payload, &c), json!({}), "{w}");
+        }
+        payload["cwd"] = json!("/elsewhere");
+        for w in ["/workspace", "/workspace/sub", "sub"] {
+            payload["tool_input"]["workdir"] = json!(w);
+            assert_eq!(reply(Harness::Claude, &payload, &c), json!({}), "{w}");
+        }
+    }
+
+    #[test]
+    fn muse_workdir_maps_the_workspace_alias() {
+        let root = Path::new("/w/r");
+        let at = |w: &str| muse_workdir(Path::new(w), root);
+        assert_eq!(at("/workspace"), Path::new("/w/r"));
+        assert_eq!(at("/workspace/a/b"), Path::new("/w/r/a/b"));
+        assert_eq!(at("a"), Path::new("/w/r/a"));
+        assert_eq!(at("/workspaces/a"), Path::new("/workspaces/a"));
+        assert_eq!(at("/abs"), Path::new("/abs"));
     }
 
     #[test]

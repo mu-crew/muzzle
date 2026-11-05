@@ -40,5 +40,5 @@ fn every_subcommand_is_implemented() {
 #[test]
 fn bad_usage_exits_2() {
     assert_eq!(muzzle(&["run"]).status.code(), Some(2));
-    assert_eq!(muzzle(&["hook", "cursor"]).status.code(), Some(2));
+    assert_eq!(muzzle(&["hook", "aider"]).status.code(), Some(2));
 }
