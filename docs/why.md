@@ -66,8 +66,9 @@ muzzle turns contention into waiting. The intent is that each job, once
 admitted, runs closer to its uncontended time and the machine stays
 responsive, while the whole batch may take longer. leasehold, a tool with the same admission model,
 measured the same work taking up to 1.5× as long in return for a
-responsive machine. Whether muzzle's trade is worth it on a real crew is
-measured, not assumed: see the README's "Measured" section.
+responsive machine. Replays of real days measured muzzle's trade (see the
+README's "Does it help?" section); a week of real crew use hasn't been
+measured yet.
 
 ## What it isn't
 
