@@ -50,26 +50,46 @@ has the details.
 **Never put `timeout` outside `muzzle run`**: it counts the queue wait. Use
 `--run-timeout S`.
 
-## Measured
+## Does it help?
 
-On linuxpc (16 cores), the real swayward gates replayed from busy days,
-without and with muzzle ([eval](docs/eval/2026-11-muzzle-v1.md),
-[results](docs/bench/0.2.4/)):
+**In short:** when the machine has room, muzzle costs nothing. On an
+overloaded machine it keeps things usable and each job's run time steady,
+but at the default budget it finishes fewer jobs per hour. A larger budget
+wins most of that back.
 
-- **The busiest real windows at real speed show no measurable cost**: no
-  longer makespan, run times within about 1 s, probe unchanged. Those
-  windows never filled the budget, so muzzle rarely queued.
-- **Under overload (the busiest window at 12× and 24×), muzzle keeps the
-  machine responsive**: load at or under 20 instead of 157, `git status` p95
-  about 7 ms instead of 103 ms, and the run p90 of rule-matched calls steady at
-  ~95 s instead of up to 561 s.
-- **The cost is throughput**: 40–49% fewer jobs per hour at the default
-  budget (cores − 2), because gates claim more slots than they keep busy.
-  A budget of 1.5× cores (`slots = 24`) cut the loss to 13% while keeping
-  `git status` p95 under 10 ms.
+We replayed real days of agent work on a 16-core Linux box (linuxpc). The
+replay starts each gate, build and test run at the time it really happened,
+once without muzzle (the hand-set `CARGO_BUILD_JOBS` caps the agents used
+before) and once with it.
+[Full write-up](docs/eval/2026-11-muzzle-v1.md), [raw results](docs/bench/0.2.4/).
 
-One workload on one machine, and no rollout week, so gate p90 and merged
-tasks per hour in real use are not measured; the eval lists the limits.
+**A normal busy day:** no difference. Both busiest windows replayed at real
+speed finished at the same time, with run times within about a second of
+each other. The machine never ran short of slots, so muzzle hardly ever made
+anything wait.
+
+**Overload:** the busiest window again, with arrivals packed 12 and 24 times
+as densely:
+
+| at 24× | without muzzle | with muzzle |
+| --- | --- | --- |
+| load average, peak (16 cores) | 157 | 19 |
+| `git status` in a scratch repo, p95 | 103 ms | 7 ms |
+| a job's run time, p90 | 561 s | 96 s |
+| jobs finished per hour | 486 | 248 |
+
+muzzle keeps the machine usable for whoever is working in it, but at the
+default budget (cores − 2) it finishes 40–49% fewer jobs per hour. Gates
+claim more cores than they keep busy, so the budget fills while cores sit
+idle. In a 12× run with a budget of 1.5× cores (`slots = 24` on this
+machine), the loss fell from 40% to 13% and `git status` stayed under
+10 ms. If you see muzzle queueing
+while your CPU sits idle, raise `slots` (see
+[tune](npm/muzzle/skills/muzzle/recipes/tune.md)).
+
+**Limits:** one workload, the swayward gates, on one machine. The overload
+is simulated by packing a real day's arrivals closer together. We haven't
+yet measured a week of real use with muzzle against the weeks before it.
 
 ## More
 
