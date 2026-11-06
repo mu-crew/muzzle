@@ -34,7 +34,7 @@ Read the machine section before the rows:
 | --- | --- |
 | blocked-idle (slot-s) | slots sat free while someone waited: the head of the queue is too big to fit, so everything behind it waits (strict FIFO). Shrink the over-sized rule |
 | CPU efficiency (low) | claims are bigger than the jobs use: weights too big |
-| utilisation near 100% while the machine's CPU stays low | the budget is saturated but the cores aren't: the reserve is too big |
+| utilisation near 100% while the machine's CPU stays low | the budget is saturated but the cores aren't: the reserve is too big, or the weights claim more than the jobs keep busy. Where CPU isn't measured (container gates, D16a), try an explicit `slots` above the core count: on linuxpc's swayward gates, 1.5× cores recovered most of the throughput lost at cores − 2 and kept `git status` p95 under 10 ms (docs/eval/2026-11-muzzle-v1.md §2c) |
 | queue non-empty | how often anyone waited at all. Near 0% means the weights cost nothing yet |
 | unclaimed load (cores) | load that no claim accounts for: `load1 − held` at admission. High means heavy work runs outside muzzle. Find the unmatched heavy commands (step 2) and add rules, or raise `reserve` to leave room for them. It is rough: the load average lags, and on Linux it counts I/O wait |
 

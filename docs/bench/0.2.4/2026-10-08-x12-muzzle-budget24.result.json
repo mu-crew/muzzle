@@ -1,0 +1,58 @@
+{
+  "calls": {
+    "failed": 11,
+    "light_skipped": 620,
+    "matched": 62,
+    "replayed": 121,
+    "unmatched_heavy": 59
+  },
+  "jobs_per_hour": 353.3,
+  "load": {
+    "load1_max": 25.4,
+    "load1_p50": 16.39,
+    "samples": 1109
+  },
+  "machine": {
+    "budget": 24,
+    "cfg": "184f02",
+    "cores": 16
+  },
+  "makespan_s": 1232.95,
+  "matched_run_s": {
+    "p50": 73.63,
+    "p90": 131.72
+  },
+  "matched_wait_s": {
+    "p50": 2.36,
+    "p90": 195.36
+  },
+  "max_slots_held": 24,
+  "mode": "muzzle",
+  "oom_kills": 0,
+  "probe": {
+    "bursts": 1109,
+    "git_status_p95_ms": 9.66,
+    "sleep_late_p99_ms": 1.87
+  },
+  "run_s": {
+    "p50": 57.05,
+    "p90": 118.76
+  },
+  "speed": 12.0,
+  "tier": "real",
+  "trace": {
+    "calls_kept": 5712,
+    "cores": 16,
+    "date": "2026-10-08",
+    "host": "linuxpc",
+    "ram_gb": 31,
+    "window_s": 86400.0
+  },
+  "v": 1,
+  "wait_s": {
+    "p50": 0.0,
+    "p90": 170.28
+  },
+  "window": "busiest:3h",
+  "window_start_s": 56272.0
+}
