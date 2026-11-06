@@ -22,6 +22,10 @@ Added:
   already right untouched: a second run changes nothing (every-harness
   D13). codex hooked inline in `config.toml` gets no second entry. `muzzle doctor` checks the same plan: a new `hook entries` line,
   `hook_entries` in `--json`, and a warning naming `muzzle init` on drift.
+  It also warns when Muse Code has a muzzle entry and `XDG_CONFIG_HOME`
+  moves the config: Muse runs hooks without that variable, so its
+  `muzzle hook claude` reads `~/.config/muzzle/config.toml` instead,
+  unless `~/.config/muzzle` links to the moved directory.
 - **`status --json` names each entry's pid and pane.** Waiters gain `pid`
   and `pane`, holders `pane`: the `$TMUX_PANE` the run started from, or
   null. A worker queued here fires no harness hook, so mu reads these to

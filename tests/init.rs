@@ -58,7 +58,12 @@ impl Home {
     }
 
     fn ok(&self, args: &[&str]) -> String {
-        let out = self.muzzle(args);
+        self.ok_env(args, &[])
+    }
+
+    /// [`Self::ok`] with `env` set, as [`Self::muzzle_env`].
+    fn ok_env(&self, args: &[&str], env: &[(&str, PathBuf)]) -> String {
+        let out = self.muzzle_env(args, env);
         assert!(out.status.success(), "{args:?}: {out:?}");
         String::from_utf8(out.stdout).unwrap()
     }
@@ -338,4 +343,46 @@ fn codex_hooked_inline_in_config_toml_is_not_hooked_twice() {
         text.contains("so each shell call is matched twice"),
         "{text}"
     );
+}
+
+#[test]
+fn doctor_warns_when_muse_hooks_read_another_config() {
+    let home = Home::new();
+    let moved = |text: &str| text.contains("Muse Code runs hooks without it");
+    // XDG_CONFIG_HOME is set away from ~/.config, but Muse has no entry.
+    std::fs::create_dir_all(home.path("home/.claude")).unwrap();
+    home.ok(&["init"]);
+    assert!(!moved(&home.ok(&["doctor"])));
+
+    home.ok(&["init", "--hooks", "muse"]);
+    let text = home.ok(&["doctor"]);
+    assert!(moved(&text), "{text}");
+    let default = home.path("home/.config/muzzle/config.toml");
+    assert!(
+        text.contains(&format!("`muzzle hook claude` reads {}", default.display())),
+        "{text}"
+    );
+    let v: Value = serde_json::from_str(&home.ok(&["doctor", "--json"])).unwrap();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| moved(w.as_str().unwrap())),
+        "{v}"
+    );
+
+    // XDG_CONFIG_HOME at its default.
+    let text = home.ok_env(
+        &["doctor"],
+        &[("XDG_CONFIG_HOME", home.path("home/.config"))],
+    );
+    assert!(text.contains("hook entries") && !moved(&text), "{text}");
+
+    // The default directory linked to the moved one: the same rules.
+    std::fs::create_dir_all(home.path("config/muzzle")).unwrap();
+    std::os::unix::fs::symlink(home.path("config/muzzle"), home.path("home/.config/muzzle"))
+        .unwrap();
+    let text = home.ok(&["doctor"]);
+    assert!(text.contains("hook entries") && !moved(&text), "{text}");
 }

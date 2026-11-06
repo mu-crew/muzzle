@@ -57,6 +57,11 @@ pub struct Facts {
     pub config_path: PathBuf,
     pub config_exists: bool,
     pub config: Result<Config, String>,
+    /// The config a hook reads when its harness keeps `HOME` but drops
+    /// `XDG_CONFIG_HOME`, as Muse Code does (every-harness D14):
+    /// `~/.config/muzzle/config.toml`, or `config_path` itself when the
+    /// two name one file.
+    pub cleared_env_config: PathBuf,
     /// `state.json`'s stored budget (D17a), when one is stored and not
     /// expired ([`crate::state::State::live_budget`]).
     pub stored: Option<Budget>,
