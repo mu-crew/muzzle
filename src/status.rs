@@ -35,7 +35,7 @@ pub struct Status {
     /// Added fields (0.2.3 S4): how many holders and waiters are `slow`.
     pub slow_holders: usize,
     pub slow_waiters: usize,
-    /// Added field (0.3.0 D7a): the factor on the cores before the reserve.
+    /// Added field (0.2.5 D7a): the factor on the cores before the reserve.
     pub overcommit: f64,
 }
 

@@ -23,7 +23,7 @@ use template::write_template;
 
 /// D7: default reserve 2.
 pub const DEFAULT_RESERVE: u32 = 2;
-/// D7a (0.3.0): slots claim a job's peak parallelism, which it holds for
+/// D7a (0.2.5): slots claim a job's peak parallelism, which it holds for
 /// only part of its run, so the budget overcommits the cores. At 1.0 the
 /// budget filled while load1 p50 sat at ~9 of 16 cores; 24 slots (1.5x 16
 /// cores, no reserve) cut the lost throughput from 40% to 13% and 20 slots
@@ -328,7 +328,7 @@ pub(super) mod tests {
 
     #[test]
     fn d7a_budget_overcommits_the_cores_before_the_reserve() {
-        // 16 cores: 0.2 gave 14; 0.3 gives floor(24) - 2.
+        // 16 cores: 0.2.4 gave 14; 0.2.5 gives floor(24) - 2.
         assert_eq!(budget_for(16, 2, DEFAULT_OVERCOMMIT), 22);
         assert_eq!(budget_for(16, 2, 1.0), 14);
         assert_eq!(budget_for(8, 2, 1.5), 10);

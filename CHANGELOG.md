@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.5
 
 Spec: D7a in `docs/specs/2026-10-29-muzzle.md`.
 
@@ -14,12 +14,12 @@ Changed:
   finished 40–49% fewer jobs per hour than no muzzle, while 24 slots
   (1.5× cores, no reserve) cut that to 13% with `git status` p95 under
   10 ms, and 20 slots to 23% (`docs/eval/2026-11-muzzle-v1.md`). The new
-  default's 22 lies between the two; no run measured it. `overcommit = 1.0` gives the 0.2
-  budget back; an explicit `slots =` still overrides both. Memory caps are
+  default's 22 lies between the two; no run measured it. `overcommit = 1.0`
+  gives the 0.2.4 budget back; an explicit `slots =` still overrides both. Memory caps are
   unchanged (RAM / cores per slot). A stored budget in `state.json` keeps
   applying until the file has been idle for an hour (D17a).
 - **Every config hash changes** on upgrade: the effective `overcommit` is
-  part of it (D28), so `report --compare` splits 0.2 and 0.3 runs.
+  part of it (D28), so `report --compare` splits 0.2.4 and 0.2.5 runs.
 
 Added:
 
