@@ -200,9 +200,14 @@ Muse runs hooks with a cleared environment: only `HOME`, `PATH`, `USER`,
 `LOGNAME`, `TMPDIR`, `SHELL`, `LANG`, `TERM` and the proxy variables
 survive. So `muzzle hook claude` there reads `~/.config/muzzle/config.toml`
 even when `XDG_CONFIG_HOME` is set, while the `muzzle run` it writes runs
-in Muse's shell, which keeps `XDG_CONFIG_HOME`. If you set it, keep the
-config at the default path too (a symlink will do), or the hook and the
-run read different rules.
+in Muse's shell, which keeps `XDG_CONFIG_HOME`. If you set it, link
+`~/.config/muzzle` to `$XDG_CONFIG_HOME/muzzle`, or the hook and the run
+read different rules. Link the directory, not the file: a relative
+`include` resolves from the directory the path names, so through a linked
+file the hook looks for it under `~/.config/muzzle`. `muzzle doctor` warns
+when Muse has a muzzle entry and the hook would read other rules than the
+run. Claude Code and Codex keep the variable, so their hooks read the moved
+config.
 
 ## cursor-agent
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::{Facts, Harnesses, RunsLog, read_config};
+use crate::rules::config::{Config, canonical_prefix};
 use crate::runlog;
 use crate::state::Store;
 
@@ -185,6 +186,49 @@ pub fn harnesses(home: &Path, cwd: &Path) -> Harnesses {
     }
 }
 
+/// The config `muzzle hook` reads under a harness that keeps `HOME` and
+/// drops `XDG_CONFIG_HOME` (Muse Code): the default under `home`, or
+/// `config_path` when the hook would read the same rules from it. Only
+/// doctor looks: how hooks find their rules is unchanged.
+fn cleared_env_config(config_path: &Path, home: &Path) -> PathBuf {
+    let default = home.join(".config").join("muzzle").join("config.toml");
+    let dir = |p: &Path| canonical_prefix(p.parent().unwrap_or(p));
+    // A linked `muzzle` directory: includes, relative to it (P5), match too.
+    let same_dir =
+        default.file_name() == config_path.file_name() && dir(&default) == dir(config_path);
+    if default == config_path
+        || same_dir
+        || (canonical_prefix(&default) == canonical_prefix(config_path)
+            && same_includes(config_path, &default))
+    {
+        config_path.to_path_buf()
+    } else {
+        default
+    }
+}
+
+/// A linked file is one file, but includes resolve from the directory the
+/// path names, not the link's target (P5), so `include = ["machine.toml"]`
+/// reads a different file through each path. One root file read through
+/// both; a config that does not parse is reported on its own.
+fn same_includes(config_path: &Path, default: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let includes = |p: &Path| {
+        Config::parse(&text, p).map(|c| {
+            c.includes()
+                .into_iter()
+                .map(|(p, _)| canonical_prefix(&p))
+                .collect::<Vec<_>>()
+        })
+    };
+    match (includes(config_path), includes(default)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true,
+    }
+}
+
 pub(super) fn gather() -> Facts {
     let (config_path, config, config_exists) = read_config();
     let (state_dir, state_writable, state_readable, stored) = match Store::open_default() {
@@ -203,6 +247,8 @@ pub(super) fn gather() -> Facts {
         .map(|d| d.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("/"));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    // `config::path`'s own home, so the two differ only by XDG_CONFIG_HOME.
+    let cleared_env_config = cleared_env_config(&config_path, &crate::rules::config::home());
     let recent = recent_runs(&state_dir);
     Facts {
         os: std::env::consts::OS,
@@ -212,6 +258,7 @@ pub(super) fn gather() -> Facts {
         config_path,
         config_exists,
         config: config.map_err(|e| e.to_string()),
+        cleared_env_config,
         stored,
         runs: runs_log(&state_dir, &recent),
         runlog: runlog::stats(&state_dir).ok(),
@@ -257,6 +304,51 @@ mod tests {
         assert_eq!((l.lines, l.bytes), (2, 66), "`bad` is not a run");
         assert_eq!(l.oldest.as_deref(), Some("2026-10-01T00:00:00Z"));
         assert_eq!(l.newest.as_deref(), Some("2026-10-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn cleared_env_config_is_the_default_unless_the_hook_reads_the_same_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let default = home.join(".config/muzzle/config.toml");
+        // Unset or set to the default.
+        assert_eq!(cleared_env_config(&default, &home), default);
+        let xdg = dir.path().join("xdg/muzzle/config.toml");
+        assert_eq!(cleared_env_config(&xdg, &home), default, "nothing exists");
+        std::fs::create_dir_all(xdg.parent().unwrap()).unwrap();
+        std::fs::write(&xdg, "").unwrap();
+        assert_eq!(
+            cleared_env_config(&xdg, &home),
+            default,
+            "only the XDG file"
+        );
+        // `~/.config/muzzle` linked to the XDG directory, before and after
+        // the file exists.
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::os::unix::fs::symlink(xdg.parent().unwrap(), home.join(".config/muzzle")).unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), xdg);
+        std::fs::remove_file(&xdg).unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), xdg, "no file yet");
+        // A copy is not the same file: it drifts.
+        std::fs::remove_file(home.join(".config/muzzle")).unwrap();
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, "").unwrap();
+        std::fs::write(&xdg, "").unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), default);
+        // Only the file linked: one file, and the same rules while every
+        // include resolves to one file through both paths.
+        std::fs::remove_file(&default).unwrap();
+        std::os::unix::fs::symlink(&xdg, &default).unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), xdg, "no includes");
+        let shared = dir.path().join("shared.toml");
+        std::fs::write(&shared, "").unwrap();
+        std::fs::write(&xdg, format!("include = [{:?}]\n", shared.display())).unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), xdg, "absolute include");
+        // A relative include resolves from the directory the path names
+        // (P5): the hook would look for ~/.config/muzzle/machine.toml.
+        std::fs::write(xdg.with_file_name("machine.toml"), "").unwrap();
+        std::fs::write(&xdg, "include = [\"machine.toml\"]\n").unwrap();
+        assert_eq!(cleared_env_config(&xdg, &home), default, "relative include");
     }
 
     #[test]
