@@ -30,8 +30,8 @@ impl Config {
         struct Norm<'a> {
             v: u32,
             reserve: u32,
-            // D7a: the effective factor, so every 0.3 hash differs from
-            // the 0.2 one: the same file now admits a bigger budget.
+            // D7a: the effective factor, so every 0.2.5 hash differs from
+            // the 0.2.4 one: the same file now admits a bigger budget.
             overcommit: f64,
             slots: Option<u32>,
             rules: Vec<NormRule<'a>>,

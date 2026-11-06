@@ -27,7 +27,7 @@ slots = 2
   is the regex escape hatch.
 - A claim above the budget is capped to the whole budget, so the job runs
   alone. That replaces exclusive lock files.
-- The budget overcommits the cores (D7a, 0.3.0): 16 cores give 22 slots.
+- The budget overcommits the cores (D7a, 0.2.5): 16 cores give 22 slots.
   Rule weights claim a job's peak, which it holds for only part of its run.
   Lower `overcommit` toward 1.0 if `muzzle bench probe` shows the machine
   getting sluggish under a full queue; raise it if jobs queue while the CPU

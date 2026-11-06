@@ -149,7 +149,7 @@ fn polls_and_reads_stay_unclaimed() {
 /// D28: later tasks that change this file record the new hash. This pins
 /// the one in linuxpc_config's evidence, so a change can't go unnoticed.
 /// 0.2 P7: hash v2 over set fields only, so the unchanged file moved from
-/// b7e2bb to 101ca4 once on upgrade. 0.3.0 D7a: the effective
+/// b7e2bb to 101ca4 once on upgrade. 0.2.5 D7a: the effective
 /// `overcommit` joined the hash, so it moved again, to 50b694.
 #[test]
 fn config_hash_is_recorded() {
