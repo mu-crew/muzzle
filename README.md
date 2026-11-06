@@ -52,10 +52,24 @@ has the details.
 
 ## Measured
 
-Not yet. The proof (a replay of a real day without and with muzzle, a
-rollout week against a measured baseline, and an interactive probe) is
-written up in `docs/eval/` once it has run, and this section will link to
-it. Until then muzzle claims nothing about speed.
+On linuxpc (16 cores), the real swayward gates replayed from busy days,
+without and with muzzle ([eval](docs/eval/2026-11-muzzle-v1.md),
+[results](docs/bench/0.2.4/)):
+
+- **The busiest real windows at real speed show no measurable cost**: no
+  longer makespan, run times within about 1 s, probe unchanged. Those
+  windows never filled the budget, so muzzle rarely queued.
+- **Under overload (the busiest window at 12× and 24×), muzzle keeps the
+  machine responsive**: load at or under 20 instead of 157, `git status` p95
+  about 7 ms instead of 103 ms, and the run p90 of rule-matched calls steady at
+  ~95 s instead of up to 561 s.
+- **The cost is throughput**: 40–49% fewer jobs per hour at the default
+  budget (cores − 2), because gates claim more slots than they keep busy.
+  A budget of 1.5× cores (`slots = 24`) cut the loss to 13% while keeping
+  `git status` p95 under 10 ms.
+
+One workload on one machine, and no rollout week, so gate p90 and merged
+tasks per hour in real use are not measured; the eval lists the limits.
 
 ## More
 
