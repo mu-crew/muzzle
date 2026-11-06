@@ -149,7 +149,16 @@ fn status_json_shows_live_holders_and_waiters() {
 
     let v = env.json(&["status", "--json"]);
     for k in [
-        "version", "budget", "cores", "reserve", "held", "free", "enforced", "holders", "waiting",
+        "version",
+        "budget",
+        "cores",
+        "reserve",
+        "overcommit",
+        "held",
+        "free",
+        "enforced",
+        "holders",
+        "waiting",
     ] {
         assert!(v.get(k).is_some(), "missing {k}: {v}");
     }
@@ -265,10 +274,12 @@ fn status_with_no_state_reports_this_hosts_budget() {
     assert_eq!(v["holders"], Value::Array(vec![]));
     assert_eq!(v["waiting"], Value::Array(vec![]));
     let cores = v["cores"].as_u64().unwrap();
+    // D7a: floor(cores x 1.5) - reserve 2.
     assert_eq!(
         v["budget"].as_u64().unwrap(),
-        cores.saturating_sub(2).max(1)
+        (cores * 3 / 2).saturating_sub(2).max(1)
     );
+    assert_eq!(v["overcommit"], 1.5);
     // Read-only: no template written, no state.json created.
     assert!(!env.path("state/muzzle/state.json").exists());
 }
@@ -295,6 +306,7 @@ fn doctor_reports_every_line_with_no_harness() {
     let v = env.json(&["doctor", "--json"]);
     assert_eq!(v["rules"], 1);
     assert_eq!(v["reserve"], 2);
+    assert_eq!(v["overcommit"], 1.5);
     assert_eq!(v["state_writable"], true);
     assert_eq!(
         v["platform"],
@@ -479,7 +491,7 @@ fn expired_stored_budget_is_not_reported() {
     assert_ne!(cores, 1000, "{s}");
     assert_eq!(
         s["budget"].as_u64().unwrap(),
-        cores.saturating_sub(2).max(1)
+        (cores * 3 / 2).saturating_sub(2).max(1)
     );
     let d = env.json(&["doctor", "--json"]);
     assert_eq!(d["budget_source"], "measured", "{d}");

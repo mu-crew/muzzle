@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::{BudgetView, ConfigFile, Facts, Report};
-use crate::rules::config::Config;
+use crate::rules::config::{Config, budget_for};
 use crate::runlog::{ARCHIVES_WARN_BYTES, LIVE_MAX_BYTES};
 use crate::state::Budget;
 
@@ -85,20 +85,24 @@ pub fn check(f: &Facts) -> Report {
         }));
     }
     let path_tables = f.config.as_ref().ok().map(Config::path_table_count);
-    let (reserve, config_slots, rules, hash, config_error) = match &f.config {
+    let (reserve, overcommit, config_slots, rules, hash, config_error) = match &f.config {
         Ok(c) => (
             Some(c.reserve),
+            Some(c.overcommit),
             c.slots,
             Some(c.rule_count()),
             Some(c.hash()),
             None,
         ),
-        Err(e) => (None, None, None, None, Some(e.clone())),
+        Err(e) => (None, None, None, None, None, Some(e.clone())),
     };
     let measured = f.cores.zip(f.ram).map(|(cores, ram)| {
         let cores = cores.max(1);
         Budget {
-            budget: config_slots.unwrap_or_else(|| cores.saturating_sub(reserve.unwrap_or(0))),
+            // A broken config shows the bare cores, as before D7a.
+            budget: config_slots.unwrap_or_else(|| {
+                budget_for(cores, reserve.unwrap_or(0), overcommit.unwrap_or(1.0))
+            }),
             cores,
             ram_per_slot: ram / u64::from(cores),
         }
@@ -134,7 +138,9 @@ pub fn check(f: &Facts) -> Report {
     }
     if effective.is_some_and(|b| b.budget == 0) {
         warnings.push(
-            "budget is 0 (cores minus reserve): every job runs alone; lower `reserve`".into(),
+            "budget is 0 (cores \u{d7} overcommit, minus reserve): every job runs alone; \
+             lower `reserve`"
+                .into(),
         );
     }
     if let Err(e) = &f.state_writable {
@@ -186,6 +192,7 @@ pub fn check(f: &Facts) -> Report {
         budget: effective.map(|b| b.budget),
         cores: effective.map(|b| b.cores),
         reserve,
+        overcommit,
         ram_per_slot_mb: effective.map(|b| mb(b.ram_per_slot)),
         budget_source,
         measured: measured.map(budget_view),
@@ -259,20 +266,34 @@ mod tests {
     }
 
     #[test]
-    fn measured_budget_is_cores_minus_reserve() {
+    fn measured_budget_is_overcommitted_cores_minus_reserve() {
+        // D7a: floor(16 x 1.5) - 2. RAM per slot stays RAM / cores (D9).
         let r = check(&facts());
         assert_eq!(
-            (r.budget, r.cores, r.reserve, r.ram_per_slot_mb),
-            (Some(14), Some(16), Some(2), Some(2048))
+            (
+                r.budget,
+                r.cores,
+                r.reserve,
+                r.overcommit,
+                r.ram_per_slot_mb
+            ),
+            (Some(22), Some(16), Some(2), Some(1.5), Some(2048))
         );
         assert_eq!((r.budget_source, r.rules, r.exit), ("measured", Some(1), 0));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
     #[test]
+    fn overcommit_1_gives_the_0_2_budget() {
+        let mut f = facts();
+        f.config = cfg("reserve = 2\novercommit = 1.0\n");
+        assert_eq!(check(&f).budget, Some(14));
+    }
+
+    #[test]
     fn matching_stored_budget_does_not_warn() {
         let mut f = facts();
-        f.stored = stored(14, 16, 2 * GIB);
+        f.stored = stored(22, 16, 2 * GIB);
         let r = check(&f);
         assert_eq!(r.budget_source, "stored");
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
@@ -282,8 +303,8 @@ mod tests {
     fn stored_vs_measured_warns_on_each_field() {
         for s in [
             stored(6, 16, 2 * GIB),
-            stored(14, 8, 2 * GIB),
-            stored(14, 16, GIB),
+            stored(22, 8, 2 * GIB),
+            stored(22, 16, GIB),
         ] {
             let mut f = facts();
             f.stored = s;
@@ -378,7 +399,7 @@ mod tests {
             .push("/h/.claude/settings.json".into());
         let t = render_text(&check(&f));
         for want in [
-            "budget         14 slots (measured; 16 cores, reserve 2, 2048 MB RAM per slot)",
+            "budget         22 slots (measured; 16 cores \u{d7} 1.5, reserve 2, 2048 MB RAM per slot)",
             "enforcement    enforced (systemd scope",
             "/s (writable)",
             "config         /c.toml (found; 1 rules, 0 path tables, hash ",

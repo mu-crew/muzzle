@@ -11,8 +11,9 @@ The first run writes a commented template and uses its rules. A command
 that matches no rule runs at once, without a claim.
 
 ```toml
-reserve = 2            # budget = logical cores - reserve
-# slots = 12           # an explicit budget instead
+reserve = 2            # budget = floor(logical cores x overcommit) - reserve
+# overcommit = 1.5     # the default; 1.0 is one slot per core
+# slots = 12           # an explicit budget instead of both
 
 [[rule]]
 name  = "cargo-test"
@@ -26,6 +27,13 @@ slots = 2
   is the regex escape hatch.
 - A claim above the budget is capped to the whole budget, so the job runs
   alone. That replaces exclusive lock files.
+- The budget overcommits the cores (D7a, 0.3.0): 16 cores give 22 slots.
+  Rule weights claim a job's peak, which it holds for only part of its run.
+  Lower `overcommit` toward 1.0 if `muzzle bench probe` shows the machine
+  getting sluggish under a full queue; raise it if jobs queue while the CPU
+  sits idle. `overcommit` goes in the root or an include, like `reserve`
+  (from 1.0 to 4.0). Memory caps don't scale with it: a slot's cap is still
+  RAM / cores (D9).
 - An unknown key, a bad pattern, or a rule with both or neither of
   `command` and `match` exits 2 and names it, and the file it is
   in.

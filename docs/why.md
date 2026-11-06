@@ -9,15 +9,16 @@ jobs, so each one is slower, the interactive side stutters, and timing
 tests flake.
 
 ```
-  16 cores, no admission                 16 cores, muzzle (budget 14)
+  16 cores, no admission                 16 cores, muzzle (budget 22)
   +-------------------------------+      +-------------------------------+
   | gate A    16 jobs             |      | gate A     6 slots  running   |
-  | gate B    16 jobs             |      | test C     2 slots  running   |
-  | test C    16 jobs             |      | test D     2 slots  running   |
-  | test D    16 jobs             |      | gate B     6 slots  queued    |
+  | gate B    16 jobs             |      | gate B     6 slots  running   |
+  | gate C    16 jobs             |      | gate C     6 slots  running   |
+  | test D    16 jobs             |      | test D     2 slots  running   |
+  | gate E    16 jobs             |      | gate E     6 slots  queued    |
   | your shell, the editor        |      | reserve 2: shell, editor      |
   +-------------------------------+      +-------------------------------+
-    64 runnable jobs on 16 cores            each admitted job gets its share
+    80 runnable jobs on 16 cores            each admitted job gets its share
 ```
 
 On linuxpc (16 cores, 31 GB) during an October fan-out, museum's session
@@ -36,8 +37,11 @@ was given a reserved one by hand.
 
 ## What muzzle does instead
 
-- **A slot budget per host.** Logical cores minus a reserve (2 by
-  default), one slot per core. A heavy command claims N slots from a rule
+- **A slot budget per host.** 1.5 slots per logical core, minus a
+  reserve of 2: 22 on 16 cores. A slot claims a job's peak parallelism, and
+  jobs spend much of their run below it (fmt, linking, doc checks run on one
+  core), so one slot per core left the CPU half idle while work queued; see
+  the README's "Does it help?". A heavy command claims N slots from a rule
   in the config, waits until they are free, then runs with its parallelism
   set from the claim (`CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
   `MAKEFLAGS`). On Linux with systemd it also runs under a memory cap and a

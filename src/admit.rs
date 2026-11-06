@@ -78,8 +78,8 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
     // group is empty (and, for a container run, its scope too: D16a). A
     // dead muzzle with a live group keeps its slots: the job is still using
     // the machine (D16).
-    // D7 gives cores − reserve, which is 0 on a 2-core host or a small
-    // container (D17a). Floor it once here so `cap` and `free` agree and a
+    // D7a gives floor(cores × overcommit) − reserve, which can be 0 on a
+    // 1-core host or a small container with a big reserve (D17a). Floor it once here so `cap` and `free` agree and a
     // job still runs alone (D8) instead of every waiter blocking forever.
     let budget = state.budget.map(|b| b.budget.max(1));
     let (kept, dead): (Vec<Holder>, Vec<Holder>) = std::mem::take(&mut state.holders)

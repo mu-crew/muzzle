@@ -21,8 +21,23 @@ use layer::{Layer, parse_layer};
 pub use template::TEMPLATE;
 use template::write_template;
 
-/// D7: budget = logical cores − reserve, default reserve 2.
+/// D7: default reserve 2.
 pub const DEFAULT_RESERVE: u32 = 2;
+/// D7a (0.3.0): slots claim a job's peak parallelism, which it holds for
+/// only part of its run, so the budget overcommits the cores. At 1.0 the
+/// budget filled while load1 p50 sat at ~9 of 16 cores; 24 slots (1.5x 16
+/// cores, no reserve) cut the lost throughput from 40% to 13% and 20 slots
+/// to 23% (docs/eval/2026-11-muzzle-v1.md §2b, §2c). The default gives 22
+/// on 16 cores, between the two.
+pub const DEFAULT_OVERCOMMIT: f64 = 1.5;
+/// D7a: `overcommit` must lie in this range.
+pub const OVERCOMMIT_RANGE: std::ops::RangeInclusive<f64> = 1.0..=4.0;
+
+/// D7, D7a: the budget a host reads from its cores, before any explicit
+/// `slots =` (D17a decides between that, this and the stored one).
+pub fn budget_for(cores: u32, reserve: u32, overcommit: f64) -> u32 {
+    ((f64::from(cores) * overcommit).floor() as u32).saturating_sub(reserve)
+}
 
 /// Errors callers switch on: everything here is "bad config", exit 2
 /// (spec §Exit codes), except a file that exists but can't be read (B5).
@@ -95,7 +110,9 @@ pub struct Config {
     /// The root file.
     pub path: PathBuf,
     pub reserve: u32,
-    /// An explicit budget, overriding `reserve` (D7, D17a).
+    /// D7a: the factor on the cores before the reserve.
+    pub overcommit: f64,
+    /// An explicit budget, overriding `reserve` and `overcommit` (D7, D17a).
     pub slots: Option<u32>,
     /// The global list, root then includes merged in (P5).
     pub global: Vec<Entry>,
@@ -169,6 +186,7 @@ impl Config {
         let mut cfg = Config {
             path: path.to_path_buf(),
             reserve: DEFAULT_RESERVE,
+            overcommit: DEFAULT_OVERCOMMIT,
             slots: None,
             global: Vec::new(),
             tables: Vec::new(),
@@ -206,6 +224,9 @@ impl Config {
     fn layer(&mut self, layer: Layer, file: &Path) -> Result<(), ConfigError> {
         if let Some(r) = layer.reserve {
             self.reserve = r;
+        }
+        if let Some(o) = layer.overcommit {
+            self.overcommit = o;
         }
         if layer.slots.is_some() {
             self.slots = layer.slots;
@@ -303,6 +324,45 @@ pub(super) mod tests {
         let err = parse(text).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "{text}: {err}");
         assert!(err.to_string().contains(needle), "{text}: {err}");
+    }
+
+    #[test]
+    fn d7a_budget_overcommits_the_cores_before_the_reserve() {
+        // 16 cores: 0.2 gave 14; 0.3 gives floor(24) - 2.
+        assert_eq!(budget_for(16, 2, DEFAULT_OVERCOMMIT), 22);
+        assert_eq!(budget_for(16, 2, 1.0), 14);
+        assert_eq!(budget_for(8, 2, 1.5), 10);
+        // floor, not round: 3 x 1.5 = 4.5.
+        assert_eq!(budget_for(3, 0, 1.5), 4);
+        // Never below 0; admit floors 0 to 1 (D8).
+        assert_eq!(budget_for(1, 4, 1.5), 0);
+    }
+
+    #[test]
+    fn d7a_overcommit_defaults_to_1_5_and_an_include_replaces_it() {
+        assert_eq!(parse("").unwrap().overcommit, 1.5);
+        assert_eq!(parse("overcommit = 1.0").unwrap().overcommit, 1.0);
+        // A TOML integer is a factor too.
+        assert_eq!(parse("overcommit = 2").unwrap().overcommit, 2.0);
+        let (_dir, c) = files(&[
+            ("config.toml", "include = [\"m.toml\"]\novercommit = 2.0"),
+            ("m.toml", "overcommit = 1.25"),
+        ]);
+        assert_eq!(c.unwrap().overcommit, 1.25);
+    }
+
+    #[test]
+    fn d7a_overcommit_outside_1_to_4_is_invalid() {
+        for bad in ["0.5", "0.99", "4.01", "nan", "inf", "-1.5"] {
+            invalid(&format!("overcommit = {bad}"), "overcommit");
+        }
+        assert!(parse("overcommit = 4.0").is_ok());
+    }
+
+    #[test]
+    fn d7a_overcommit_is_a_budget_key_so_no_path_table_sets_it() {
+        let err = parse("[path.\"/x\"]\novercommit = 2.0").unwrap_err();
+        assert!(err.to_string().contains("overcommit"), "{err}");
     }
 
     #[test]

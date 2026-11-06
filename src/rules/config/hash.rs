@@ -30,6 +30,9 @@ impl Config {
         struct Norm<'a> {
             v: u32,
             reserve: u32,
+            // D7a: the effective factor, so every 0.3 hash differs from
+            // the 0.2 one: the same file now admits a bigger budget.
+            overcommit: f64,
             slots: Option<u32>,
             rules: Vec<NormRule<'a>>,
             paths: Vec<(std::borrow::Cow<'a, str>, Vec<NormRule<'a>>)>,
@@ -61,6 +64,7 @@ impl Config {
         let n = Norm {
             v: 2,
             reserve: self.reserve,
+            overcommit: self.overcommit,
             slots: self.slots,
             rules: norm(&self.global),
             paths: self
@@ -131,6 +135,10 @@ match = 'sweep'
         assert_eq!(hash(reformatted), h);
         let without_reserve = BASE.replacen("reserve = 2\n", "", 1);
         assert_eq!(hash(&without_reserve), h);
+        // D7a: likewise the default factor, written or not.
+        let explicit_overcommit =
+            BASE.replacen("reserve = 2\n", "reserve = 2\novercommit = 1.5\n", 1);
+        assert_eq!(hash(&explicit_overcommit), h);
     }
 
     /// 0.2.1 C5/R7: `command` hashes with whitespace collapsed and a
@@ -160,6 +168,7 @@ match = 'sweep'
             BASE.replace("slots = 999", "slots = 8"),
             BASE.replace("slots = 3", "slots = 3\nenabled = true"),
             BASE.replace("/p", "/q"),
+            BASE.replace("reserve = 2", "reserve = 2\novercommit = 1.0"),
             BASE.replace("reserve = 2", "reserve = 3"),
             BASE.replace("reserve = 2", "reserve = 2\nslots = 12"),
             BASE.replace("slots = 2\n", "slots = 2\nclass = \"high\"\n"),
