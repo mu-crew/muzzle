@@ -205,8 +205,11 @@ fn check(cmd: &DocCommand) -> Option<String> {
         .take_while(|a| *a != "--")
         .collect();
     args.push("--help");
+    let home = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(&args)
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("XDG_STATE_HOME", home.path())
         .output()
         .expect("spawn muzzle");
     (!out.status.success()).then(|| {

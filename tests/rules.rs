@@ -1,5 +1,5 @@
 //! `muzzle match`, `wrap` and `hook` as processes, each with a private
-//! `XDG_CONFIG_HOME` (spec §Interface CLI and Config).
+//! `XDG_CONFIG_HOME` and `XDG_STATE_HOME` (spec §Interface CLI and Config).
 
 use std::io::Write;
 use std::path::Path;
@@ -11,6 +11,7 @@ fn muzzle(config_home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", config_home.join("state"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -95,6 +96,7 @@ fn concurrent_first_runs_leave_one_valid_template() {
             Command::new(env!("CARGO_BIN_EXE_muzzle"))
                 .args(["match", "--json", "--", "contrib/gate"])
                 .env("XDG_CONFIG_HOME", home.path())
+                .env("XDG_STATE_HOME", home.path().join("state"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
