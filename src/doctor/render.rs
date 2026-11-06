@@ -9,10 +9,11 @@ pub fn render_text(r: &Report) -> String {
     line(
         "budget",
         format!(
-            "{} slots ({}; {} cores, reserve {}, {} MB RAM per slot)",
+            "{} slots ({}; {} cores \u{d7} {}, reserve {}, {} MB RAM per slot)",
             opt(r.budget.map(u64::from)),
             r.budget_source,
             opt(r.cores.map(u64::from)),
+            r.overcommit.map_or("?".to_string(), |o| o.to_string()),
             opt(r.reserve.map(u64::from)),
             opt(r.ram_per_slot_mb),
         ),

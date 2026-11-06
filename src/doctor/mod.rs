@@ -101,6 +101,8 @@ pub struct Report {
     pub budget: Option<u32>,
     pub cores: Option<u32>,
     pub reserve: Option<u32>,
+    /// Added field (0.3.0 D7a).
+    pub overcommit: Option<f64>,
     pub ram_per_slot_mb: Option<u64>,
     /// `stored` (state.json, D17a), `config` (`slots =`) or `measured`.
     pub budget_source: &'static str,

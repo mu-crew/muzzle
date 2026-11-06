@@ -282,13 +282,13 @@ fn is_nested(
     })
 }
 
-/// D7, D9: this process's own reading of the budget; D17a decides whether
-/// it or the stored one is used.
+/// D7, D7a, D9: this process's own reading of the budget; D17a decides
+/// whether it or the stored one is used.
 fn reading(config: &Config) -> anyhow::Result<Budget> {
     let cores = proc::logical_cores().context("counting cores")?.max(1) as u32;
     let ram = proc::total_ram().context("reading total RAM")?;
     Ok(Budget {
-        budget: cores.saturating_sub(config.reserve),
+        budget: crate::rules::config::budget_for(cores, config.reserve, config.overcommit),
         cores,
         ram_per_slot: ram / u64::from(cores),
     })

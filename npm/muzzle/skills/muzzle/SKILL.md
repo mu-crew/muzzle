@@ -6,7 +6,7 @@ description: Per-host admission for heavy commands (gates, builds, test suites).
 # muzzle
 
 muzzle queues each heavy command for a weighted share of this machine's slot
-budget (cores minus a reserve), runs it, and logs what it used. Rules in
+budget (1.5 slots per core, minus a reserve), runs it, and logs what it used. Rules in
 `~/.config/muzzle/config.toml` decide which commands claim slots and how
 many. A command that matches no rule runs at once, unclaimed. There is no
 daemon: every waiting muzzle re-checks the queue itself. `muzzle <cmd> --help`

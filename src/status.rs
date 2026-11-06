@@ -17,7 +17,7 @@ use serde::Serialize;
 use crate::admit::{self, Class, Liveness};
 use crate::cli::StatusArgs;
 use crate::proc::{self, Pid};
-use crate::rules::config::DEFAULT_RESERVE;
+use crate::rules::config::{DEFAULT_OVERCOMMIT, DEFAULT_RESERVE, budget_for};
 use crate::runlog::{self, RuleKey, Typical};
 use crate::state::{Budget, EnforcedReason, State, Store};
 
@@ -35,6 +35,8 @@ pub struct Status {
     /// Added fields (0.2.3 S4): how many holders and waiters are `slow`.
     pub slow_holders: usize,
     pub slow_waiters: usize,
+    /// Added field (0.3.0 D7a): the factor on the cores before the reserve.
+    pub overcommit: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -113,7 +115,7 @@ pub fn view(
     live: &impl Liveness,
     reading: Budget,
     config_slots: Option<u32>,
-    reserve: u32,
+    (reserve, overcommit): (u32, f64),
     enforced: bool,
 ) -> Status {
     let mut state = state.clone();
@@ -173,6 +175,7 @@ pub fn view(
         enforced,
         slow_holders: 0,
         slow_waiters: waiting.iter().filter(|w| w.slow).count(),
+        overcommit,
         holders,
         waiting,
     }
@@ -206,9 +209,10 @@ fn class_str(c: Class) -> &'static str {
 
 pub fn render_text(s: &Status) -> String {
     let mut out = format!(
-        "budget {} slots ({} cores, reserve {}), {} held, {} free, {}\n",
+        "budget {} slots ({} cores \u{d7} {}, reserve {}), {} held, {} free, {}\n",
         s.budget,
         s.cores,
+        s.overcommit,
         s.reserve,
         s.held,
         s.free,
@@ -261,13 +265,13 @@ pub fn render_text(s: &Status) -> String {
     out
 }
 
-/// This host's own budget reading (D7, D9), as `run` computes it.
-pub(crate) fn reading(reserve: u32) -> anyhow::Result<Budget> {
+/// This host's own budget reading (D7, D7a, D9), as `run` computes it.
+pub(crate) fn reading(reserve: u32, overcommit: f64) -> anyhow::Result<Budget> {
     use anyhow::Context;
     let cores = proc::logical_cores().context("counting cores")?.max(1) as u32;
     let ram = proc::total_ram().context("reading total RAM")?;
     Ok(Budget {
-        budget: cores.saturating_sub(reserve),
+        budget: budget_for(cores, reserve, overcommit),
         cores,
         ram_per_slot: ram / u64::from(cores),
     })
@@ -282,11 +286,11 @@ pub(crate) fn now_ms() -> u64 {
 pub fn main(args: &StatusArgs) -> anyhow::Result<ExitCode> {
     // A broken config must not hide the queue: fall back to the default
     // reserve, say so, and still report what state.json holds.
-    let (reserve, config_slots) = match crate::doctor::read_config().1 {
-        Ok(c) => (c.reserve, c.slots),
+    let (reserve, overcommit, config_slots) = match crate::doctor::read_config().1 {
+        Ok(c) => (c.reserve, c.overcommit, c.slots),
         Err(e) => {
-            eprintln!("muzzle: {e} (status uses the default reserve)");
-            (DEFAULT_RESERVE, None)
+            eprintln!("muzzle: {e} (status uses the default reserve and overcommit)");
+            (DEFAULT_RESERVE, DEFAULT_OVERCOMMIT, None)
         }
     };
     let store = Store::open_default()?;
@@ -300,9 +304,9 @@ pub fn main(args: &StatusArgs) -> anyhow::Result<ExitCode> {
         &state,
         now_ms(),
         &ProcLive,
-        reading(reserve)?,
+        reading(reserve, overcommit)?,
         config_slots,
-        reserve,
+        (reserve, overcommit),
         proc::systemd_user_reachable(),
     )
     .mark_slow(&typical);
@@ -405,7 +409,7 @@ mod tests {
 
     #[test]
     fn hides_the_dead_and_counts_the_live() {
-        let s = view(&state(), 63_000, &live(), READING, None, 2, true);
+        let s = view(&state(), 63_000, &live(), READING, None, (2, 1.5), true);
         assert_eq!((s.budget, s.cores, s.reserve), (4, 6, 2));
         let agents: Vec<_> = s.holders.iter().map(|h| h.agent.clone().unwrap()).collect();
         assert_eq!(agents, ["orch"]);
@@ -416,7 +420,7 @@ mod tests {
 
     #[test]
     fn waiting_is_in_queue_order_and_capped() {
-        let s = view(&state(), 63_000, &live(), READING, None, 2, false);
+        let s = view(&state(), 63_000, &live(), READING, None, (2, 1.5), false);
         let w: Vec<_> = s
             .waiting
             .iter()
@@ -434,12 +438,12 @@ mod tests {
     #[test]
     fn without_a_stored_budget_uses_the_reading_and_config_slots() {
         let empty = State::default();
-        let s = view(&empty, 0, &live(), READING, None, 2, false);
+        let s = view(&empty, 0, &live(), READING, None, (2, 1.5), false);
         assert_eq!((s.budget, s.cores, s.free), (6, 8, 6));
-        let s = view(&empty, 0, &live(), READING, Some(3), 2, false);
+        let s = view(&empty, 0, &live(), READING, Some(3), (2, 1.5), false);
         assert_eq!((s.budget, s.free), (3, 3));
         // A stored budget wins over config slots until the next run.
-        let s = view(&state(), 0, &live(), READING, Some(3), 2, false);
+        let s = view(&state(), 0, &live(), READING, Some(3), (2, 1.5), false);
         assert_eq!(s.budget, 4);
     }
 
@@ -452,12 +456,12 @@ mod tests {
             ..State::default()
         };
         let later = 1_000 + crate::state::BUDGET_TTL_MS + 1;
-        let s = view(&old, later, &live(), READING, None, 2, false);
+        let s = view(&old, later, &live(), READING, None, (2, 1.5), false);
         assert_eq!((s.budget, s.cores, s.free), (6, 8, 6));
         // Dead entries still count as busy until a run prunes them, as in
         // `Store::update`, which expires before pruning.
         old.enqueue(22, 1, None, claim(1, Class::Normal, "dead-waiter"), 0);
-        let s = view(&old, later, &live(), READING, None, 2, false);
+        let s = view(&old, later, &live(), READING, None, (2, 1.5), false);
         assert_eq!((s.budget, s.cores), (4, 6));
     }
 
@@ -467,7 +471,7 @@ mod tests {
             budget: 0,
             ..READING
         };
-        let s = view(&State::default(), 0, &live(), zero, None, 8, false);
+        let s = view(&State::default(), 0, &live(), zero, None, (8, 1.5), false);
         assert_eq!((s.budget, s.free), (1, 1));
     }
 
@@ -480,7 +484,7 @@ mod tests {
         h.enforced_reason = Some(EnforcedReason::Container);
         h.scope = Some("live.scope".into());
         st.holders.push(h);
-        let s = view(&st, 63_000, &live(), READING, None, 2, true);
+        let s = view(&st, 63_000, &live(), READING, None, (2, 1.5), true);
         let agents: Vec<_> = s.holders.iter().map(|h| h.agent.clone().unwrap()).collect();
         assert_eq!(agents, ["orch", "box"]);
         let v = serde_json::to_value(&s).unwrap();
@@ -491,13 +495,13 @@ mod tests {
         assert!(render_text(&s).contains("(container: not enforced)"));
         // Once the scope is gone, so is the holder.
         st.holders[2].scope = Some("gone.scope".into());
-        let s = view(&st, 63_000, &live(), READING, None, 2, true);
+        let s = view(&st, 63_000, &live(), READING, None, (2, 1.5), true);
         assert_eq!(s.holders.len(), 1);
     }
 
     #[test]
     fn json_has_every_spec_field() {
-        let s = view(&state(), 63_000, &live(), READING, None, 2, true);
+        let s = view(&state(), 63_000, &live(), READING, None, (2, 1.5), true);
         let v = serde_json::to_value(&s).unwrap();
         for k in [
             "version",
@@ -545,7 +549,7 @@ mod tests {
             .map(|t| (("/w".to_string(), "gate".to_string()), t))
             .into_iter()
             .collect();
-        let s = view(&state(), now_ms, &live(), READING, None, 2, true).mark_slow(&t);
+        let s = view(&state(), now_ms, &live(), READING, None, (2, 1.5), true).mark_slow(&t);
         s.holders[0].clone()
     }
 
@@ -572,25 +576,25 @@ mod tests {
         st.holders[1].claim.repo = None;
         assert!(holder_keys(&st).is_empty());
         let t: Typical = [(("/w".to_string(), "gate".to_string()), 1)].into();
-        let s = view(&st, 1_000_000, &live(), READING, None, 2, true).mark_slow(&t);
+        let s = view(&st, 1_000_000, &live(), READING, None, (2, 1.5), true).mark_slow(&t);
         assert_eq!((s.holders[0].typical_s, s.holders[0].slow), (None, false));
     }
 
     #[test]
     fn waiters_are_slow_from_30s_and_the_counts_add_up() {
         // state(): human enqueued at 3 s, worker-7 at 2 s.
-        let s = view(&state(), 32_999, &live(), READING, None, 2, true);
+        let s = view(&state(), 32_999, &live(), READING, None, (2, 1.5), true);
         let w: Vec<_> = s.waiting.iter().map(|w| (w.age_s, w.slow)).collect();
         assert_eq!(w, [(29, false), (30, true)]);
         assert_eq!((s.slow_holders, s.slow_waiters), (0, 1));
         let t: Typical = [(("/w".to_string(), "gate".to_string()), 10)].into();
-        let s = view(&state(), 63_000, &live(), READING, None, 2, true).mark_slow(&t);
+        let s = view(&state(), 63_000, &live(), READING, None, (2, 1.5), true).mark_slow(&t);
         assert_eq!((s.slow_holders, s.slow_waiters), (1, 2));
         let text = render_text(&s);
         assert!(text.contains("62s (slow, usually \u{2264}10s)"), "{text}");
         // S4: nothing slow, text as before: a typical time alone adds nothing.
         let t: Typical = [(("/w".to_string(), "gate".to_string()), 1000)].into();
-        let s = view(&state(), 20_000, &live(), READING, None, 2, true).mark_slow(&t);
+        let s = view(&state(), 20_000, &live(), READING, None, (2, 1.5), true).mark_slow(&t);
         assert_eq!((s.slow_holders, s.slow_waiters), (0, 0));
         assert!(!render_text(&s).contains("slow"), "{}", render_text(&s));
         assert!(text.contains("60s (slow)"), "{text}");

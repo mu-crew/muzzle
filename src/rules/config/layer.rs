@@ -17,6 +17,8 @@ use crate::rules::heads::Matcher;
 struct RawFile {
     include: Option<Vec<String>>,
     reserve: Option<u32>,
+    /// D7a. serde's f64 also takes a TOML integer, so `overcommit = 2` works.
+    overcommit: Option<f64>,
     slots: Option<u32>,
     #[serde(default)]
     rule: Vec<RawRule>,
@@ -89,6 +91,7 @@ enum RawClass {
 pub(super) struct Layer {
     pub(super) include: Option<Vec<String>>,
     pub(super) reserve: Option<u32>,
+    pub(super) overcommit: Option<f64>,
     pub(super) slots: Option<u32>,
     pub(super) global: Vec<Entry>,
     pub(super) tables: Vec<(String, PathBuf, Vec<Entry>)>,
@@ -105,6 +108,16 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
     };
     if raw.slots == Some(0) {
         return Err(invalid("slots must be at least 1".into()));
+    }
+    // D7a: below 1.0 the reserve already says it; above 4.0 is a typo.
+    if let Some(o) = raw.overcommit
+        && !super::OVERCOMMIT_RANGE.contains(&o)
+    {
+        return Err(invalid(format!(
+            "overcommit = {o}: must be from {} to {}",
+            super::OVERCOMMIT_RANGE.start(),
+            super::OVERCOMMIT_RANGE.end()
+        )));
     }
     let entries = |raw: Vec<RawRule>, scope: &str| -> Result<Vec<Entry>, ConfigError> {
         // Unique within one table and within one file's global list (P3):
@@ -205,6 +218,7 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
     Ok(Layer {
         include: raw.include,
         reserve: raw.reserve,
+        overcommit: raw.overcommit,
         slots: raw.slots,
         global,
         tables,

@@ -24,8 +24,9 @@ pub const TEMPLATE: &str = r#"# muzzle config (spec: github.com/mu-crew/muzzle).
 # crate syntax over the whole shell string, for shapes that aren't a
 # command word. A rule sets one of the two.
 
-reserve = 2            # budget = logical cores - reserve
-# slots = 12           # explicit budget; overrides reserve
+reserve = 2            # budget = floor(logical cores x overcommit) - reserve
+# overcommit = 1.5     # jobs hold their peak only part of the time; 1.0 = one slot per core
+# slots = 12           # explicit budget; overrides reserve and overcommit
 
 # Files merged after this one, relative to it (~ works). A missing file is
 # skipped: keep per-machine weights in an untracked file.
