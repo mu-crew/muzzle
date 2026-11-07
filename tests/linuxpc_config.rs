@@ -1,7 +1,8 @@
 //! `bench/linuxpc-config.toml` (linuxpc_config; spec §Interface Config, D8,
 //! D14, D17b, D21, D28) through `muzzle match`, with a private
-//! `XDG_CONFIG_HOME`. The commands are synthetic copies of the shapes seen
-//! in museum; the real sample stays in the private sidecar (D38).
+//! `XDG_CONFIG_HOME` and `XDG_STATE_HOME`. The commands are synthetic
+//! copies of the shapes seen in museum; the real sample stays in the
+//! private sidecar (D38).
 
 use std::path::Path;
 use std::process::Command;
@@ -23,6 +24,7 @@ fn matched(home: &Path, command: &str) -> Value {
     let out = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(["match", "--json", "--", command])
         .env("XDG_CONFIG_HOME", home)
+        .env("XDG_STATE_HOME", home.join("state"))
         .output()
         .expect("spawn muzzle");
     assert!(out.status.success(), "{out:?}");

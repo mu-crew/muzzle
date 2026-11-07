@@ -1,5 +1,5 @@
 //! `muzzle match`, `wrap` and `hook` as processes, each with a private
-//! `XDG_CONFIG_HOME` (spec §Interface CLI and Config).
+//! `XDG_CONFIG_HOME` and `XDG_STATE_HOME` (spec §Interface CLI and Config).
 
 use std::io::Write;
 use std::path::Path;
@@ -11,6 +11,7 @@ fn muzzle(config_home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_muzzle"))
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", config_home.join("state"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -95,6 +96,7 @@ fn concurrent_first_runs_leave_one_valid_template() {
             Command::new(env!("CARGO_BIN_EXE_muzzle"))
                 .args(["match", "--json", "--", "contrib/gate"])
                 .env("XDG_CONFIG_HOME", home.path())
+                .env("XDG_STATE_HOME", home.path().join("state"))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -402,6 +404,50 @@ fn hook_replies_to_stored_payloads() {
         let v = json_out(&muzzle(home.path(), &["hook", h], Some(&fixture(f))));
         assert_eq!(v, json!({}), "{f}");
     }
+}
+
+/// every-harness D14 through the binary: Muse Code's `bash` under
+/// `hook claude`, and cursor-agent's deny with the exact rerun line.
+#[test]
+fn hook_serves_muse_and_cursor() {
+    let home = tempfile::tempdir().unwrap();
+    let line = "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'";
+    let v = json_out(&muzzle(
+        home.path(),
+        &["hook", "claude"],
+        Some(&fixture("muse-bash-match.json")),
+    ));
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+    assert_eq!(v["hookSpecificOutput"]["updatedInput"]["command"], line);
+    let v = json_out(&muzzle(
+        home.path(),
+        &["hook", "cursor"],
+        Some(&fixture("cursor-shell-match.json")),
+    ));
+    // The reason tells the agent to run the line, which stands exact and
+    // alone on its last line (every-harness D14, amended 2026-11-05).
+    assert_eq!(v["permission"], "deny");
+    assert_eq!(v["agent_message"], v["user_message"]);
+    let msg = v["user_message"].as_str().unwrap();
+    assert!(msg.contains("Run exactly this instead:"), "{msg}");
+    assert_eq!(msg.lines().last(), Some(line), "{msg}");
+    let mut rerun: Value = serde_json::from_str(&fixture("cursor-shell-match.json")).unwrap();
+    rerun["command"] = json!(line);
+    let v = json_out(&muzzle(
+        home.path(),
+        &["hook", "cursor"],
+        Some(&rerun.to_string()),
+    ));
+    assert_eq!(v, json!({}));
+    let v = json_out(&muzzle(
+        home.path(),
+        &["hook", "cursor"],
+        Some(&fixture("cursor-shell-nomatch.json")),
+    ));
+    assert_eq!(v, json!({}));
+    let out = muzzle(home.path(), &["hook", "cursor"], Some("not json"));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty());
 }
 
 #[test]

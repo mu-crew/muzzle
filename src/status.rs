@@ -51,6 +51,9 @@ pub struct HolderView {
     pub run_s: u64,
     pub pid: u32,
     pub pgid: Option<u32>,
+    /// Added field (every-harness D14): the tmux pane the run started
+    /// from (`$TMUX_PANE`), or null.
+    pub pane: Option<String>,
     /// Added fields (D16a): false with reason `container` when the job
     /// entered a container and the scope neither caps nor measures it.
     pub enforced: bool,
@@ -73,6 +76,11 @@ pub struct WaiterView {
     pub age_s: u64,
     /// Added field (0.2.3 S3): queued at least [`SLOW_WAITER_S`].
     pub slow: bool,
+    /// Added fields (every-harness D14): the queued muzzle's pid and the
+    /// tmux pane it started from, or null. A worker waiting here fires no
+    /// harness hook, so mu reads these to call it waiting, not stalled.
+    pub pid: u32,
+    pub pane: Option<String>,
 }
 
 /// 0.2.3 S2: a holder under this is never slow, however short its history.
@@ -143,6 +151,7 @@ pub fn view(
             run_s: secs(h.run_start_ms),
             pid: h.pid,
             pgid: h.pgid,
+            pane: h.claim.pane.clone(),
             enforced: h.enforced,
             enforced_reason: h.enforced_reason,
             typical_s: None,
@@ -162,6 +171,8 @@ pub fn view(
                 rule: w.claim.rule.clone(),
                 age_s,
                 slow: age_s >= SLOW_WAITER_S,
+                pid: w.pid,
+                pane: w.claim.pane.clone(),
             }
         })
         .collect();
@@ -356,6 +367,7 @@ mod tests {
             cwd: "/w".into(),
             repo: Some("/w".into()),
             cfg: None,
+            pane: None,
         }
     }
 
@@ -433,6 +445,33 @@ mod tests {
                 (2, "worker-7".to_string(), 4, 61)
             ]
         );
+    }
+
+    #[test]
+    fn entries_name_their_pid_and_pane() {
+        // every-harness D14: mu matches a queued muzzle to a worker's pane.
+        let mut st = state();
+        st.holders[0].claim.pane = Some("%3".into());
+        st.waiters[0].claim.pane = Some("%7".into());
+        let s = view(&st, 63_000, &live(), READING, None, (2, 1.5), false);
+        assert_eq!(
+            (s.holders[0].pid, s.holders[0].pane.as_deref()),
+            (10, Some("%3"))
+        );
+        let w: Vec<_> = s
+            .waiting
+            .iter()
+            .map(|w| (w.pid, w.pane.as_deref()))
+            .collect();
+        assert_eq!(w, [(21, None), (20, Some("%7"))]);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["waiting"][1]["pane"], "%7");
+        assert!(v["waiting"][0]["pane"].is_null(), "{v}");
+        // The pane is stored only when known, and an older file reads.
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(json.matches("\"pane\"").count(), 2, "{json}");
+        let old: State = serde_json::from_str(&json.replace(",\"pane\":\"%7\"", "")).unwrap();
+        assert_eq!(old.waiters[0].claim.pane, None);
     }
 
     #[test]
@@ -528,13 +567,14 @@ mod tests {
             "run_s",
             "pid",
             "pgid",
+            "pane",
             "typical_s",
             "slow",
         ] {
             assert!(v["holders"][0].get(k).is_some(), "holder missing {k}");
         }
         for k in [
-            "position", "slots", "class", "agent", "rule", "age_s", "slow",
+            "position", "slots", "class", "agent", "rule", "age_s", "slow", "pid", "pane",
         ] {
             assert!(v["waiting"][0].get(k).is_some(), "waiter missing {k}");
         }

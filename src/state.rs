@@ -80,6 +80,11 @@ pub struct Claim {
     pub repo: Option<String>,
     /// The config hash (D28), copied into the run record.
     pub cfg: Option<String>,
+    /// The tmux pane the run was started from (`$TMUX_PANE`), so mu can
+    /// tell a worker queued here from a stalled one (every-harness D14).
+    /// Added field: absent in a state file an older muzzle wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +476,7 @@ mod tests {
             cwd: "/tmp".into(),
             repo: None,
             cfg: Some("a1b2c3".into()),
+            pane: None,
         }
     }
 
@@ -565,6 +571,44 @@ mod tests {
         assert!(err.contains("schema v2"), "{err}");
         assert_eq!(fs::read_to_string(store.state_path()).unwrap(), newer);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2); // state.json + lock
+    }
+
+    /// Additive changes keep `state.json` at v1 in `~/.local/state/muzzle`
+    /// (AGENTS.md, State directories): the bytes muzzle 0.2.4 writes, which
+    /// have no `pane`, load here, and so does a file carrying fields a newer
+    /// muzzle added. A new required field or `deny_unknown_fields` would
+    /// break that, and with it the queue host and container share (D17a).
+    /// Loading is all that is kept: a muzzle drops the fields it does not
+    /// know when it rewrites the file, as 0.2.4 drops `pane`, so a reader
+    /// must take an added field as possibly absent.
+    #[test]
+    fn older_and_newer_v1_files_load_in_place() {
+        let released = r#"{"v":1,"next_ticket":3,"budget":null,"waiters":[{"ticket":2,"pid":11,"start":5,"pgid":null,"enqueued_ms":900,"slots":1,"class":"normal","agent":null,"rule":"gate","cwd":"/w","repo":null,"cfg":null}],"holders":[{"ticket":1,"pid":10,"start":4,"pgid":10,"run_start_ms":800,"waited_s":0.5,"enforced":false,"kept":false,"slots":2,"class":"high","agent":"worker-7","rule":null,"cwd":"/w","repo":"/r","cfg":"a1b2c3"}],"updated_ms":900}"#;
+        let added = r#"{"v":1,"next_ticket":3,"budget":null,"later":{"x":1},"waiters":[{"ticket":2,"pid":11,"start":5,"pgid":null,"enqueued_ms":900,"slots":1,"class":"normal","agent":null,"rule":"gate","cwd":"/w","repo":null,"cfg":null,"pane":"%3","later":true}],"holders":[{"ticket":1,"pid":10,"start":4,"pgid":10,"run_start_ms":800,"waited_s":0.5,"enforced":false,"kept":false,"slots":2,"class":"high","agent":"worker-7","rule":null,"cwd":"/w","repo":"/r","cfg":"a1b2c3","later":[1]}],"updated_ms":900}"#;
+        // 0.2.4 differs from this muzzle only by `pane`, skipped when None,
+        // so this muzzle writes the released bytes back unchanged.
+        let parsed: State = serde_json::from_str(released).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), released);
+        for (text, pane) in [(released, None), (added, Some("%3"))] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            fs::write(store.state_path(), text).unwrap();
+            let ticket = store
+                .update(1_000, |s| Ok(s.enqueue(12, 6, None, claim(1), 1_000)))
+                .unwrap();
+            assert_eq!(ticket, 3, "{text}");
+            let state = store.read().unwrap();
+            assert_eq!(state.v, SCHEMA_VERSION);
+            assert_eq!(state.holders[0].claim.repo.as_deref(), Some("/r"));
+            assert_eq!(state.holders[0].claim.pane, None);
+            assert_eq!(state.waiters[0].claim.pane.as_deref(), pane);
+            assert_eq!(state.waiters.len(), 2);
+            // Loaded, not moved aside as corrupt: state.json and the lock.
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2, "{text}");
+            // The rewrite kept what this muzzle knows and dropped the rest.
+            let written = fs::read_to_string(store.state_path()).unwrap();
+            assert!(!written.contains("later"), "{written}");
+        }
     }
 
     #[test]

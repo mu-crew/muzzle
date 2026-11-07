@@ -43,7 +43,7 @@ pub(crate) fn canonical_key(key: &str) -> Option<PathBuf> {
 /// path and appends the rest, so a key's identity follows symlinks
 /// (`/home` -> `/var/home`, macOS `/var` -> `/private/var`) whether or not
 /// the directory exists yet, and doesn't change when it is created.
-fn canonical_prefix(p: &Path) -> PathBuf {
+pub(crate) fn canonical_prefix(p: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut cur = p;
     loop {

@@ -1,5 +1,6 @@
 //! The hook snippets in `docs/harnesses/` as the harnesses run them (spec
-//! §Integrations "Claude Code and Codex", D23). Each test reads the snippet,
+//! §Integrations "Claude Code and Codex", D23; Muse Code and cursor-agent,
+//! mu's every-harness spec D14). Each test reads the snippet,
 //! takes its `command` string, runs it with `sh -c` with the built muzzle on
 //! `PATH`, and pipes a stored payload from `tests/fixtures/hooks/` through
 //! it. Editing a snippet changes what is tested.
@@ -30,6 +31,18 @@ fn snippet(file: &str) -> (String, String) {
         groups[0]["matcher"].as_str().unwrap().to_string(),
         hooks[0]["command"].as_str().unwrap().to_string(),
     )
+}
+
+/// The one `beforeShellExecution` hook in cursor-agent's snippet: its
+/// `command`.
+fn cursor_snippet() -> String {
+    let v: Value = serde_json::from_str(&read("docs/harnesses/cursor.hooks.json")).unwrap();
+    assert_eq!(v["version"], 1);
+    let hooks = v["hooks"].as_object().unwrap();
+    assert_eq!(hooks.len(), 1, "only beforeShellExecution");
+    let entries = hooks["beforeShellExecution"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0]["command"].as_str().unwrap().to_string()
 }
 
 /// A `PATH` with only the built muzzle's directory before the system dirs,
@@ -177,14 +190,85 @@ fn codex_snippet_replies_to_stored_payloads() {
 }
 
 #[test]
-fn snippets_never_block_when_muzzle_cannot_answer() {
-    // Exit 2 is "block" to both harnesses. A garbled payload, or muzzle
-    // missing from PATH (sh exits 127), must be any other code.
+fn muse_snippet_matches_bash_and_runs_muzzle_hook_claude() {
+    let (matcher, command) = snippet("muse.hooks.json");
+    // Muse's shell tool is `bash` (U0). The matcher works read as an exact
+    // name or as a pattern; muzzle checks `tool_name` itself either way.
+    assert_eq!(matcher, "bash");
+    assert!(regex::Regex::new(&matcher).unwrap().is_match("bash"));
+    assert_eq!(command, "muzzle hook claude");
+}
+
+#[test]
+fn muse_snippet_replies_to_stored_payloads() {
+    let (_, cmd) = snippet("muse.hooks.json");
+    assert_eq!(
+        reply(&cmd, "muse-bash-match.json"),
+        json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "command": "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'",
+                "description": "Run tests",
+                "workdir": "/home/user/my-project",
+            },
+        }})
+    );
+    for f in ["muse-bash-nomatch.json", "muse-subagent-spawn.json"] {
+        assert_eq!(reply(&cmd, f), json!({}), "{f}");
+    }
+}
+
+/// A cursor-agent deny whose reason tells the agent to run `line`, which
+/// stands exact and alone on the reason's last line, so the agent's rerun
+/// is that string (every-harness D14, amended 2026-11-05).
+fn assert_denied_with(v: &Value, line: &str) {
+    assert_eq!(v["permission"], "deny", "{v}");
+    assert_eq!(v["agent_message"], v["user_message"], "{v}");
+    let msg = v["user_message"].as_str().unwrap();
+    assert!(msg.contains("Run exactly this instead:"), "{msg}");
+    assert_eq!(msg.lines().last(), Some(line), "{msg}");
+}
+
+/// every-harness D14: a matched command is denied with the exact line,
+/// the rerun of that line passes, and an unmatched command passes.
+#[test]
+fn cursor_snippet_denies_with_the_line_and_passes_the_rerun() {
+    let cmd = cursor_snippet();
+    assert_eq!(cmd, "muzzle hook cursor");
+    let line = "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'";
+    assert_denied_with(&reply(&cmd, "cursor-shell-match.json"), line);
+    let mut rerun: Value =
+        serde_json::from_str(&read("tests/fixtures/hooks/cursor-shell-match.json")).unwrap();
+    rerun["command"] = json!(line);
     let home = tempfile::tempdir().unwrap();
-    for file in ["claude-code.hooks.json", "codex.hooks.json"] {
-        let (_, cmd) = snippet(file);
+    let out = run_hook(&cmd, home.path(), &rerun.to_string());
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({})
+    );
+    assert_eq!(reply(&cmd, "cursor-shell-nomatch.json"), json!({}));
+}
+
+#[test]
+fn snippets_never_block_when_muzzle_cannot_answer() {
+    // Exit 2 is "block" to every harness here. A garbled payload, or muzzle
+    // missing from PATH (sh exits 127), must be any other code, and
+    // cursor-agent also blocks on stdout that isn't JSON, so there is none.
+    let home = tempfile::tempdir().unwrap();
+    let cmds = [
+        "claude-code.hooks.json",
+        "codex.hooks.json",
+        "muse.hooks.json",
+    ]
+    .map(|f| (f, snippet(f).1))
+    .into_iter()
+    .chain([("cursor.hooks.json", cursor_snippet())]);
+    for (file, cmd) in cmds {
         let out = run_hook(&cmd, home.path(), "not json");
         assert_eq!(out.status.code(), Some(1), "{file}: {out:?}");
+        assert!(out.stdout.is_empty(), "{file}: {out:?}");
         let out = Command::new("/bin/sh")
             .args(["-c", &cmd])
             .env_clear()
@@ -222,13 +306,18 @@ fn docs_carry_the_allow_warning_and_the_snippets() {
         .skip(1)
         .map(|b| serde_json::from_str(b.split("```").next().unwrap()).unwrap())
         .collect();
-    let files: Vec<Value> = ["claude-code.hooks.json", "codex.hooks.json"]
-        .iter()
-        .map(|f| {
-            assert!(doc.contains(&format!("({f})")), "{f} not linked");
-            serde_json::from_str(&read(&format!("docs/harnesses/{f}"))).unwrap()
-        })
-        .collect();
+    let files: Vec<Value> = [
+        "claude-code.hooks.json",
+        "codex.hooks.json",
+        "muse.hooks.json",
+        "cursor.hooks.json",
+    ]
+    .iter()
+    .map(|f| {
+        assert!(doc.contains(&format!("({f})")), "{f} not linked");
+        serde_json::from_str(&read(&format!("docs/harnesses/{f}"))).unwrap()
+    })
+    .collect();
     assert_eq!(blocks, files);
 }
 

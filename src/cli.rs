@@ -25,12 +25,16 @@ pub enum Command {
     Match(MatchArgs),
     /// Print the `muzzle run …` rewrite of a shell string, as JSON.
     Wrap(WrapArgs),
-    /// Answer a harness PreToolUse hook: payload on stdin, reply on stdout.
+    /// Answer a harness shell hook (PreToolUse, or cursor-agent's
+    /// beforeShellExecution): payload on stdin, reply on stdout.
     Hook(HookArgs),
     /// Show the budget, holders and queue.
     Status(StatusArgs),
     /// Check the budget, enforcement, state, config and harness setup.
     Doctor(DoctorArgs),
+    /// Add or update muzzle's hook entry in each harness's settings file,
+    /// leaving every other entry alone.
+    Init(InitArgs),
     /// Summarise runs.jsonl: machine figures, per-rule rows, suggestions.
     Report(ReportArgs),
     /// Replay traces and sample the interactive probe.
@@ -99,8 +103,13 @@ pub struct WrapArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Harness {
+    /// Claude Code, and Muse Code, whose `PreToolUse` payloads Claude's
+    /// format covers once its `bash` tool is mapped (every-harness D14).
     Claude,
     Codex,
+    /// cursor-agent's `beforeShellExecution`: deny with the rewrite as the
+    /// reason, since it can't rewrite (every-harness D14).
+    Cursor,
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +126,26 @@ pub struct StatusArgs {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// A harness whose settings `init` writes (every-harness D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HookTarget {
+    Claude,
+    Codex,
+    CursorAgent,
+    Muse,
+    All,
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Write these harnesses' entries even where they aren't set up yet;
+    /// by default only harnesses whose config directory exists.
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "LIST")]
+    pub hooks: Option<Vec<HookTarget>>,
     #[arg(long)]
     pub json: bool,
 }
