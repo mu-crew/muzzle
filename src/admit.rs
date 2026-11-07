@@ -263,6 +263,7 @@ mod tests {
             cwd: "/w".into(),
             repo: None,
             cfg: None,
+            pane: None,
         }
     }
 

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Class;
 use crate::rules::heads::Matcher;
+pub(crate) use keys::canonical_prefix;
 use keys::expand_tilde;
 use layer::{Layer, parse_layer};
 pub use template::TEMPLATE;

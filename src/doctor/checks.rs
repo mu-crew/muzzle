@@ -1,8 +1,9 @@
 //! The checks: [`Facts`] in, a [`Report`] out, without I/O.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{BudgetView, ConfigFile, Facts, Report};
+use crate::init::CheckState;
 use crate::rules::config::{Config, budget_for};
 use crate::runlog::{ARCHIVES_WARN_BYTES, LIVE_MAX_BYTES};
 use crate::state::Budget;
@@ -177,6 +178,51 @@ pub fn check(f: &Facts) -> Report {
             ));
         }
     }
+    for c in &f.hook_entries {
+        let path = c.path.display();
+        match c.state {
+            CheckState::Drift => warnings.push(format!(
+                "{} hook entry in {path} differs from what `muzzle init` writes ({}); \
+                 run `muzzle init`",
+                c.harness,
+                c.drift()
+            )),
+            CheckState::Unreadable => warnings.push(format!(
+                "{} settings {path} unreadable: {}; `muzzle init` leaves it alone",
+                c.harness,
+                c.error.as_deref().unwrap_or("?")
+            )),
+            CheckState::Ok | CheckState::Unhooked => {}
+        }
+        if let (true, Some(toml)) = (c.doubled(), &c.also_in) {
+            warnings.push(format!(
+                "{} hook runs from both {path} and the inline hooks in {}, so each \
+                 shell call is matched twice; remove the inline one",
+                c.harness,
+                toml.display()
+            ));
+        }
+    }
+    // Muse Code runs hooks with HOME but no XDG_CONFIG_HOME (every-harness
+    // D14), so its `muzzle hook claude` reads the default config while the
+    // `muzzle run` it writes, in Muse's shell, reads this one.
+    let muse_hooked = f
+        .hook_entries
+        .iter()
+        .any(|c| c.harness == "muse" && c.plan.owned > 0);
+    if muse_hooked && f.cleared_env_config != f.config_path {
+        // The directory, not the file: includes resolve from it (P5).
+        let dir = |p: &Path| p.parent().unwrap_or(p).to_path_buf();
+        warnings.push(format!(
+            "XDG_CONFIG_HOME puts the config at {}, but Muse Code runs hooks without \
+             it, so its `muzzle hook claude` reads {}; link {} to {}, or the hook and \
+             the run apply different rules",
+            f.config_path.display(),
+            f.cleared_env_config.display(),
+            dir(&f.cleared_env_config).display(),
+            dir(&f.config_path).display()
+        ));
+    }
     let systemd = f.systemd && f.os == "linux";
     let exit = if config_error.is_some() {
         crate::exit::USAGE
@@ -217,6 +263,7 @@ pub fn check(f: &Facts) -> Report {
         claude_hook: found(&f.harnesses.claude_hook, "installed", "not found"),
         codex_hook: found(&f.harnesses.codex_hook, "installed", "not found"),
         harness_files: f.harnesses.clone(),
+        hook_entries: f.hook_entries.clone(),
         warnings,
         exit,
     }
@@ -245,6 +292,7 @@ mod tests {
             config_path: "/c.toml".into(),
             config_exists: true,
             config: cfg("reserve = 2\n[[rule]]\nname='g'\nmatch='g'\nslots=2\n"),
+            cleared_env_config: "/c.toml".into(),
             stored: None,
             state_dir: "/s".into(),
             state_writable: Ok(()),
@@ -254,6 +302,7 @@ mod tests {
             runlog: None,
             container_runs: Vec::new(),
             harnesses: Harnesses::default(),
+            hook_entries: Vec::new(),
         }
     }
 
@@ -580,5 +629,122 @@ mod tests {
             r.warnings
         );
         assert_eq!(r.exit, 0);
+    }
+
+    #[test]
+    fn hook_entries_are_listed_and_drift_warns_with_the_fix() {
+        use crate::init::{CheckState, HookCheck, plan::Plan};
+        let entry = |harness, state, plan: Plan, error: Option<&str>| HookCheck {
+            harness,
+            path: format!("/h/{harness}.json").into(),
+            state,
+            plan,
+            error: error.map(String::from),
+            also_in: None,
+        };
+        let mut f = facts();
+        assert!(render_text(&check(&f)).contains("hook entries   no harness set up"));
+        f.hook_entries = vec![
+            entry("claude", CheckState::Ok, Plan::default(), None),
+            entry("codex", CheckState::Unhooked, Plan::default(), None),
+            entry(
+                "muse",
+                CheckState::Drift,
+                Plan {
+                    owned: 1,
+                    removed: vec!["Stop: muzzle hook claude".into()],
+                    ..Plan::default()
+                },
+                None,
+            ),
+            entry(
+                "cursor-agent",
+                CheckState::Unreadable,
+                Plan::default(),
+                Some("it is not a JSON object"),
+            ),
+        ];
+        let r = check(&f);
+        assert_eq!(r.exit, 0, "advisory");
+        assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+        assert!(
+            r.warnings[0].contains("muse hook entry in /h/muse.json")
+                && r.warnings[0].contains("(stray Stop: muzzle hook claude); run `muzzle init`"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings[1].contains("not a JSON object"),
+            "{:?}",
+            r.warnings
+        );
+        let t = render_text(&r);
+        assert!(
+            t.contains(
+                "hook entries   claude ok, codex none (`muzzle init` adds it), muse drift, \
+                 cursor-agent unreadable"
+            ),
+            "{t}"
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["hook_entries"][2]["state"], "drift");
+        assert_eq!(
+            v["hook_entries"][2]["removed"][0],
+            "Stop: muzzle hook claude"
+        );
+    }
+
+    #[test]
+    fn a_moved_config_warns_only_with_a_muse_entry() {
+        use crate::init::{CheckState, HookCheck, plan::Plan};
+        let entry = |harness, state, owned| HookCheck {
+            harness,
+            path: format!("/h/{harness}.json").into(),
+            state,
+            plan: Plan {
+                owned,
+                ..Plan::default()
+            },
+            error: None,
+            also_in: None,
+        };
+        let moved = |r: &Report| {
+            r.warnings
+                .iter()
+                .filter(|w| w.contains("XDG_CONFIG_HOME"))
+                .count()
+        };
+        let mut f = facts();
+        f.hook_entries = vec![entry("muse", CheckState::Ok, 1)];
+        assert_eq!(moved(&check(&f)), 0, "one file");
+
+        f.config_path = "/xdg/muzzle/config.toml".into();
+        f.cleared_env_config = "/home/.config/muzzle/config.toml".into();
+        let r = check(&f);
+        assert_eq!(r.exit, 0, "advisory");
+        assert_eq!(moved(&r), 1, "{:?}", r.warnings);
+        let w = r.warnings.iter().find(|w| w.contains("XDG")).unwrap();
+        assert!(
+            w.contains("config at /xdg/muzzle/config.toml")
+                && w.contains("`muzzle hook claude` reads /home/.config/muzzle/config.toml")
+                && w.contains("link /home/.config/muzzle to /xdg/muzzle,"),
+            "{w}"
+        );
+        // A drifted entry still runs.
+        f.hook_entries = vec![entry("muse", CheckState::Drift, 2)];
+        assert_eq!(moved(&check(&f)), 1);
+        // No muzzle entry in Muse, or only claude's and codex's, which keep
+        // the environment.
+        for others in [
+            vec![entry("muse", CheckState::Unhooked, 0)],
+            vec![
+                entry("claude", CheckState::Ok, 1),
+                entry("codex", CheckState::Ok, 1),
+            ],
+            Vec::new(),
+        ] {
+            f.hook_entries = others;
+            assert_eq!(moved(&check(&f)), 0, "{:?}", f.hook_entries);
+        }
     }
 }

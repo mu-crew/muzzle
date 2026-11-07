@@ -236,8 +236,15 @@ run …` survives a hangup.
   `TERM_PROGRAM` is `tmux`, and tmux drops the sequence (only DCS
   passthrough would carry it, which muzzle does not use).
 - `muzzle doctor` checks the budget, enforcement, the state directory, the
-  config, the run log and each harness's setup. Exit 0 means usable, even
+  config, the run log and each harness's setup, including whether muzzle's
+  hook entries match what `muzzle init` writes. Exit 0 means usable, even
   when only advisory.
+- `muzzle init` writes those hook entries for each harness set up here,
+  leaving every other entry in the shared settings files alone
+  ([docs/harnesses/](harnesses/README.md)).
+- `muzzle status --json` names each holder's and waiter's `pid` and the
+  tmux `pane` it was started from, so mu can tell a worker queued here
+  from a stalled one.
 - `muzzle report` summarises the run log: machine figures, per-rule rows
   and a suggested weight per rule. `--compare A..B C..D` puts two periods
   side by side. `--by repo` gives a row per rule and repo, each with the
@@ -281,7 +288,7 @@ it without any CPU use. Read it as a trend, not a measurement.
 
 ## Harnesses
 
-pi, Claude Code, Codex, opencode and hand-wrapping:
+pi, Claude Code, Codex, Muse Code, cursor-agent, opencode and hand-wrapping:
 [harnesses.md](../npm/muzzle/skills/muzzle/recipes/harnesses.md), with the
 snippets in [docs/harnesses/](harnesses/README.md).
 

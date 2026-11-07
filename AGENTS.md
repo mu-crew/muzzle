@@ -44,6 +44,7 @@ dependency is pre-declared, so a unit edits only its own files.
 | `src/repo.rs` | which repo a run belongs to (D27a) |
 | `src/rules/` | `config/` (load, merge, template, hash), `resolve.rs` (what applies at a cwd), `shell.rs`, `heads.rs` (command rules), `hook.rs`; `match`, `wrap` |
 | `src/status.rs` | `status` |
+| `src/init/` | `init` (every-harness D13): `plan.rs` (pure), `json.rs` (order-keeping JSON), `mod.rs` (I/O, check for doctor) |
 | `src/doctor/` | `doctor`: `gather.rs` (I/O), `checks.rs` (pure), `render.rs` |
 | `src/report/` | `report`: `period.rs`, `rows.rs`, `by_repo.rs`, `machine.rs`, `render.rs` |
 | `src/bench/` | `bench run` and `bench burn` (`replay/`), `bench probe` (`probe.rs`) |
@@ -66,6 +67,18 @@ A unit that must touch `Cargo.toml`, `src/cli.rs`, `src/lib.rs` or
   published.
 - **Never put `timeout` outside `muzzle run`**: it counts the queue wait. Use
   `--run-timeout`.
+- **State directories.** A change that breaks on-disk state compatibility
+  with the released version gets a new versioned directory under
+  `~/.local/state` (`<tool><major>`, e.g. `mu5`, `murmur2`), never a
+  `<tool>-next` name; additive changes stay in the current directory.
+  muzzle's is `~/.local/state/muzzle`; `state.json` and `runs.jsonl` only
+  gain fields. An older muzzle still loads them but drops fields it does
+  not know when it rewrites `state.json`, so readers (mu) take an added
+  field as possibly absent. Never run a development build against the real
+  state directory: tests and manual runs set `XDG_STATE_HOME` and
+  `XDG_CONFIG_HOME` to a temp dir; `init` and `doctor` runs also set `HOME`
+  to one and unset `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
+  `PI_CODING_AGENT_DIR`. muzzle reads no murmur or mu state.
 
 ## Style
 

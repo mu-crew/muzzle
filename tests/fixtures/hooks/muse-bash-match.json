@@ -1,0 +1,12 @@
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "bash",
+  "tool_input": {"command": "cargo test --workspace", "description": "Run tests", "workdir": "/home/user/my-project"},
+  "session_id": "00000000-0000-7000-8000-000000000001",
+  "turn_id": "00000000-0000-7000-8000-000000000002",
+  "cwd": "/home/user/my-project",
+  "transcript_path": null,
+  "model": "example-model",
+  "permission_mode": "default",
+  "model_provider": "example"
+}
