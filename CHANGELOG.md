@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- Release binaries are built with fat LTO, one codegen unit and stripped
+  symbols, about a third smaller (macOS arm64: 5.29 -> 3.43 MB). A panic
+  backtrace from a release binary no longer names functions.
+
 ## 0.3.0
 
 Added:
