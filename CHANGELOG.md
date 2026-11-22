@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
+
+Added:
+
+- **Process launches per run** (0.3.1 spec L1–L4). `runs.jsonl` gains
+  `procs`: the processes seen in the job's process group, sampled every
+  20 ms on macOS and 250 ms on Linux, a lower bound. On hosts where a
+  launch is expensive, `cores` misses that cost, and this is the figure
+  that shows it. `report` and `--by repo` show `procs/s p50/p90` after
+  cores, and `--json` adds `procs_per_s`. Suggestions don't use it yet;
+  `recipes/tune.md` says how to read it.
+- usage.md: size a tool's own worker pool from `MUZZLE_SLOTS` (vitest
+  `maxWorkers`, pytest-xdist `-n`, ninja, jest, go test), since a claim
+  can't cap a tool that picks its own worker count.
 
 Changed:
 
