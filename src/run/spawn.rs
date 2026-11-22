@@ -1,6 +1,7 @@
 //! Spawn and process groups: signal targets, the run deadline, the
 //! nested run, program lookup and exit codes.
 
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -245,6 +246,7 @@ impl Deadline {
         target: Target,
         mut sampler: Option<&mut Sampler>,
         mut beat: Option<&mut Heartbeat>,
+        mut launches: Option<&mut Launches>,
     ) {
         let Some(termed) = self.termed else { return };
         loop {
@@ -266,8 +268,93 @@ impl Deadline {
             if let Some(b) = beat.as_deref_mut() {
                 b.beat();
             }
+            // L1: ran_s includes the grace, so its processes count too.
+            if let Some(l) = launches.as_deref_mut() {
+                l.tick(target);
+            }
             std::thread::sleep(TICK);
         }
+    }
+}
+
+/// L1 (0.3.1 launches spec): how often the job's group is listed to count
+/// its processes. On macOS a listing is one `proc_listpids(PROC_PGRP_ONLY)`
+/// plus a stat per member, so it runs every `TICK`; on Linux it reads all
+/// of /proc, so every `POLL`: the cost D18's 2026-10-30 note weighed
+/// against adoption (a scan every `POLL` for the run's whole length), taken
+/// here on Linux and not yet measured there.
+const LAUNCH_SAMPLE: Duration = if cfg!(target_os = "macos") {
+    TICK
+} else {
+    POLL
+};
+
+/// L1: the processes the job ran, counted by sampling its group. Each
+/// process is told apart by (pid, start stamp), so one that leaves the
+/// group and comes back counts once, and a recycled pid counts again. A
+/// lower bound: a process that starts and ends between two samples is
+/// missed.
+pub(super) struct Launches {
+    /// The previous sample, sorted: these are the same processes as last
+    /// time, so their start stamps aren't read again.
+    prev: Vec<Pid>,
+    /// Every process counted so far.
+    seen: HashMap<Pid, proc::StartTime>,
+    pub(super) count: u64,
+    next: Instant,
+}
+
+impl Launches {
+    /// Seeded with the top command, which is counted even if it exits
+    /// before the first sample.
+    pub(super) fn new(top: Pid) -> Launches {
+        let mut seen = HashMap::new();
+        if let Some(st) = proc::start_time(top) {
+            seen.insert(top, st);
+        }
+        Launches {
+            prev: vec![top],
+            seen,
+            count: 1,
+            next: Instant::now(),
+        }
+    }
+
+    /// List the group when a sample is due.
+    pub(super) fn tick(&mut self, target: Target) {
+        if Instant::now() < self.next {
+            return;
+        }
+        self.next = Instant::now() + LAUNCH_SAMPLE;
+        self.see(target.others(), proc::start_time);
+    }
+
+    /// Count the members not seen before. `start` reads a pid's start
+    /// stamp, only for pids that weren't in the previous sample.
+    pub(super) fn see(
+        &mut self,
+        mut members: Vec<Pid>,
+        start: impl Fn(Pid) -> Option<proc::StartTime>,
+    ) {
+        members.sort_unstable();
+        for &pid in &members {
+            if self.prev.binary_search(&pid).is_ok() {
+                continue;
+            }
+            match (start(pid), self.seen.get(&pid)) {
+                // Back in the group, or listed again: the same process.
+                (Some(st), Some(&old)) if st == old => {}
+                (Some(st), _) => {
+                    self.seen.insert(pid, st);
+                    self.count += 1;
+                }
+                // Gone between the listing and the read: a process all the
+                // same, unless the pid was counted before.
+                (None, Some(_)) => {}
+                (None, None) => self.count += 1,
+            }
+        }
+        self.prev = members;
     }
 }
 
@@ -280,6 +367,7 @@ pub(super) fn supervise(
     deadline: &mut Deadline,
     mut sampler: Option<&mut Sampler>,
     mut beat: Option<&mut Heartbeat>,
+    mut launches: Option<&mut Launches>,
 ) -> anyhow::Result<(ExitStatus, proc::Rusage)> {
     let started = Instant::now();
     loop {
@@ -304,6 +392,9 @@ pub(super) fn supervise(
         }
         if let Some(b) = beat.as_deref_mut() {
             b.beat();
+        }
+        if let Some(l) = launches.as_deref_mut() {
+            l.tick(target);
         }
         std::thread::sleep(TICK);
     }
@@ -360,9 +451,9 @@ pub(super) fn run_nested(
     let pid = child.id() as Pid;
     let target = Target::Child(pid);
     let mut deadline = Deadline::new(run_timeout);
-    let (status, _) = supervise(pid, target, &mut deadline, None, None)?;
+    let (status, _) = supervise(pid, target, &mut deadline, None, None, None)?;
     // D18's grace applies to the nested job's leftovers as to a group.
-    deadline.drain(target, None, None);
+    deadline.drain(target, None, None, None);
     proc::reap_adopted(pid);
     let code = deadline.why.map_or(exit_code(status), Fired::code);
     if let Some(path) = &args.report {
@@ -436,6 +527,8 @@ pub(super) fn spawn_failed(program: &str, e: &std::io::Error) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt;
+
     use super::*;
 
     #[test]
@@ -443,5 +536,63 @@ mod tests {
         assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
         assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
+    }
+
+    /// Start stamps for synthetic pids: pid × 100, unless overridden.
+    fn stamps(over: &[(Pid, u64)]) -> impl Fn(Pid) -> Option<proc::StartTime> + '_ {
+        move |pid| {
+            over.iter()
+                .find(|(p, _)| *p == pid)
+                .map_or(Some(pid as u64 * 100), |&(_, st)| Some(st))
+        }
+    }
+
+    #[test]
+    fn launches_count_the_top_command_that_exits_before_any_sample() {
+        let mut l = Launches::new(10);
+        l.see(vec![], stamps(&[]));
+        assert_eq!(l.count, 1);
+    }
+
+    #[test]
+    fn launches_count_each_process_once() {
+        let mut l = Launches::new(10);
+        l.see(vec![11, 10], stamps(&[]));
+        assert_eq!(l.count, 2);
+        l.see(vec![11, 12, 13], stamps(&[]));
+        assert_eq!(l.count, 4);
+        // 11 leaves the group and comes back, same start stamp: the same
+        // process (F1 of the 0.3.1 review: it was counted twice).
+        l.see(vec![12], stamps(&[]));
+        l.see(vec![11, 12], stamps(&[]));
+        assert_eq!(l.count, 4);
+        // 13 is recycled: a new start stamp is a new process.
+        l.see(vec![13], stamps(&[(13, 9999)]));
+        assert_eq!(l.count, 5);
+        // A pid gone before its stamp is read still counts, once.
+        l.see(vec![14], |_| None);
+        assert_eq!(l.count, 6);
+    }
+
+    #[test]
+    fn launches_see_a_real_groups_children() {
+        // A group of its own: sh plus three sleeps that outlive the loop,
+        // so a late fork or a slow sampler only delays the count.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as Pid;
+        let mut l = Launches::new(pid);
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until && l.count < 4 {
+            l.tick(Target::Group(pid));
+            std::thread::sleep(TICK);
+        }
+        // SAFETY: signalling the group this test made.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        child.wait().unwrap();
+        assert_eq!(l.count, 4);
     }
 }

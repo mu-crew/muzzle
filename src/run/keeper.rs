@@ -5,8 +5,9 @@ use std::time::Instant;
 use anyhow::bail;
 
 use super::job::{Ending, Job};
+use super::report::Measured;
 use super::scope::{Sampler, mb, scope_outcome};
-use super::spawn::Target;
+use super::spawn::{Launches, Target};
 use super::{Heartbeat, POLL, now_ms};
 use crate::proc::{self, Pid};
 use crate::state::Killed;
@@ -20,6 +21,7 @@ impl Job<'_> {
         &self,
         target: Target,
         sampler: Option<Sampler>,
+        launches: Launches,
         unit: String,
         started: Instant,
         ending: &Ending,
@@ -44,7 +46,7 @@ impl Job<'_> {
                         libc::signal(sig, libc::SIG_IGN);
                     }
                     libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                    self.keep(target, sampler, &unit, started, ending, fds[1]);
+                    self.keep(target, sampler, launches, &unit, started, ending, fds[1]);
                     libc::_exit(0);
                 }
                 _ => {
@@ -66,10 +68,12 @@ impl Job<'_> {
 
     /// The keeper's body. Writes one byte to `ready` once it holds the
     /// entry, then waits for the group to empty.
+    #[allow(clippy::too_many_arguments)] // all the run handed across fork
     fn keep(
         &self,
         target: Target,
         mut sampler: Option<Sampler>,
+        mut launches: Launches,
         unit: &str,
         started: Instant,
         ending: &Ending,
@@ -98,6 +102,10 @@ impl Job<'_> {
         loop {
             beat.beat();
             let others = target.others();
+            // L1: the group is listed anyway; every POLL, so a background
+            // job's short-lived processes are undercounted more than a
+            // foreground one's.
+            launches.see(others.clone(), proc::start_time);
             match others.first() {
                 Some(&member) => {
                     if let Some(s) = sampler.as_mut() {
@@ -126,7 +134,12 @@ impl Job<'_> {
                 ending.killed = Some(Killed::Oom);
             }
         }
-        let _ = self.release(ran_s, &ending, cpu_s, peak, true);
+        let m = Measured {
+            cpu_s,
+            mem_peak_mb: peak,
+            procs: Some(launches.count),
+        };
+        let _ = self.release(ran_s, &ending, m, true);
     }
 }
 

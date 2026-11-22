@@ -201,6 +201,10 @@ pub struct RunRecord {
     /// P12: slots held by other tickets at admission; absent on older lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<u32>,
+    /// L1 (0.3.1): processes seen in the job's group, sampled, so a lower
+    /// bound; absent on older lines and null-free: omitted when unmeasured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procs: Option<u64>,
 }
 
 /// D16a: why a run that had a scope was not enforced.
@@ -754,6 +758,7 @@ mod tests {
             enforced_reason: None,
             load1: None,
             held: None,
+            procs: None,
         };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["killed"], "holder");

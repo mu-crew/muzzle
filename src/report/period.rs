@@ -39,6 +39,12 @@ impl Run {
         let cpu = self.rec.cpu_s?;
         (self.rec.ran_s > 0.0).then(|| cpu / self.rec.ran_s)
     }
+
+    /// L2: processes started per second of run, `procs / ran_s`.
+    pub fn procs_per_s(&self) -> Option<f64> {
+        let n = self.rec.procs? as f64;
+        (self.rec.ran_s > 0.0).then(|| n / self.rec.ran_s)
+    }
 }
 
 /// Parses `runs.jsonl` text. Lines that don't parse or have a newer schema

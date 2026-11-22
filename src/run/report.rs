@@ -65,6 +65,15 @@ pub(super) fn repo_str(cwd: Option<&Path>) -> Option<String> {
     repo::repo_of(cwd?).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// What was measured of a run, for its `runs.jsonl` line.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Measured {
+    pub(super) cpu_s: Option<f64>,
+    pub(super) mem_peak_mb: Option<u64>,
+    /// L1: processes seen in the job's group.
+    pub(super) procs: Option<u64>,
+}
+
 pub(super) fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
@@ -74,19 +83,24 @@ impl Job<'_> {
         &self,
         ran_s: f64,
         ending: &Ending,
-        cpu_s: Option<f64>,
-        mem_peak_mb: Option<u64>,
+        m: Measured,
         kept: bool,
         budget: Option<u32>,
     ) -> RunRecord {
         let h = &self.holder;
         // D16a: the scope saw only podman exec and conmon, so its figures
         // say nothing about the job (3 s of in-container CPU read 0.21 s on
-        // linuxpc). Null, as for a run nobody measured.
-        let (cpu_s, mem_peak_mb) = match h.enforced_reason {
-            Some(EnforcedReason::Container) => (None, None),
-            None => (cpu_s, mem_peak_mb),
+        // linuxpc). Null, as for a run nobody measured. L1: so is the
+        // process count, as the container's processes aren't in the group.
+        let m = match h.enforced_reason {
+            Some(EnforcedReason::Container) => Measured::default(),
+            None => m,
         };
+        let Measured {
+            cpu_s,
+            mem_peak_mb,
+            procs,
+        } = m;
         RunRecord {
             v: 1,
             end: admit::rfc3339(now_ms()),
@@ -110,6 +124,7 @@ impl Job<'_> {
             enforced_reason: h.enforced_reason,
             load1: h.admit_load1,
             held: h.admit_held,
+            procs,
         }
     }
 
@@ -121,14 +136,13 @@ impl Job<'_> {
         &self,
         ran_s: f64,
         ending: &Ending,
-        cpu_s: Option<f64>,
-        mem_peak_mb: Option<u64>,
+        m: Measured,
         kept: bool,
     ) -> anyhow::Result<u64> {
         self.store.update_logged(now_ms(), |s| {
             let now = now_ms();
             let budget = s.budget.map(|b| b.budget.max(1));
-            let rec = self.record(ran_s, ending, cpu_s, mem_peak_mb, kept, budget);
+            let rec = self.record(ran_s, ending, m, kept, budget);
             // A keeper whose entry was pruned (it was SIGSTOPped, say) has
             // already had its line written by the pruning waiter.
             let lines = if s.remove(self.ticket) || !kept {
@@ -214,9 +228,14 @@ mod tests {
             killed: None,
             exit: 0,
         };
-        let r = job.record(1.0, &ending, Some(3.0), Some(10), false, Some(8));
+        let m = Measured {
+            cpu_s: Some(3.0),
+            mem_peak_mb: Some(10),
+            procs: Some(5),
+        };
+        let r = job.record(1.0, &ending, m, false, Some(8));
         // D16a nulls the scope's figures, not the admission ones.
-        assert_eq!((r.cpu_s, r.mem_peak_mb), (None, None));
+        assert_eq!((r.cpu_s, r.mem_peak_mb, r.procs), (None, None, None));
         assert_eq!((r.load1, r.held), (Some(9.5), Some(4)));
     }
 }

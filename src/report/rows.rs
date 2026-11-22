@@ -49,6 +49,8 @@ pub struct Row {
     pub wait_s: Option<P5090>,
     pub run_s: Option<P5090>,
     pub cores: Option<P5090>,
+    /// L2: processes started per second, over clean runs that counted them.
+    pub procs_per_s: Option<P5090>,
     pub mem_peak_mb_p90: Option<f64>,
     pub suggest: Suggest,
 }
@@ -76,6 +78,7 @@ pub fn row(rule: Option<String>, runs: &[&Run], host: Host) -> Row {
     let waits: Vec<f64> = runs.iter().map(|r| r.rec.waited_s).collect();
     let rans: Vec<f64> = clean.iter().map(|r| r.rec.ran_s).collect();
     let cores: Vec<f64> = clean.iter().filter_map(|r| r.cores()).collect();
+    let procs: Vec<f64> = clean.iter().filter_map(|r| r.procs_per_s()).collect();
     let mems: Vec<f64> = clean
         .iter()
         .filter_map(|r| r.rec.mem_peak_mb.map(|m| m as f64))
@@ -114,6 +117,7 @@ pub fn row(rule: Option<String>, runs: &[&Run], host: Host) -> Row {
         wait_s: p5090(&waits),
         run_s: p5090(&rans),
         cores: p5090(&cores),
+        procs_per_s: p5090(&procs),
         mem_peak_mb_p90: mem_p90,
         suggest,
     }
@@ -332,6 +336,29 @@ mod tests {
     use super::super::tests::{HOST, T0, one_row, run, slots_tag, with_cores};
     use super::*;
     use crate::report::render::{row_json, row_text};
+
+    /// L2: procs/s is procs ÷ ran_s over clean runs that carry procs; a
+    /// failed run and a line without procs (older, container) are skipped.
+    #[test]
+    fn procs_per_s_is_over_clean_runs_with_a_count() {
+        let mut runs = with_cores(T0, 4, &[1.0; 5]);
+        for (i, r) in runs.iter_mut().enumerate() {
+            r.rec.procs = Some(100 * (i as u64 + 1)); // 1..5 per s at 100 s
+        }
+        runs[0].rec.procs = None;
+        let mut failed = run(T0 + 99_999.0, 100.0);
+        failed.rec.exit = Some(1);
+        failed.rec.procs = Some(100_000);
+        runs.push(failed);
+        let r = one_row(&runs);
+        assert_eq!(r.procs_per_s, Some(P5090 { p50: 3.0, p90: 5.0 }));
+        assert!(row_text(&r).contains("\t3.0/5.0\t"), "{}", row_text(&r));
+        assert_eq!(row_json(&r)["procs_per_s"]["p90"], 5.0);
+        // No run with a count: "-" and null, as for cores.
+        let none = one_row(&with_cores(T0, 4, &[1.0; 5]));
+        assert_eq!(none.procs_per_s, None);
+        assert!(row_json(&none)["procs_per_s"].is_null());
+    }
 
     #[test]
     fn rows_report_percentiles_over_clean_runs() {

@@ -503,6 +503,44 @@ fn background_child_hands_off_to_a_keeper() {
     assert_eq!(runs[0]["exit"], 0);
     assert_eq!(runs[0]["held"], 0, "the keeper's line keeps P12's fields");
     assert!(runs[0]["ran_s"].as_f64().unwrap() >= 1.8, "{}", runs[0]);
+    // L1: sh, then the sleep the keeper saw after the handoff.
+    assert_eq!(runs[0]["procs"], 2, "{}", runs[0]);
+}
+
+/// L1: a foreground run counts the processes its group started.
+#[test]
+fn a_run_counts_the_processes_of_its_group() {
+    let env = Env::new();
+    let out = env
+        .cmd(&["--", "sh", "-c", "sleep 1; sleep 1; true"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(env.runs()[0]["procs"], 3, "sh and two sleeps");
+}
+
+/// L1: a process started in --run-timeout's grace counts, as the grace
+/// counts in ran_s (F2 of the 0.3.1 review).
+#[test]
+fn a_run_counts_processes_started_in_the_term_grace() {
+    let env = Env::new();
+    let out = env
+        .cmd(&[
+            "--run-timeout",
+            "1",
+            "--",
+            "bash",
+            "-c",
+            r#"bash -c "$0" & wait"#,
+            // The second sleep starts half a second into the grace, long
+            // after the top bash died of the TERM.
+            "trap 'sleep 0.5; sleep 1; exit 0' TERM; while :; do :; done",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(124), "{out:?}");
+    let r = &env.runs()[0];
+    assert_eq!(r["procs"], 4, "two bashes, then the trap's sleeps: {r}");
 }
 
 /// f-keeper-handoff (D16): a `--report` that can't be written, after the
@@ -1037,10 +1075,12 @@ fn a_run_appends_its_line_to_runs_jsonl() {
         "budget",
         "load1",
         "held",
+        "procs",
     ] {
         assert!(r.get(key).is_some(), "missing {key}: {r}");
     }
     assert_eq!(r["held"], 0, "nobody else held slots");
+    assert_eq!(r["procs"], 1, "a sh loop of builtins forks nothing");
     assert_eq!(r["rule"], "gate");
     assert_eq!(r["slots"], 2, "the rule's slots");
     assert_eq!(r["class"], "normal");
@@ -1316,6 +1356,8 @@ fn a_container_run_is_recorded_as_not_enforced() {
     assert_eq!(r["enforced_reason"], "container", "{r}");
     // The scope saw only podman and conmon: no figures rather than wrong ones.
     assert!(r["cpu_s"].is_null() && r["mem_peak_mb"].is_null(), "{r}");
+    // L1: the container's processes aren't in the group: no count at all.
+    assert!(r.get("procs").is_none(), "{r}");
     let rep: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
     assert_eq!(rep["enforced"], false);
     assert_eq!(rep["enforced_reason"], "container");

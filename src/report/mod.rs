@@ -274,6 +274,7 @@ mod tests {
                 enforced_reason: None,
                 load1: None,
                 held: None,
+                procs: None,
             },
         }
     }

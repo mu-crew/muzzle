@@ -4,10 +4,11 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use super::report::Measured;
 use super::scope::{
     Sampler, cpu_weight, mb, scope_dir, scope_outcome, systemd_run_expands_env, unit_name,
 };
-use super::spawn::{Deadline, Fired, Target, exit_code, spawn_failed, supervise};
+use super::spawn::{Deadline, Fired, Launches, Target, exit_code, spawn_failed, supervise};
 use super::{Heartbeat, now_ms, scope_populated};
 use crate::cli::RunArgs;
 use crate::proc::{self, Pid, StartTime};
@@ -147,14 +148,23 @@ impl Job<'_> {
         }
         let mut deadline = Deadline::new(run_timeout);
         let mut beat = Heartbeat::new(self.store, self.ticket);
+        // L1: a container run's processes aren't in the group, and its count
+        // is dropped (D16a), so don't scan for it.
+        let mut launches = Launches::new(pid);
         let (status, ru) = supervise(
             pid,
             target,
             &mut deadline,
             sampler.as_mut(),
             Some(&mut beat),
+            (!container).then_some(&mut launches),
         )?;
-        deadline.drain(target, sampler.as_mut(), Some(&mut beat));
+        deadline.drain(
+            target,
+            sampler.as_mut(),
+            Some(&mut beat),
+            (!container).then_some(&mut launches),
+        );
         let ran_s = started.elapsed().as_secs_f64();
         let mut ending = Ending {
             code: exit_code(status),
@@ -181,7 +191,7 @@ impl Job<'_> {
         let kept = (!deadline.fired() && !target.others().is_empty()) || self.scope_busy();
         let mut released_ms = None;
         if kept {
-            self.hand_off(target, sampler, unit, started, &ending)?;
+            self.hand_off(target, sampler, launches, unit, started, &ending)?;
         } else {
             let mut cpu_s = ru.cpu_s;
             let mut peak = ru.max_rss_bytes;
@@ -205,7 +215,12 @@ impl Job<'_> {
                     ending.killed = Some(Killed::Oom);
                 }
             }
-            released_ms = Some(self.release(ran_s, &ending, Some(cpu_s), Some(mb(peak)), false)?);
+            let m = Measured {
+                cpu_s: Some(cpu_s),
+                mem_peak_mb: Some(mb(peak)),
+                procs: Some(launches.count),
+            };
+            released_ms = Some(self.release(ran_s, &ending, m, false)?);
         }
         // The job ran and its slots are settled, so its code stands: a
         // `--report` that can't be written is muzzle's error, said on stderr,

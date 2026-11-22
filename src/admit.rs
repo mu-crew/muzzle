@@ -187,6 +187,7 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         enforced_reason: h.enforced_reason,
         load1: h.admit_load1,
         held: h.admit_held,
+        procs: None,
     }
 }
 

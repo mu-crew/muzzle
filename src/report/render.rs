@@ -28,7 +28,8 @@ pub(super) fn row_json(r: &Row) -> Value {
     let mut v = json!({
         "rule": r.rule, "runs": r.runs, "clean": r.clean, "oom": r.oom,
         "slots": r.slots, "wait_s": pj(r.wait_s), "run_s": pj(r.run_s),
-        "cores": pj(r.cores), "mem_peak_mb_p90": r.mem_peak_mb_p90,
+        "cores": pj(r.cores), "procs_per_s": pj(r.procs_per_s),
+        "mem_peak_mb_p90": r.mem_peak_mb_p90,
         "suggest": suggest_json(&r.suggest),
     });
     if let Some(cfg) = &r.cfg {
@@ -138,12 +139,13 @@ pub(super) fn row_text(r: &Row) -> String {
         String::new()
     };
     format!(
-        "{name}\t{}{oom}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{name}\t{}{oom}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         r.runs,
         r.slots,
         pair(r.wait_s, " s", 0),
         pair(r.run_s, " s", 0),
         pair(r.cores, "", 1),
+        pair(r.procs_per_s, "", 1),
         r.mem_peak_mb_p90.map_or("-".into(), gb),
         suggest_text(&r.suggest),
     )
@@ -151,7 +153,7 @@ pub(super) fn row_text(r: &Row) -> String {
 
 fn rows_text(rows: &[(Row, Vec<Row>)], out: &mut String) {
     out.push_str(
-        "rule\truns\tslots\twait p50/p90\trun p50/p90\tcores p50/p90\tmem peak p90\tsuggest\n",
+        "rule\truns\tslots\twait p50/p90\trun p50/p90\tcores p50/p90\tprocs/s p50/p90\tmem peak p90\tsuggest\n",
     );
     for (r, subs) in rows {
         out.push_str(&row_text(r));
@@ -291,6 +293,19 @@ mod tests {
         assert!(out.contains("insufficient data (3 runs)"), "{out}");
         assert!(out.contains(UNMATCHED_HINT), "{out}");
         assert!(out.contains("utilisation "), "{out}");
+        // Every row has as many columns as the header (L2 added one).
+        let lines: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("rule\t"))
+            .collect();
+        let tabs = |l: &str| l.matches('\t').count();
+        assert!(
+            lines[1..]
+                .iter()
+                .take_while(|l| !l.is_empty())
+                .all(|l| tabs(l) == tabs(lines[0])),
+            "{out}"
+        );
     }
 
     #[test]

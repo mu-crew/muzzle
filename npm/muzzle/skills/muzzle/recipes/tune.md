@@ -50,6 +50,18 @@ Then the rows. `suggest` names its evidence and carries a tag:
 - `not measured (container)`: those runs entered a container, so muzzle
   saw no CPU or memory. No suggestion can come from them.
 
+`procs/s p50/p90` (0.3.1) counts processes the job started per second, a
+lower bound sampled from its group. Suggestions ignore it. Read it on a
+host where a launch is slow: much of a launch's cost there lands on
+other processes, so `cores`
+and CPU efficiency can call a spawn-heavy job light while the machine
+crawls. Time `/usr/bin/true`: tens of ms, not ~1 ms, means launches are
+expensive. A high `procs/s` is a hint, not proof: confirm that the rule's
+runs get faster when fewer of them run at once before acting. Then shrink
+the budget (`overcommit = 1.0`, a larger `reserve`) in that host's
+machine file, and weight the rule above its `cores` p90, with the figure
+in the `# why:` comment.
+
 Narrow to one rule with `--rule NAME`, or to a period with `--since D`
 and `--until D` (`now`, `7d`, `12h`, `30m`, `YYYY-MM-DD`, or RFC 3339).
 

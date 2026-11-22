@@ -112,13 +112,14 @@ fn row_text(r: &RepoRow) -> String {
         String::new()
     };
     format!(
-        "{}\t{}\t{}{oom}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}{oom}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         label(&w.rule),
         repo_label(&r.repo),
         w.runs,
         pair(w.wait_s, " s", 0),
         pair(w.run_s, " s", 0),
         pair(w.cores, "", 1),
+        pair(w.procs_per_s, "", 1),
         w.mem_peak_mb_p90.map_or("-".into(), gb),
         now_text(r),
         suggest_text(&w.suggest),
@@ -159,7 +160,7 @@ pub fn render(m: &Option<Machine>, rows: &[RepoRow], json_out: bool) -> String {
     machine_text(m, &mut out);
     out.push('\n');
     out.push_str(
-        "rule\trepo\truns\twait p50/p90\trun p50/p90\tcores p50/p90\tmem peak p90\tnow\tsuggest\n",
+        "rule\trepo\truns\twait p50/p90\trun p50/p90\tcores p50/p90\tprocs/s p50/p90\tmem peak p90\tnow\tsuggest\n",
     );
     rows.iter().for_each(|r| out.push_str(&row_text(r)));
     out.push('\n');
@@ -282,6 +283,19 @@ enabled = false
         assert!(text.contains("(no rule)\t(none)\t"), "{text}");
         assert!(text.contains(NOT_HERE), "{text}");
         assert!(text.contains(UNMATCHED_HINT), "{text}");
+        // Every row has as many columns as the header (L2 added one).
+        let lines: Vec<&str> = text
+            .lines()
+            .skip_while(|l| !l.starts_with("rule\t"))
+            .collect();
+        let tabs = |l: &str| l.matches('\t').count();
+        assert!(
+            lines[1..]
+                .iter()
+                .take_while(|l| !l.is_empty())
+                .all(|l| tabs(l) == tabs(lines[0])),
+            "{text}"
+        );
 
         let v: Value = serde_json::from_str(&render(&None, &rows, true)).unwrap();
         let rule = |repo: Value| {

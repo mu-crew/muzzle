@@ -177,7 +177,9 @@ muzzle run --rule cargo-test -- cargo test --locked
   waiters go ahead of normal ones and never pre-empt a running job.
 - muzzle sets `MUZZLE_SLOTS`, `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS` and
   `MAKEFLAGS=-jN` from the claim, overwriting inherited values. An
-  assignment inside the command string still wins.
+  assignment inside the command string still wins. Other tools pick their
+  own worker count; see [Size workers from
+  `MUZZLE_SLOTS`](#size-workers-from-muzzle_slots).
 - A `muzzle run` inside a claimed job (a gate script calling `cargo test`
   through muzzle) is nested: it starts at once and claims nothing. Nesting
   is found through process ancestry, or through the `MUZZLE_HOLD` variable
@@ -271,6 +273,25 @@ Every admitted run appends one line to
   `muzzle: runs.jsonl rotation failed` line and the run still logs.
 - The log is local state and records working directories, so don't
   publish it.
+
+### Process launches
+
+Each run line also records `procs`, the processes seen in the job's
+process group, including any started in a `--run-timeout` grace. muzzle
+lists the group every 20 ms on macOS and every 250 ms on Linux (a
+keeper: every 250 ms on both), so it is a lower bound: a process that
+starts and exits between two listings isn't counted, nor one that leaves
+the group. A container run has no `procs` key, as its processes aren't
+in the group. `report` shows `procs/s p50/p90` next to cores, over clean
+runs that have a count.
+
+Read it where a launch is expensive. On some hosts a launch takes
+~100 ms, and much of that cost lands on other processes, not on the
+job. A job that starts hundreds of
+processes a second can then read as 2 cores while the machine is
+saturated. A high `procs/s` is a hint, not proof that launches hold the
+job up. `report`'s suggestions ignore it; the tune recipe says how to
+weigh it.
 
 ### Unclaimed load
 
@@ -382,6 +403,45 @@ such jobs.
 - **Advisory** is macOS, a container, or Linux without a user manager.
   Admission, classes and the queue work the same. Nothing caps memory or
   CPU, and the figures come from rusage.
+
+### Size workers from `MUZZLE_SLOTS`
+
+A claim decides how many slots a job holds in the queue, not how many
+workers it starts. muzzle sets `MUZZLE_SLOTS`, `CARGO_BUILD_JOBS`,
+`RUST_TEST_THREADS` and `MAKEFLAGS=-jN`, which cargo and make read. Tools
+that size their own pools from the core count ignore them: `vitest run`
+allows up to one worker per core but one, and pytest-xdist's `-n auto`
+one per physical core (logical, without psutil). In advisory mode
+nothing caps CPU, so a 2-slot vitest run on 16 cores may still run 15
+workers. Even enforced, `CPUWeight` only shares CPU under contention, and
+the extra workers' memory still counts against `MemoryMax`.
+
+So make the tool read `MUZZLE_SLOTS`, with a fallback for runs outside
+muzzle:
+
+```ts
+// vitest.config.ts
+import { availableParallelism } from "node:os";
+import { defineConfig } from "vitest/config";
+const slots = Number(process.env.MUZZLE_SLOTS) || availableParallelism() - 1; // vitest run's default
+export default defineConfig({ test: { maxWorkers: Math.max(1, Math.floor(slots)) } });
+```
+
+```sh
+pytest -n "${MUZZLE_SLOTS:-auto}"             # pytest-xdist
+ninja ${MUZZLE_SLOTS:+-j "$MUZZLE_SLOTS"}     # no -j outside muzzle: ninja's default
+```
+
+make and cargo need nothing: they read `MAKEFLAGS` and
+`CARGO_BUILD_JOBS`, which muzzle sets. Don't add a `-j` fallback for make:
+a bare `-j`, which `-j"$(nproc)"` becomes on a Mac without `nproc`, means
+no limit at all, as does ninja's `-j0`. Jest takes
+`--maxWorkers=$MUZZLE_SLOTS`, xargs and GNU parallel `-P $MUZZLE_SLOTS`.
+go test needs both `-p $MUZZLE_SLOTS` (packages built and tested at once)
+and `-parallel $MUZZLE_SLOTS` (parallel tests inside one package). With the tool following the
+claim, `report`'s cores figure measures what the weight allowed, and
+changing a weight changes what the job does. muzzle never edits repos
+(D20), so this is a change the repo's owner makes.
 
 ### Containers
 
