@@ -52,10 +52,10 @@ has the details.
 
 ## Does it help?
 
-**In short:** when the machine has room, muzzle costs nothing. On an
-overloaded machine it keeps things usable and each job's run time steady.
-With one slot per core it also finished far fewer jobs per hour, so since
-0.2.5 the budget is 1.5 slots per core, which wins most of that back.
+**In short:** yes, where it counts. On a normal busy day muzzle costs
+nothing. On an overloaded machine it keeps the machine responsive and each
+job's run time short and steady, for about 13% fewer jobs per hour at the
+default budget of 1.5 slots per core.
 
 We replayed real days of agent work on a 16-core Linux box (linuxpc). The
 replay starts each gate, build and test run at the time it really happened,
@@ -68,32 +68,35 @@ speed finished at the same time, with run times within about a second of
 each other. The machine never ran short of slots, so muzzle hardly ever made
 anything wait.
 
-**Overload:** the busiest window again, with arrivals packed 12 and 24 times
-as densely:
+**Overload:** the busiest window again, with arrivals packed 12 times as
+densely, without muzzle and with it at 1.5 slots per core:
 
-| at 24× | without muzzle | muzzle, 14 slots (0.2.4) |
+| at 12× | without muzzle | muzzle, 24 slots |
 | --- | --- | --- |
-| load average, peak (16 cores) | 157 | 19 |
-| `git status` in a scratch repo, p95 | 103 ms | 7 ms |
-| a job's run time, p90 | 561 s | 96 s |
-| jobs finished per hour | 486 | 248 |
+| load average, peak (16 cores) | 90 | 25 |
+| `git status` in a scratch repo, p95 | 31 ms | 9.7 ms |
+| a job's run time, p90 | 329 s | 132 s |
+| jobs finished per hour | 408 | 353 |
 
-muzzle kept the machine usable for whoever was working in it, but with
-one slot per core (the 0.2.4 default, 14 slots here) it finished 40–49% fewer
-jobs per hour. Gates claim more cores than they keep busy, so the budget
-filled while cores sat idle. In a 12× run with 24 slots (1.5× cores), the
-loss fell from 40% to 13% and `git status` stayed under 10 ms; 20 slots
-gave 23%. So 0.2.5 made 1.5 slots per core the default (`overcommit =
-1.5`, 22 slots on this machine after the reserve of 2). If muzzle queues
-while your CPU sits idle, raise `overcommit`; if the machine gets sluggish
-under a full queue, lower it (see
-[tune](npm/muzzle/skills/muzzle/recipes/tune.md)).
+Load peaks at under a third, `git status` stays under 10 ms, and a job runs
+in 40% of the time. Jobs wait in the queue instead, and wait plus run comes
+to about 327 s at p90: the same as the run time alone without muzzle, with
+the machine responsive throughout. Packed 24 times as densely, the machine
+without muzzle peaked at a load of 157 and 103 ms for `git status`; muzzle
+held it at 19 and 7 ms.
+
+The default is 1.5 slots per core (`overcommit = 1.5`, 22 slots on this
+machine after the reserve of 2). One slot per core, the 0.2.4 default, kept
+the machine even quieter but finished 40–49% fewer jobs per hour, because
+gates claim more cores than they keep busy. If muzzle queues while your CPU
+sits idle, raise `overcommit`; if the machine gets sluggish under a full
+queue, lower it (see [tune](npm/muzzle/skills/muzzle/recipes/tune.md)).
 
 **Limits:** one workload, the swayward gates, on one machine. The overload
-is simulated by packing a real day's arrivals closer together. The new
-default (22 slots here) lies between the two budgets measured, not on
-either. We haven't yet measured a week of real use with muzzle against the
-weeks before it.
+is simulated by packing a real day's arrivals closer together, and the
+default (22 slots here) lies between the two budgets measured, 20 and 24. A
+week of real use with muzzle against the weeks before it hasn't been
+measured yet.
 
 ## More
 
