@@ -139,7 +139,7 @@ Added:
 
 ## 0.2.3
 
-Spec: `docs/specs/2026-10-31-muzzle-0.2.3-slow-status.md`.
+Spec: `docs/specs/2026-10-31-slow-status.md`.
 
 Added:
 
@@ -154,7 +154,7 @@ Added:
 
 Fixes from a review panel (2026-10-30). Spec notes dated 2026-10-30 in
 `docs/specs/2026-10-29-muzzle.md` and R5 amendments in
-`docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`.
+`docs/specs/2026-10-30-command-rules.md`.
 
 Changed:
 
@@ -224,7 +224,7 @@ Fixed:
 ## 0.2.1
 
 Rules that match command words (spec
-`docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`). Additive: every
+`docs/specs/2026-10-30-command-rules.md`). Additive: every
 0.2.0 config still loads.
 
 - **`command` rules.** `command = "cargo test"` or a list of them names a
@@ -266,7 +266,7 @@ Changed:
 ## 0.2.0
 
 Per-repo weights, a shared config with a machine file, and a run log that
-keeps its history (spec `docs/specs/2026-10-30-muzzle-0.2-paths.md`).
+keeps its history (spec `docs/specs/2026-10-30-paths.md`).
 
 **BREAKING.** There is no migration and no compatibility shim:
 

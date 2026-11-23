@@ -18,7 +18,7 @@ const FILES: &[&str] = &[
     "npm/muzzle/skills/muzzle/SKILL.md",
     "npm/muzzle/skills/muzzle/recipes/tune.md",
     "docs/specs/2026-10-29-muzzle.md",
-    "docs/specs/2026-10-30-muzzle-0.2-paths.md",
+    "docs/specs/2026-10-30-paths.md",
 ];
 
 /// Each ```toml block with the line it starts on.

@@ -1,6 +1,6 @@
 # 0.2.1 command rules: the museum check
 
-Spec: `docs/specs/2026-10-30-muzzle-0.2.1-command-rules.md`, C6 and R6.
+Spec: `docs/specs/2026-10-30-command-rules.md`, C6 and R6.
 Result: **zero regressions** on complete rows after one matcher change
 (`bash -n`, below).
 

@@ -1,7 +1,7 @@
-# muzzle 0.2.1: rules that match command words
+# muzzle: rules that match command words
 
 Status: approved by the human (2026-10-30, Q1–Q3 "agreed, let's fix all
-this"). Revised after a REFUTED refuter pass (R1–R7, orchestrator's calls). It amends the 0.2 spec (`2026-10-30-muzzle-0.2-paths.md`) and the
+this"). Revised after a REFUTED refuter pass (R1–R7, orchestrator's calls). It amends the 0.2 spec (`2026-10-30-paths.md`) and the
 v1 spec's §Config and D22. This spec wins where they disagree.
 
 ## Problem

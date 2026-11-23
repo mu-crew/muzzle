@@ -1,4 +1,4 @@
-# muzzle 0.3.3: different-PID deadlock & orphan-hold guards
+# muzzle: different-PID deadlock & orphan-hold guards
 
 Status: revised draft (2026-11-23, post-refutation wave `spec-refute`).
 Amends D16, D17, D19 and adds `muzzle drop` plus additive fields to

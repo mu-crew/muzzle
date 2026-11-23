@@ -2,7 +2,7 @@
 //! validation, template and hash. What applies at a cwd is
 //! [`super::resolve`].
 //!
-//! Spec 0.2 (`docs/specs/2026-10-30-muzzle-0.2-paths.md`): P1 path tables,
+//! Spec 0.2 (`docs/specs/2026-10-30-paths.md`): P1 path tables,
 //! P5 includes, P6 budget keys, P7 hash, B1 key identity, B2 validation,
 //! B5 read errors. v1: D8 (slots default 1, capping is admit's job).
 

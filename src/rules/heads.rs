@@ -1,4 +1,4 @@
-//! 0.2.1 command rules (spec `2026-10-30-muzzle-0.2.1-command-rules.md`):
+//! 0.2.1 command rules (spec `2026-10-30-command-rules.md`):
 //! the heads of a shell text, and matching a `command` pattern against one.
 //!
 //! A head is a simple command from [`shell::commands`] past assignments,
