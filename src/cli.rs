@@ -65,6 +65,13 @@ pub struct RunArgs {
     /// Give up after S seconds queued (exit 75).
     #[arg(long, value_name = "S")]
     pub timeout: Option<f64>,
+    /// Run at once and claim slots retroactively once the job has run S
+    /// seconds and used `--grace-cpu` CPU-seconds (H4).
+    #[arg(long, value_name = "S", conflicts_with_all = ["timeout", "no_timeout"], value_parser = positive_secs)]
+    pub grace: Option<f64>,
+    /// CPU-seconds that promote a `--grace` run (default 1.0).
+    #[arg(long, value_name = "S", value_parser = non_negative_secs)]
+    pub grace_cpu: Option<f64>,
     /// Write the run's figures as JSON to FILE on exit.
     #[arg(long, value_name = "FILE")]
     pub report: Option<PathBuf>,
@@ -125,8 +132,26 @@ pub struct WrapArgs {
     /// The harness's timeout; becomes `--run-timeout S`.
     #[arg(long, value_name = "S")]
     pub timeout: Option<f64>,
+    /// Wrap a command no rule matched in `run --grace` unless it is purely
+    /// light (H4).
+    #[arg(long)]
+    pub with_grace: bool,
     #[arg(last = true, required = true, value_name = "SHELL STRING")]
     pub command: String,
+}
+
+fn positive_secs(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
+        _ => Err(format!("{s:?}: must be a finite number of seconds above 0")),
+    }
+}
+
+fn non_negative_secs(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        _ => Err(format!("{s:?}: must be a finite number, 0 or more")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -307,6 +332,40 @@ mod tests {
         };
         assert!(!a.allow_concurrent && !a.no_timeout);
         assert!(parse(&["run", "--no-timeout", "--timeout", "0", "--", "x"]).is_err());
+    }
+
+    #[test]
+    fn run_takes_grace_flags() {
+        let Command::Run(a) = parse(&["run", "--grace", "2.5", "--grace-cpu", "0", "--", "x"])
+            .unwrap()
+            .command
+        else {
+            panic!("not run");
+        };
+        assert_eq!((a.grace, a.grace_cpu), (Some(2.5), Some(0.0)));
+        let Command::Run(a) = parse(&["run", "--", "x"]).unwrap().command else {
+            panic!("not run");
+        };
+        assert_eq!((a.grace, a.grace_cpu), (None, None));
+        assert!(parse(&["run", "--grace", "1", "--timeout", "1", "--", "x"]).is_err());
+        assert!(parse(&["run", "--grace", "1", "--no-timeout", "--", "x"]).is_err());
+        assert!(parse(&["run", "--grace", "0", "--", "x"]).is_err());
+        assert!(parse(&["run", "--grace-cpu", "-1", "--", "x"]).is_err());
+    }
+
+    #[test]
+    fn wrap_takes_with_grace() {
+        let Command::Wrap(a) = parse(&["wrap", "--json", "--with-grace", "--", "x"])
+            .unwrap()
+            .command
+        else {
+            panic!("not wrap");
+        };
+        assert!(a.with_grace);
+        let Command::Wrap(a) = parse(&["wrap", "--json", "--", "x"]).unwrap().command else {
+            panic!("not wrap");
+        };
+        assert!(!a.with_grace);
     }
 
     #[test]

@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use super::config::{Config, Entry, Table};
-use super::heads::{Heads, Matcher};
+pub use super::heads::MatchProvenance;
+use super::heads::{Heads, Matcher, SCRIPT_HEAVY_HEAD, UNMATCHED_HEAVY_HEAD};
 use crate::cli::Class;
 
 /// A rule with every field filled in.
@@ -49,16 +50,47 @@ pub struct Match<'a> {
     pub rule: &'a Rule,
     pub source: &'a Source,
     pub slots_from: &'a Origin,
+    /// R5: found in the command's own words, or only in a body (H1-H3).
+    pub provenance: MatchProvenance,
 }
 
-impl<'a> From<&'a Resolved> for Match<'a> {
-    fn from(r: &'a Resolved) -> Self {
+impl<'a> Match<'a> {
+    fn new(r: &'a Resolved, provenance: MatchProvenance) -> Self {
         Match {
             rule: &r.rule,
             source: &r.source,
             slots_from: &r.slots_from,
+            provenance,
         }
     }
+}
+
+/// H3.3, H4.1: rules every config has unless it defines one of that name.
+pub const SCRIPT_HEAVY: &str = "script-heavy";
+pub const UNMATCHED_HEAVY: &str = "unmatched-heavy";
+
+/// The built-in `name` rule for `config`, or `None` when it is off
+/// (`script_slots = 0`). `script-heavy` matches the head H3 emits for a
+/// heavy python/node body; `unmatched-heavy` matches nothing, it is
+/// only named (`run --grace`, `wrap --with-grace`).
+fn builtin(config: &Config, name: &str) -> Option<Rule> {
+    let (head, slots) = match name {
+        SCRIPT_HEAVY if config.script_slots > 0 => (SCRIPT_HEAVY_HEAD, config.script_slots),
+        UNMATCHED_HEAVY => (UNMATCHED_HEAVY_HEAD, 1),
+        _ => return None,
+    };
+    Some(Rule {
+        name: name.to_string(),
+        matcher: Matcher::Command(vec![vec![head.to_string()]]),
+        slots,
+        class: None,
+    })
+}
+
+/// Whether `name` is a built-in rule, which an entry may tune without a
+/// matcher of its own (H3.3).
+pub fn is_builtin(name: &str) -> bool {
+    name == SCRIPT_HEAVY || name == UNMATCHED_HEAVY
 }
 
 /// The rules in effect for one target, in match order (P4).
@@ -72,11 +104,17 @@ pub struct Effective {
 impl Effective {
     /// The first enabled rule matching `command` (P3, P4).
     pub fn matches(&self, command: &str) -> Option<Match<'_>> {
-        let heads = Heads::new(command);
-        self.rules
-            .iter()
-            .find(|r| r.enabled && r.rule.matcher.matches(&heads))
-            .map(Match::from)
+        self.matches_in(command, None)
+    }
+
+    /// [`Self::matches`] with the directory the command runs in, so local
+    /// script files it runs can be read (H2).
+    pub fn matches_in(&self, command: &str, cwd: Option<&Path>) -> Option<Match<'_>> {
+        let heads = Heads::new_in(command, cwd);
+        self.rules.iter().filter(|r| r.enabled).find_map(|r| {
+            let p = r.rule.matcher.provenance(&heads)?;
+            Some(Match::new(r, p))
+        })
     }
 
     /// An enabled rule by name: `run --rule` (B3) and `report --by repo`.
@@ -84,7 +122,7 @@ impl Effective {
         self.rules
             .iter()
             .find(|r| r.enabled && r.rule.name == name)
-            .map(Match::from)
+            .map(|r| Match::new(r, MatchProvenance::Direct))
     }
 }
 
@@ -129,6 +167,30 @@ fn create(e: &Entry, table: Option<&Table>) -> Option<Resolved> {
     })
 }
 
+/// H3.3: a built-in rule with the fields a matcherless entry of its name
+/// sets (`slots`, `class`, `enabled`), or `None` when `e` names no
+/// built-in or the built-in is off.
+fn tune_builtin(config: &Config, e: &Entry) -> Option<Resolved> {
+    let rule = builtin(config, &e.name)?;
+    let from = origin(&e.file, None);
+    let mut r = Resolved {
+        rule,
+        enabled: true,
+        source: Source::Global,
+        match_from: origin(&config.path, None),
+        slots_from: origin(&config.path, None),
+    };
+    if let Some(s) = e.slots {
+        r.rule.slots = s;
+        r.slots_from = from;
+    }
+    if e.class.is_some() {
+        r.rule.class = e.class;
+    }
+    r.enabled = e.enabled.unwrap_or(true);
+    Some(r)
+}
+
 /// P3: merge a table entry into an inherited rule, field by field.
 fn merge(r: &mut Resolved, e: &Entry, t: &Table) {
     // C1: `command` and `match` replace each other.
@@ -158,7 +220,31 @@ impl Config {
     /// The rules in effect at `target`, already a P2 target (a repo path
     /// from runs.jsonl); `None` applies the global list alone (B6).
     pub fn resolve_target(&self, target: Option<&Path>) -> Effective {
-        let mut rules: Vec<Resolved> = self.global.iter().filter_map(|e| create(e, None)).collect();
+        let mut rules: Vec<Resolved> = self
+            .global
+            .iter()
+            .filter_map(|e| create(e, None).or_else(|| tune_builtin(self, e)))
+            .collect();
+        // H3.3, H4.1: built-ins go last, so every configured rule wins, and
+        // before the tables, so a table can reweight them like any rule.
+        for name in [SCRIPT_HEAVY, UNMATCHED_HEAVY] {
+            if rules.iter().any(|r| r.rule.name == name) {
+                continue;
+            }
+            if let Some(rule) = builtin(self, name) {
+                let from = Origin {
+                    file: self.path.clone(),
+                    path: None,
+                };
+                rules.push(Resolved {
+                    rule,
+                    enabled: true,
+                    source: Source::Global,
+                    match_from: from.clone(),
+                    slots_from: from,
+                });
+            }
+        }
         // `tables` is sorted by canonical key, so the ones that apply come
         // outermost first. `starts_with` compares whole components (P2:
         // `crew` is not an ancestor of `crewmate`).
@@ -197,8 +283,9 @@ impl Config {
                     .flat_map(|t| t.entries.iter().map(move |e| (e, Some(t)))),
             )
             .filter(|(e, _)| e.name == name)
-            .find_map(|(e, t)| create(e, t))
+            .find_map(|(e, t)| create(e, t).or_else(|| tune_builtin(self, e)))
             .map(|r| r.rule)
+            .or_else(|| builtin(self, name))
     }
 }
 
@@ -211,7 +298,40 @@ mod tests {
     }
 
     fn names(e: &Effective) -> Vec<&str> {
-        e.rules.iter().map(|r| r.rule.name.as_str()).collect()
+        e.rules
+            .iter()
+            .map(|r| r.rule.name.as_str())
+            .filter(|n| ![SCRIPT_HEAVY, UNMATCHED_HEAVY].contains(n))
+            .collect()
+    }
+
+    #[test]
+    fn builtin_rules_go_last_and_can_be_replaced_or_off() {
+        let c = parse("[[rule]]\nname='a'\nmatch='x'");
+        let e = c.resolve_target(None);
+        let all: Vec<_> = e.rules.iter().map(|r| r.rule.name.as_str()).collect();
+        assert_eq!(all, ["a", SCRIPT_HEAVY, UNMATCHED_HEAVY]);
+        assert_eq!(e.rule(SCRIPT_HEAVY).unwrap().rule.slots, 2);
+        assert_eq!(c.rule_anywhere(SCRIPT_HEAVY).unwrap().slots, 2);
+        assert!(c.rule_anywhere(UNMATCHED_HEAVY).is_some());
+        // script_slots sets them; 0 turns script-heavy off.
+        let c = parse("script_slots = 5");
+        assert_eq!(c.rule_anywhere(SCRIPT_HEAVY).unwrap().slots, 5);
+        let c = parse("script_slots = 0");
+        assert!(c.rule_anywhere(SCRIPT_HEAVY).is_none());
+        assert!(c.resolve_target(None).rule(SCRIPT_HEAVY).is_none());
+        // A user rule of that name replaces it, and can be disabled.
+        let c = parse("[[rule]]\nname='script-heavy'\nmatch='x'\nslots=7\nenabled=false");
+        let e = c.resolve_target(None);
+        assert!(e.rule(SCRIPT_HEAVY).is_none());
+        assert_eq!(c.rule_anywhere(SCRIPT_HEAVY).unwrap().slots, 7);
+        assert_eq!(
+            e.rules
+                .iter()
+                .filter(|r| r.rule.name == SCRIPT_HEAVY)
+                .count(),
+            1
+        );
     }
 
     /// global → /c → /c/m, as in the spec's call sites, with plain paths

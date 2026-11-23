@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::config::Config;
-use super::heads::Matcher;
+use super::heads::{MatchProvenance, Matcher};
 use crate::cli::Harness;
 
 /// The shell tool a `PreToolUse` payload names, by harness. Its input
@@ -68,7 +68,8 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
         Shell::Claude | Shell::Codex => None,
     }
     .unwrap_or(session);
-    let Some(wrapped) = super::wrap(config, command, &cwd, timeout_s(shell, input)) else {
+    let eff = config.resolve(&cwd);
+    let Some((wrapped, m)) = super::wrap_in(&eff, command, &cwd, timeout_s(shell, input)) else {
         return skip;
     };
     // Claude replaces the whole input with `updatedInput`, so every other
@@ -90,7 +91,7 @@ pub fn reply(harness: Harness, payload: &Value, config: &Config) -> Value {
     // (spec §Integrations "Claude Code and Codex", decided 2026-10-29).
     // Muse takes Claude's rule. It rejects an `allow` without
     // `updatedInput`, which this reply always carries.
-    if shell == Shell::Codex || claude_may_allow(config, command, &cwd) {
+    if shell == Shell::Codex || claude_may_allow(&m, command) {
         out["permissionDecision"] = json!("allow");
     }
     json!({ "hookSpecificOutput": out })
@@ -185,17 +186,19 @@ fn current_dir() -> PathBuf {
 /// plus it, with the subcommand words after it: a match through a wrapper
 /// (`npx`, `mise exec`, `distrobox`), a script (R1) or a variable (R3) is
 /// wrapped but left to Claude's prompt, and so is `/tmp/evil/cargo`.
-fn claude_may_allow(config: &Config, command: &str, cwd: &std::path::Path) -> bool {
+fn claude_may_allow(m: &super::resolve::Match<'_>, command: &str) -> bool {
     if !plain_words(command) || !is_simple_command(command) || expands(command) {
         return false;
     }
     let Some(at) = super::shell::command_word(command) else {
         return false;
     };
-    let eff = config.resolve(cwd);
-    let Some(m) = eff.matches(command) else {
+    // R5: `m` is the match the rewrite came from, not a second one.
+    // R5: a match found in a heredoc, a script file or a script body is
+    // wrapped, never approved: the hook didn't see those words run.
+    if m.provenance == MatchProvenance::Inspected {
         return false;
-    };
+    }
     // One simple command (checked above), from its command word.
     let own = super::shell::commands(&command[at..]);
     let [own] = own.as_slice() else {
@@ -1239,5 +1242,25 @@ mod tests {
                 .unwrap()
                 .contains("--rule=p --slots 3")
         );
+    }
+
+    /// R5: the allow comes from the match the rewrite was made from. A
+    /// second match could differ if a file it read changed between.
+    #[test]
+    fn allow_is_decided_from_the_given_match() {
+        let c = Config::parse(
+            "[[rule]]\nname = 'a'\ncommand = 'cargo test'\n[[rule]]\nname = 'b'\ncommand = 'tool'\n",
+            Path::new("t.toml"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let eff = c.resolve(dir.path());
+        let inspected = super::super::resolve::Match {
+            provenance: MatchProvenance::Inspected,
+            ..eff.rule("a").unwrap()
+        };
+        // `./tool` alone matches `b` directly, and would be allowed.
+        assert!(claude_may_allow(&eff.rule("b").unwrap(), "./tool"));
+        assert!(!claude_may_allow(&inspected, "./tool"));
     }
 }

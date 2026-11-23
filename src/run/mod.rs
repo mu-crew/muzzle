@@ -3,6 +3,7 @@
 //! handoff, release, `runs.jsonl` (through [`crate::runlog`]), `--report`,
 //! exit codes and stderr lines.
 
+mod grace;
 mod job;
 mod keeper;
 mod osc;
@@ -97,6 +98,9 @@ struct Heartbeat<'a> {
     store: &'a Store,
     ticket: u64,
     next: Instant,
+    /// H4: a `--grace` run has no ticket until it is promoted; the watch
+    /// samples its CPU on every beat and sets `ticket` when it promotes.
+    watch: Option<grace::Watch>,
 }
 
 impl<'a> Heartbeat<'a> {
@@ -106,10 +110,32 @@ impl<'a> Heartbeat<'a> {
             store,
             ticket,
             next: Instant::now() + HEARTBEAT,
+            watch: None,
+        }
+    }
+
+    /// H4: no claim yet; `watch` makes one when the run has earned it.
+    fn watching(store: &'a Store, watch: grace::Watch) -> Self {
+        Heartbeat {
+            store,
+            ticket: 0,
+            next: Instant::now() + HEARTBEAT,
+            watch: Some(watch),
         }
     }
 
     fn beat(&mut self) {
+        if let Some(w) = self.watch.as_mut() {
+            w.tick(self.store);
+            match &w.promoted {
+                Some(p) if self.ticket == 0 => {
+                    self.ticket = p.holder.ticket;
+                    self.next = Instant::now() + HEARTBEAT;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
         if Instant::now() < self.next {
             return;
         }
@@ -323,8 +349,24 @@ fn is_nested(
             || ancestors.iter().any(|a| {
                 (a.pid as u32 == h.pid && a.start == h.start) || h.pgid == Some(a.pgid as u32)
             });
-        named && admit::holds(h, live)
+        // H4: a promoted grace claim never swallows an inner `muzzle run`.
+        named && !h.grace && admit::holds(h, live)
     })
+}
+
+/// A lock-free, non-mutating read of `state.json`. `save` replaces the file
+/// by rename, so a read sees a whole file; one that is missing or unreadable
+/// counts as empty here, and the first locked update deals with it.
+fn peek_state(store: &Store) -> State {
+    std::fs::read(store.state_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// H4: a promoted claim of `wanted` slots, capped by `max` and the budget.
+fn reading_budget_cap(wanted: u32, max: u32, budget: u32) -> u32 {
+    wanted.min(max).min(budget).max(1)
 }
 
 /// D7, D7a, D9: this process's own reading of the budget; D17a decides
@@ -412,8 +454,16 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
     let my_start = proc::start_time(me as Pid).context("reading muzzle's own start time")?;
 
     let hold = std::env::var("MUZZLE_HOLD").ok();
+    // H4.3: a grace run takes no lock and writes nothing before it earns a
+    // claim, so it peeks at the file instead of `read` (which locks, and
+    // moves a corrupt file aside).
+    let seen = if args.grace.is_some() {
+        peek_state(&store)
+    } else {
+        store.read()?
+    };
     if is_nested(
-        &store.read()?,
+        &seen,
         &proc::ancestors(me as Pid),
         hold.as_deref(),
         &ProcLive,
@@ -442,6 +492,20 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         cfg: Some(config.hash()),
         pane: std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()),
     };
+    if let Some(grace_s) = args.grace {
+        return grace::run(&grace::Ctx {
+            args,
+            config: &config,
+            store: &store,
+            claim,
+            reading,
+            leader,
+            me,
+            my_start,
+            grace_s,
+            run_timeout,
+        });
+    }
     let report_claim = claim.clone();
     let enqueued = Instant::now();
     let ticket = store.update(now_ms(), |s| {
@@ -575,6 +639,7 @@ mod tests {
             orphan_active_ms: None,
             orphan_sample_ms: None,
             orphan_procs: None,
+            grace: false,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,
@@ -691,6 +756,15 @@ mod tests {
         assert!(is_nested(&s, &[ancestor(100, 1, 55)], None, &live));
         // Same pid, different start: a recycled pid is not the holder.
         assert!(!is_nested(&s, &[ancestor(100, 1, 56)], None, &live));
+    }
+
+    #[test]
+    fn a_grace_holder_never_nests() {
+        let (mut s, live) = one_holder();
+        s.holders[0].grace = true;
+        assert!(!is_nested(&s, &[ancestor(100, 1, 55)], None, &live));
+        assert!(!is_nested(&s, &[ancestor(301, 200, 1)], None, &live));
+        assert!(!is_nested(&s, &[], Some("7:100:55"), &live));
     }
 
     #[test]

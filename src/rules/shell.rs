@@ -16,6 +16,42 @@ pub fn commands(text: &str) -> Vec<Vec<String>> {
     lex(text).out
 }
 
+/// H1: cap on the body kept for one heredoc or here-string. Longer ones
+/// are still skipped cleanly to their delimiter; only the stored text stops.
+pub const BODY_CAP: usize = 16 * 1024;
+
+/// One simple command with what its redirections say (H1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cmd {
+    pub words: Vec<String>,
+    /// The effective fd-0 input of a heredoc or here-string: when several
+    /// target stdin the last one wins, as in bash; a later `< file` takes
+    /// stdin away from them. `None` for a file or no redirect at all.
+    pub stdin: Option<String>,
+    /// Targets of `>`, `>>`, `>|` and `1>` (fd 1 only), as written with
+    /// quotes removed.
+    pub writes: Vec<String>,
+    /// Indexes into `words` of the words that had a command substitution
+    /// lifted out of them: what is left is only part of the value.
+    pub dynamic: Vec<usize>,
+}
+
+/// [`commands`] with each command's stdin heredoc or here-string and
+/// output redirect targets (H1). Same order and length as [`commands`].
+pub fn commands_full(text: &str) -> Vec<Cmd> {
+    let lx = lex(text);
+    lx.out
+        .into_iter()
+        .zip(lx.meta)
+        .map(|(words, m)| Cmd {
+            words,
+            stdin: m.stdin,
+            writes: m.writes,
+            dynamic: m.dynamic,
+        })
+        .collect()
+}
+
 /// [`commands`] with the byte offset in `text` where each word starts
 /// (its first character, which may be a quote).
 pub fn command_spans(text: &str) -> Vec<Vec<(String, usize)>> {
@@ -44,7 +80,10 @@ fn lex(text: &str) -> Lexer {
         starts: Vec::new(),
         words: Vec::new(),
         word_starts: Vec::new(),
-        heredocs: Vec::new(),
+        meta: Vec::new(),
+        cur: Pending::default(),
+        queue: Vec::new(),
+        lifted: false,
     };
     lx.run();
     lx
@@ -58,8 +97,49 @@ struct Lexer {
     starts: Vec<Vec<usize>>,
     words: Vec<String>,
     word_starts: Vec<usize>,
-    /// Heredoc delimiters waiting for the next newline, with `<<-`.
+    /// Redirect facts of each command of `out`, in step with it.
+    meta: Vec<Meta>,
+    /// Redirects of the command being read.
+    cur: Pending,
+    /// Heredocs of finished commands waiting for the next newline.
+    queue: Vec<Queued>,
+    /// Set when a substitution was lifted out of the word being read.
+    lifted: bool,
+}
+
+#[derive(Default)]
+struct Meta {
+    stdin: Option<String>,
+    writes: Vec<String>,
+    dynamic: Vec<usize>,
+}
+
+/// Which redirect currently feeds fd 0 of the command being read.
+#[derive(Default)]
+enum Stdin {
+    #[default]
+    Unset,
+    /// `< file` or similar: no text.
+    Other,
+    Here(String),
+    /// Index into [`Pending::heredocs`].
+    Heredoc(usize),
+}
+
+#[derive(Default)]
+struct Pending {
+    writes: Vec<String>,
+    dynamic: Vec<usize>,
+    stdin: Stdin,
+    /// `(delimiter, <<-)` of every heredoc, stdin or not: all have a body.
     heredocs: Vec<(String, bool)>,
+}
+
+struct Queued {
+    delim: String,
+    strip: bool,
+    /// The command in `out` whose stdin this body is, if it is the one.
+    owner: Option<usize>,
 }
 
 impl Lexer {
@@ -68,9 +148,33 @@ impl Lexer {
     }
 
     fn end_command(&mut self) {
-        if !self.words.is_empty() {
+        let cur = std::mem::take(&mut self.cur);
+        let chosen = match cur.stdin {
+            Stdin::Heredoc(i) => Some(i),
+            _ => None,
+        };
+        let mut meta = Meta {
+            stdin: None,
+            writes: cur.writes,
+            dynamic: cur.dynamic,
+        };
+        let has_words = !self.words.is_empty();
+        if let Stdin::Here(t) = cur.stdin {
+            meta.stdin = Some(t);
+        }
+        if has_words {
             self.out.push(std::mem::take(&mut self.words));
             self.starts.push(std::mem::take(&mut self.word_starts));
+            self.meta.push(meta);
+        }
+        // A heredoc with no command (`<<EOF` alone, `> f <<EOF`) still
+        // has a body to skip, but feeds nothing.
+        for (i, (delim, strip)) in cur.heredocs.into_iter().enumerate() {
+            self.queue.push(Queued {
+                delim,
+                strip,
+                owner: (has_words && chosen == Some(i)).then(|| self.out.len() - 1),
+            });
         }
     }
 
@@ -81,7 +185,7 @@ impl Lexer {
                 '\n' => {
                     self.at += 1;
                     self.end_command();
-                    self.skip_heredocs();
+                    self.read_heredocs();
                 }
                 ';' | '&' | '|' | '(' | ')' => {
                     self.at += 1;
@@ -92,18 +196,33 @@ impl Lexer {
                         self.at += 1;
                     }
                 }
-                '<' | '>' => self.redirect(),
+                '<' | '>' => self.redirect(None),
                 _ => {
                     let start = self.at;
+                    self.lifted = false;
                     let w = self.word();
-                    // `2>file`: a word of digits glued to a redirect is its fd.
+                    let raw = &self.chars[start..self.at];
+                    // `2>file`: digits as written, glued to a redirect, are
+                    // its fd; `'0'<f` is an argument.
                     if matches!(self.peek(0), Some('<' | '>'))
-                        && w.bytes().all(|b| b.is_ascii_digit())
+                        && !raw.is_empty()
+                        && raw.iter().all(char::is_ascii_digit)
                     {
-                        self.redirect();
+                        self.redirect(w.parse().ok().or(Some(u32::MAX)));
                     } else if !w.is_empty() {
-                        // Empty after a substitution was lifted out; an
-                        // empty `''` word never names a command either.
+                        self.words.push(w);
+                        self.word_starts.push(start);
+                        if self.lifted {
+                            self.cur.dynamic.push(self.words.len() - 1);
+                        }
+                    } else if !self.words.is_empty()
+                        && !raw.is_empty()
+                        && raw.iter().all(|c| matches!(c, '\'' | '"'))
+                    {
+                        // An empty `''` operand is still an argument
+                        // (`python3 -c '' x`), though it never names a
+                        // command; empty after a substitution was lifted
+                        // out stays dropped.
                         self.words.push(w);
                         self.word_starts.push(start);
                     }
@@ -113,9 +232,11 @@ impl Lexer {
         self.end_command();
     }
 
-    /// `<`, `>`, `>>`, `>&2`, `&>`-style redirects drop their target;
-    /// `<<WORD` queues a heredoc; `<<<` takes a word, also dropped.
-    fn redirect(&mut self) {
+    /// `<`, `>`, `>>`, `>&2`, `&>`-style redirects leave the words alone
+    /// and note what they feed (H1); `<<WORD` queues a heredoc; `<<<`
+    /// takes a word, the here-string. `fd` is an explicit `N` before it.
+    fn redirect(&mut self, fd: Option<u32>) {
+        let stdin = fd.is_none_or(|n| n == 0);
         if self.peek(0) == Some('<') && self.peek(1) == Some('<') && self.peek(2) != Some('<') {
             self.at += 2;
             let strip = self.peek(0) == Some('-');
@@ -123,12 +244,35 @@ impl Lexer {
                 self.at += 1;
             }
             self.blanks();
+            let before = self.at;
             let delim = self.word();
-            if !delim.is_empty() {
-                self.heredocs.push((delim, strip));
+            // `<<''` has an empty delimiter that ends at an empty line:
+            // consumed as a word, it still counts.
+            if self.at > before {
+                self.cur.heredocs.push((delim, strip));
+                if stdin {
+                    self.cur.stdin = Stdin::Heredoc(self.cur.heredocs.len() - 1);
+                }
             }
             return;
         }
+        if self.peek(0) == Some('<') && self.peek(1) == Some('<') && self.peek(2) == Some('<') {
+            self.at += 3;
+            self.blanks();
+            let mut w = self.word();
+            if w.len() > BODY_CAP {
+                let mut end = BODY_CAP;
+                while !w.is_char_boundary(end) {
+                    end -= 1;
+                }
+                w.truncate(end);
+            }
+            if stdin {
+                self.cur.stdin = Stdin::Here(w);
+            }
+            return;
+        }
+        let output = self.peek(0) == Some('>');
         while matches!(self.peek(0), Some('<' | '>' | '|')) {
             self.at += 1;
         }
@@ -138,10 +282,21 @@ impl Lexer {
             while self.peek(0).is_some_and(|c| c.is_ascii_digit() || c == '-') {
                 self.at += 1;
             }
+            // `0<&3` makes another descriptor stdin: no heredoc feeds it.
+            if !output && stdin {
+                self.cur.stdin = Stdin::Other;
+            }
             return;
         }
         self.blanks();
-        self.word();
+        let target = self.word();
+        if output {
+            if fd.is_none_or(|n| n == 1) && !target.is_empty() {
+                self.cur.writes.push(target);
+            }
+        } else if stdin {
+            self.cur.stdin = Stdin::Other;
+        }
     }
 
     fn blanks(&mut self) {
@@ -150,9 +305,14 @@ impl Lexer {
         }
     }
 
-    /// After a newline, skip the bodies of any queued heredocs.
-    fn skip_heredocs(&mut self) {
-        for (delim, strip) in std::mem::take(&mut self.heredocs) {
+    /// After a newline, read the bodies of any queued heredocs. Only the
+    /// one that is a command's stdin is kept, up to [`BODY_CAP`].
+    fn read_heredocs(&mut self) {
+        for q in std::mem::take(&mut self.queue) {
+            let mut body = String::new();
+            // Once a line doesn't fit, nothing after it is kept: lines
+            // from past the cap would read as if they were adjacent.
+            let mut full = false;
             loop {
                 let start = self.at;
                 while self.peek(0).is_some_and(|c| c != '\n') {
@@ -161,14 +321,28 @@ impl Lexer {
                 let line: String = self.chars[start..self.at].iter().collect();
                 let at_end = self.peek(0).is_none();
                 self.at = (self.at + 1).min(self.chars.len());
-                let line = if strip {
+                let line = if q.strip {
                     line.trim_start_matches('\t')
                 } else {
                     &line
                 };
-                if line == delim || at_end {
+                if line == q.delim {
                     break;
                 }
+                if q.owner.is_some() && !full {
+                    if body.len() + line.len() < BODY_CAP {
+                        body.push_str(line);
+                        body.push('\n');
+                    } else {
+                        full = true;
+                    }
+                }
+                if at_end {
+                    break;
+                }
+            }
+            if let Some(o) = q.owner {
+                self.meta[o].stdin = Some(body);
             }
         }
     }
@@ -305,8 +479,10 @@ impl Lexer {
 
     /// Add the commands of a substitution whose text starts at `offset`.
     fn lift(&mut self, inner: &str, offset: usize) {
+        self.lifted = true;
         let lx = lex(inner);
         self.out.extend(lx.out);
+        self.meta.extend(lx.meta);
         self.starts.extend(
             lx.starts
                 .into_iter()
@@ -776,7 +952,7 @@ fn safe_assignment(w: &str) -> bool {
         .is_some_and(|(name, _)| SAFE_VARS.contains(&name))
 }
 
-fn is_assignment(w: &str) -> bool {
+pub(super) fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(name, _)| {
         !name.is_empty()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -941,6 +1117,64 @@ pub fn text_enters(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full(text: &str) -> Vec<(Vec<String>, Option<String>, Vec<String>)> {
+        commands_full(text)
+            .into_iter()
+            .map(|c| (c.words, c.stdin, c.writes))
+            .collect()
+    }
+
+    #[test]
+    fn heredocs_here_strings_and_output_redirects_are_collected() {
+        let f = full("cat > /tmp/x <<'EOF'\nbody\nEOF\nls");
+        assert_eq!(
+            f[0],
+            (
+                words(&["cat"]),
+                Some("body\n".into()),
+                vec!["/tmp/x".to_string()]
+            )
+        );
+        assert_eq!(f[1].0, words(&["ls"]));
+        assert_eq!(f[1].1, None);
+        // Last stdin redirect wins; both bodies are consumed.
+        let f = full("bash <<A <<B\none\nA\ntwo\nB\nls");
+        assert_eq!(f[0].1.as_deref(), Some("two\n"));
+        assert_eq!(f[1].0, words(&["ls"]));
+        let f = full("bash <<A <<<'here'\none\nA\nls");
+        assert_eq!(f[0].1.as_deref(), Some("here"));
+        assert_eq!(f.len(), 2);
+        // A later file redirect takes stdin away.
+        assert_eq!(full("bash <<A < f\none\nA")[0].1, None);
+        // Not fd 0: skipped, not stdin.
+        let f = full("bash 3<<X\nbody\nX\nls");
+        assert_eq!((f[0].1.clone(), f.len()), (None, 2));
+        assert_eq!(full("bash 0<<X\nb\nX")[0].1.as_deref(), Some("b\n"));
+        // Output redirects: fd 1 only.
+        let f = full("a >o1 >>o2 1>o3 2>e >&2 >|o4");
+        assert_eq!(f[0].2, ["o1", "o2", "o3", "o4"]);
+        // Empty delimiter ends at an empty line.
+        let f = full("cat <<''\nx\n\nls");
+        assert_eq!(
+            (f[0].1.as_deref(), f[1].0.clone()),
+            (Some("x\n"), words(&["ls"]))
+        );
+        // Heredoc of a command inside `<<EOF | bash` lines up.
+        let f = full("cat <<EOF | bash\ncargo test\nEOF");
+        assert_eq!(f[0].1.as_deref(), Some("cargo test\n"));
+        assert_eq!(f[1].1, None);
+    }
+
+    #[test]
+    fn heredoc_body_is_capped_but_fully_skipped() {
+        let line = "x".repeat(1023);
+        let body = format!("{line}\n").repeat(40);
+        let f = full(&format!("cat <<E\n{body}E\nls"));
+        assert!(f[0].1.as_ref().unwrap().len() <= BODY_CAP);
+        assert!(f[0].1.as_ref().unwrap().len() > BODY_CAP - 1100);
+        assert_eq!(f[1].0, words(&["ls"]));
+    }
 
     fn words(ws: &[&str]) -> Vec<String> {
         ws.iter().map(|w| w.to_string()).collect()

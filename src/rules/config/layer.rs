@@ -25,6 +25,11 @@ struct RawFile {
     orphan_ttl: Option<u64>,
     queue_timeout: Option<f64>,
     allow_concurrent: Option<bool>,
+    // Script and grace keys (H3, H4); not part of `config::hash`.
+    script_slots: Option<u32>,
+    grace_s: Option<f64>,
+    grace_cpu_s: Option<f64>,
+    grace_max_slots: Option<u32>,
     #[serde(default)]
     rule: Vec<RawRule>,
     // File order, so the B1 message names the spellings as written. toml
@@ -102,6 +107,10 @@ pub(super) struct Layer {
     pub(super) orphan_ttl: Option<u64>,
     pub(super) queue_timeout: Option<f64>,
     pub(super) allow_concurrent: Option<bool>,
+    pub(super) script_slots: Option<u32>,
+    pub(super) grace_s: Option<f64>,
+    pub(super) grace_cpu_s: Option<f64>,
+    pub(super) grace_max_slots: Option<u32>,
     pub(super) global: Vec<Entry>,
     pub(super) tables: Vec<(String, PathBuf, Vec<Entry>)>,
 }
@@ -134,6 +143,23 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
         return Err(invalid(format!(
             "queue_timeout = {q}: must be a finite number of seconds, 0 or more"
         )));
+    }
+    if let Some(g) = raw.grace_s
+        && !(g.is_finite() && g > 0.0)
+    {
+        return Err(invalid(format!(
+            "grace_s = {g}: must be a finite number of seconds, above 0"
+        )));
+    }
+    if let Some(g) = raw.grace_cpu_s
+        && !(g.is_finite() && g >= 0.0)
+    {
+        return Err(invalid(format!(
+            "grace_cpu_s = {g}: must be a finite number of CPU-seconds, 0 or more"
+        )));
+    }
+    if raw.grace_max_slots == Some(0) {
+        return Err(invalid("grace_max_slots must be at least 1".into()));
     }
     let entries = |raw: Vec<RawRule>, scope: &str| -> Result<Vec<Entry>, ConfigError> {
         // Unique within one table and within one file's global list (P3):
@@ -240,6 +266,10 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
         orphan_ttl: raw.orphan_ttl,
         queue_timeout: raw.queue_timeout,
         allow_concurrent: raw.allow_concurrent,
+        script_slots: raw.script_slots,
+        grace_s: raw.grace_s,
+        grace_cpu_s: raw.grace_cpu_s,
+        grace_max_slots: raw.grace_max_slots,
         global,
         tables,
     })

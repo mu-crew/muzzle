@@ -158,6 +158,10 @@ pub struct Holder {
     /// G1: the previous per-member CPU snapshot (at most 64 members).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_procs: Option<Vec<ProcCpu>>,
+    /// H4: promoted retroactively by `run --grace`; never swallows a nested
+    /// `muzzle run` (D17).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grace: bool,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,
@@ -873,6 +877,7 @@ mod tests {
             orphan_active_ms: None,
             orphan_sample_ms: None,
             orphan_procs: None,
+            grace: false,
             claim: Claim {
                 slots: 1,
                 class: Class::Normal,
@@ -897,5 +902,42 @@ mod tests {
         s.holders[0].orphan_since_ms = Some(5);
         let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.holders[0], s.holders[0]);
+    }
+
+    #[test]
+    fn grace_is_additive_in_a_holder() {
+        let mut s = State::default();
+        s.holders.push(Holder {
+            ticket: 1,
+            pid: 2,
+            start: 3,
+            pgid: None,
+            run_start_ms: 0,
+            waited_s: 0.0,
+            enforced: false,
+            kept: false,
+            enforced_reason: None,
+            scope: None,
+            probe: None,
+            admit_load1: None,
+            admit_held: None,
+            seen_ms: None,
+            orphan_since_ms: None,
+            orphan_active_ms: None,
+            orphan_sample_ms: None,
+            orphan_procs: None,
+            grace: false,
+            claim: claim(1),
+        });
+        // Omitted when false, so an older muzzle's file is unchanged.
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("grace"), "{text}");
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert!(!back.holders[0].grace);
+        s.holders[0].grace = true;
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"grace\":true"), "{text}");
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert!(back.holders[0].grace);
     }
 }

@@ -38,6 +38,9 @@ pub const DEFAULT_ORPHAN_IDLE_S: u64 = 120;
 /// G1: seconds after which an orphaned claim is released regardless; 0
 /// disables.
 pub const DEFAULT_ORPHAN_TTL: u64 = 600;
+pub const DEFAULT_SCRIPT_SLOTS: u32 = 2;
+pub const DEFAULT_GRACE_CPU_S: f64 = 1.0;
+pub const DEFAULT_GRACE_MAX_SLOTS: u32 = 4;
 /// D7a: `overcommit` must lie in this range.
 pub const OVERCOMMIT_RANGE: std::ops::RangeInclusive<f64> = 1.0..=4.0;
 
@@ -130,6 +133,14 @@ pub struct Config {
     pub queue_timeout: Option<f64>,
     /// G2: queue behind an own orphaned claim instead of exiting 76.
     pub allow_concurrent: bool,
+    /// H3: slots of the built-in `script-heavy` rule (default 2, 0 disables).
+    pub script_slots: u32,
+    /// H4: default `--grace` seconds for `wrap --with-grace`; `None` is off.
+    pub grace_s: Option<f64>,
+    /// H4: CPU-seconds that promote a grace run (default 1.0).
+    pub grace_cpu_s: f64,
+    /// H4: cap on a promoted grace claim (default 4).
+    pub grace_max_slots: u32,
     /// The global list, root then includes merged in (P5).
     pub global: Vec<Entry>,
     /// Sorted by canonical key, so an ancestor comes before its
@@ -208,6 +219,10 @@ impl Config {
             orphan_ttl: DEFAULT_ORPHAN_TTL,
             queue_timeout: None,
             allow_concurrent: false,
+            script_slots: DEFAULT_SCRIPT_SLOTS,
+            grace_s: None,
+            grace_cpu_s: DEFAULT_GRACE_CPU_S,
+            grace_max_slots: DEFAULT_GRACE_MAX_SLOTS,
             global: Vec::new(),
             tables: Vec::new(),
             includes: Vec::new(),
@@ -263,10 +278,26 @@ impl Config {
         if let Some(v) = layer.allow_concurrent {
             self.allow_concurrent = v;
         }
+        if let Some(v) = layer.script_slots {
+            self.script_slots = v;
+        }
+        if layer.grace_s.is_some() {
+            self.grace_s = layer.grace_s;
+        }
+        if let Some(v) = layer.grace_cpu_s {
+            self.grace_cpu_s = v;
+        }
+        if let Some(v) = layer.grace_max_slots {
+            self.grace_max_slots = v;
+        }
         for e in layer.global {
             // B2: a global entry with no matcher reweights a rule an
             // earlier file defined.
-            if e.matcher.is_none() && !self.global.iter().any(|g| g.name == e.name) {
+            // H3.3: so does one naming a built-in rule, which has its own.
+            if e.matcher.is_none()
+                && !super::resolve::is_builtin(&e.name)
+                && !self.global.iter().any(|g| g.name == e.name)
+            {
                 return Err(ConfigError::Invalid {
                     path: file.to_path_buf(),
                     message: format!(
@@ -301,7 +332,7 @@ impl Config {
                         && t.canonical.starts_with(&a.canonical)
                         && a.entries.iter().any(|ae| ae.name == e.name)
                 });
-                if !global && !ancestor {
+                if !global && !ancestor && !super::resolve::is_builtin(&e.name) {
                     return Err(ConfigError::Invalid {
                         path: e.file.clone(),
                         message: format!(
@@ -425,6 +456,42 @@ pub(super) mod tests {
         invalid("queue_timeout = -1\n", "queue_timeout");
         invalid("queue_timeout = inf\n", "queue_timeout");
         invalid("queue_timeout = nan\n", "queue_timeout");
+    }
+
+    #[test]
+    fn script_and_grace_keys_default_and_parse() {
+        let c = parse("").unwrap();
+        assert_eq!(c.script_slots, 2);
+        assert_eq!(c.grace_s, None);
+        assert_eq!(c.grace_cpu_s, 1.0);
+        assert_eq!(c.grace_max_slots, 4);
+        let c =
+            parse("script_slots = 0\ngrace_s = 5\ngrace_cpu_s = 0\ngrace_max_slots = 8\n").unwrap();
+        assert_eq!(c.script_slots, 0);
+        assert_eq!(c.grace_s, Some(5.0));
+        assert_eq!(c.grace_cpu_s, 0.0);
+        assert_eq!(c.grace_max_slots, 8);
+    }
+
+    #[test]
+    fn script_and_grace_keys_reject_bad_values() {
+        invalid("grace_s = 0\n", "grace_s");
+        invalid("grace_s = -1\n", "grace_s");
+        invalid("grace_s = inf\n", "grace_s");
+        invalid("grace_s = nan\n", "grace_s");
+        invalid("grace_cpu_s = -0.5\n", "grace_cpu_s");
+        invalid("grace_cpu_s = nan\n", "grace_cpu_s");
+        invalid("grace_max_slots = 0\n", "grace_max_slots");
+    }
+
+    #[test]
+    fn script_and_grace_keys_do_not_change_the_hash() {
+        let with =
+            "reserve = 2\nscript_slots = 5\ngrace_s = 3\ngrace_cpu_s = 2\ngrace_max_slots = 9\n";
+        assert_eq!(
+            parse("reserve = 2\n").unwrap().hash(),
+            parse(with).unwrap().hash()
+        );
     }
 
     #[test]

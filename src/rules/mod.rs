@@ -37,31 +37,99 @@ pub struct Wrapped {
 /// queue wait (D24).
 pub fn wrap(config: &Config, command: &str, cwd: &Path, timeout_s: Option<f64>) -> Option<Wrapped> {
     let eff = config.resolve(cwd);
-    let m = matches(&eff, command)?;
+    wrap_in(&eff, command, cwd, timeout_s).map(|(w, _)| w)
+}
+
+/// [`wrap`] against rules already resolved, with the match the rewrite
+/// came from: a caller that decides anything from the match (the hook's
+/// `allow`) must use this one, not match a second time (R5), since files
+/// the match read can change in between.
+pub(crate) fn wrap_in<'a>(
+    eff: &'a Effective,
+    command: &str,
+    cwd: &Path,
+    timeout_s: Option<f64>,
+) -> Option<(Wrapped, resolve::Match<'a>)> {
+    let m = matches(eff, command, cwd)?;
     let mut out = format!(
         "muzzle run --rule={} --slots {}",
         quote_word(&m.rule.name),
         m.rule.slots
     );
+    push_tail(&mut out, command, timeout_s);
+    let wrapped = Wrapped {
+        command: out,
+        rule: m.rule.name.clone(),
+        slots: m.rule.slots,
+    };
+    Some((wrapped, m))
+}
+
+/// ` --run-timeout T -- bash -c '<command>'`, the end of every rewrite.
+fn push_tail(out: &mut String, command: &str, timeout_s: Option<f64>) {
     if let Some(t) = timeout_s.filter(|t| t.is_finite() && *t > 0.0) {
         out.push_str(&format!(" --run-timeout {}", fmt_secs(t)));
     }
     out.push_str(" -- bash -c ");
     out.push_str(&quote(command));
+}
+
+/// H4.4: commands that never need a grace claim. A command is purely light
+/// when every head, past assignments and wrappers, is one of these.
+const LIGHT: [&str; 42] = [
+    "ls", "cat", "head", "tail", "rg", "grep", "git", "mu", "gh", "muzzle", "ps", "pgrep", "pkill",
+    "kill", "rm", "mv", "cp", "mkdir", "sed", "awk", "wc", "sort", "uniq", "echo", "printf",
+    "date", "pwd", "which", "true", "false", "sleep", "cd", "export", "unset", "test", "[",
+    "touch", "chmod", "diff", "jq", "find", "tee",
+];
+
+fn purely_light(command: &str) -> bool {
+    shell::commands(command)
+        .iter()
+        .filter_map(|c| shell::strip_prefix(c).first())
+        .all(|w| LIGHT.contains(&shell::base(w)))
+}
+
+/// H4.4, `wrap --with-grace`: for a command no rule matched, that isn't
+/// purely light, `muzzle run --grace <S> …` with the built-in
+/// `unmatched-heavy` rule, which claims slots only if the command turns
+/// out to burn CPU. `grace` is `MUZZLE_GRACE`'s value, else the config's;
+/// `None`, zero or a value that isn't a positive number turns it off.
+pub fn wrap_grace(
+    config: &Config,
+    command: &str,
+    timeout_s: Option<f64>,
+    grace: Option<&str>,
+) -> Option<Wrapped> {
+    let secs = match grace.and_then(|g| g.trim().parse::<f64>().ok()) {
+        Some(s) => Some(s),
+        None => config.grace_s,
+    }
+    .filter(|s| s.is_finite() && *s > 0.0)?;
+    if shell::runs_muzzle(command) || purely_light(command) {
+        return None;
+    }
+    let slots = config.grace_max_slots;
+    let mut out = format!(
+        "muzzle run --grace {} --rule={} --slots {slots}",
+        fmt_secs(secs),
+        resolve::UNMATCHED_HEAVY
+    );
+    push_tail(&mut out, command, timeout_s);
     Some(Wrapped {
         command: out,
-        rule: m.rule.name.clone(),
-        slots: m.rule.slots,
+        rule: resolve::UNMATCHED_HEAVY.into(),
+        slots,
     })
 }
 
 /// [`Effective::matches`], except that a command which already runs muzzle
 /// matches nothing (D22): `match`, `wrap` and `hook` all agree.
-fn matches<'a>(eff: &'a Effective, command: &str) -> Option<resolve::Match<'a>> {
+fn matches<'a>(eff: &'a Effective, command: &str, cwd: &Path) -> Option<resolve::Match<'a>> {
     if shell::runs_muzzle(command) {
         return None;
     }
-    eff.matches(command)
+    eff.matches_in(command, Some(cwd))
 }
 
 /// D16a: `command` (shell text) enters a container (`distrobox enter`,
@@ -133,7 +201,7 @@ fn class_str(c: Class) -> &'static str {
 /// The `match --json` object (spec §CLI, 0.2 P8 and B4).
 pub fn match_json(config: &Config, command: &str, cwd: &Path) -> Value {
     let eff = config.resolve(cwd);
-    match matches(&eff, command) {
+    match matches(&eff, command, cwd) {
         None => json!({ "slots": null }),
         Some(m) => {
             let mut v = json!({
@@ -193,14 +261,24 @@ pub fn wrap_main(args: &WrapArgs) -> anyhow::Result<ExitCode> {
         Ok(c) => c,
         Err(code) => return Ok(code),
     };
-    let v = match wrap(
-        &config,
-        &args.command,
-        &cwd_or_current(&args.cwd),
-        args.timeout,
-    ) {
-        None => json!({ "command": null }),
+    let cwd = cwd_or_current(&args.cwd);
+    let v = match wrap(&config, &args.command, &cwd, args.timeout) {
         Some(w) => json!({ "command": w.command, "rule": w.rule, "slots": w.slots }),
+        // H4.4: only with the flag; without it the reply is as it was.
+        None if args.with_grace => {
+            let env = std::env::var("MUZZLE_GRACE").ok();
+            match wrap_grace(&config, &args.command, args.timeout, env.as_deref()) {
+                Some(w) => json!({
+                    "matched": false,
+                    "grace": true,
+                    "command": w.command,
+                    "rule": w.rule,
+                    "slots": w.slots,
+                }),
+                None => json!({ "command": null }),
+            }
+        }
+        None => json!({ "command": null }),
     };
     println!("{v}");
     Ok(ExitCode::SUCCESS)

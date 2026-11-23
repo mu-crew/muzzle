@@ -147,7 +147,7 @@ impl Deadline {
         }
     }
 
-    fn check(&mut self, started: Instant, target: Target) {
+    pub(super) fn check(&mut self, started: Instant, target: Target) {
         let due = self.after.is_some_and(|after| started.elapsed() >= after);
         match self.termed {
             None if due => self.fire(target, Fired::Timeout),

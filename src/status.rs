@@ -482,6 +482,7 @@ mod tests {
             orphan_active_ms: None,
             orphan_sample_ms: None,
             orphan_procs: None,
+            grace: false,
             claim: claim(slots, Class::High, agent),
         }
     }

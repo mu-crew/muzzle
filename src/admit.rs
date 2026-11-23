@@ -259,6 +259,7 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         orphan_active_ms: None,
         orphan_sample_ms: None,
         orphan_procs: None,
+        grace: false,
         claim,
     }
 }

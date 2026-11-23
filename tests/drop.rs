@@ -42,6 +42,7 @@ fn holder(ticket: u64, agent: &str, pid: u32, start: u64, pgid: Option<u32>, kep
         orphan_active_ms: None,
         orphan_sample_ms: None,
         orphan_procs: None,
+        grace: false,
         claim: Claim {
             slots: 2,
             class: Class::Normal,

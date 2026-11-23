@@ -479,3 +479,54 @@ test("a queued call's status reaches pi's terminal under its own id, and is clea
     delete process.env.TERM_PROGRAM;
   }
 });
+
+// H4.4: grace replies and the footer rule, with a fake `muzzle wrap`.
+function fakeWrap(argsLog: string, reply: string): string {
+  const fake = join(home, `fake-${Math.random().toString(36).slice(2)}`);
+  writeFileSync(fake, `#!/bin/sh\necho "$@" > '${argsLog}'\necho '${reply}'\n`);
+  chmodSync(fake, 0o755);
+  return fake;
+}
+
+async function graceRun(report: Record<string, unknown>, reply = `{"command":"muzzle run --slots 1 -- bash -c x","grace":true}`) {
+  const log = join(home, "args.log");
+  const { emit, entries } = load(() => fakeWrap(log, reply));
+  const input: Record<string, unknown> = { command: "x", timeout: 30 };
+  await emit("tool_call", call("g", input));
+  const cmd = input.command as string;
+  const path = /--report '([^']+)'/.exec(cmd)?.[1];
+  if (path) writeFileSync(path, JSON.stringify({ waited_s: 0, ran_s: 1, slots: 1, class: null, rule: null, exit: 0, enforced: true, ...report }));
+  const r = await emit("tool_result", result("g", input, "out"));
+  return { cmd, input, r, entries, args: readFileSync(log, "utf8") };
+}
+
+test("wrap is asked for --with-grace", async () => {
+  const { args } = await graceRun({ promoted: false });
+  assert.match(args, /wrap --json --with-grace --cwd /);
+});
+
+test("a grace: true reply is wrapped, with --report and the timeout moved", async () => {
+  const { cmd, input } = await graceRun({ promoted: false });
+  assert.match(cmd, /^'[^']+' run --report '[^']+\.json' --slots 1 -- bash -c x$/);
+  assert.equal(input.timeout, undefined);
+});
+
+test("an unpromoted, unkilled exit leaves no footer", async () => {
+  const { r } = await graceRun({ promoted: false });
+  assert.equal(r, undefined);
+});
+
+test("a promoted run keeps the footer", async () => {
+  const { r } = await graceRun({ promoted: true });
+  assert.match(r.content.at(-1).text, /^out\n\nmuzzle: waited/);
+});
+
+test("killed before promotion keeps the footer", async () => {
+  const { r } = await graceRun({ promoted: false, killed: "run-timeout" });
+  assert.match(r.content.at(-1).text, /muzzle: waited/);
+});
+
+test("a report without promoted keeps the footer", async () => {
+  const { r } = await graceRun({});
+  assert.match(r.content.at(-1).text, /muzzle: waited/);
+});

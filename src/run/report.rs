@@ -39,6 +39,27 @@ pub(super) fn write_report(
     reason: Option<EnforcedReason>,
     kept: bool,
 ) -> anyhow::Result<()> {
+    write_report_as(
+        path, t, slots, class, rule, repo, exit, enforced, reason, kept, None,
+    )
+}
+
+/// H4: a `--grace` run's report also says whether it was `promoted`, and
+/// how it was `killed` (`null` if not); both keys are absent otherwise.
+#[allow(clippy::too_many_arguments)] // one flat JSON object, spec §CLI
+pub(super) fn write_report_as(
+    path: &Path,
+    t: &Times,
+    slots: Option<u32>,
+    class: Option<Class>,
+    rule: Option<&str>,
+    repo: Option<&str>,
+    exit: u8,
+    enforced: bool,
+    reason: Option<EnforcedReason>,
+    kept: bool,
+    grace: Option<(bool, Option<Killed>)>,
+) -> anyhow::Result<()> {
     let mut v = json!({
         "waited_s": round3(t.waited_s),
         "ran_s": round3(t.ran_s),
@@ -55,6 +76,10 @@ pub(super) fn write_report(
     // Added only when set (D16a), as status and runs.jsonl do.
     if let Some(r) = reason {
         v["enforced_reason"] = json!(r);
+    }
+    if let Some((promoted, killed)) = grace {
+        v["promoted"] = json!(promoted);
+        v["killed"] = json!(killed);
     }
     fs::write(path, format!("{v}\n")).with_context(|| format!("writing {}", path.display()))
 }
@@ -194,14 +219,31 @@ impl Job<'_> {
         enforced: bool,
         kept: bool,
     ) -> anyhow::Result<()> {
+        self.finish_as(args, ran_s, released_ms, ending, enforced, kept, None)
+    }
+
+    /// [`Job::finish`] for a run that may be a promoted `--grace` run;
+    /// `grace` then holds when the claim was taken, which is
+    /// `admitted_ms` (the holder's `run_start_ms` is the earlier spawn).
+    #[allow(clippy::too_many_arguments)] // `finish`'s, plus the grace flag
+    pub(super) fn finish_as(
+        &self,
+        args: &RunArgs,
+        ran_s: f64,
+        released_ms: Option<u64>,
+        ending: &Ending,
+        enforced: bool,
+        kept: bool,
+        grace: Option<u64>,
+    ) -> anyhow::Result<()> {
         let h = &self.holder;
         match &args.report {
-            Some(path) => write_report(
+            Some(path) => write_report_as(
                 path,
                 &Times {
                     waited_s: h.waited_s,
                     ran_s,
-                    admitted_ms: Some(h.run_start_ms),
+                    admitted_ms: Some(grace.unwrap_or(h.run_start_ms)),
                     released_ms,
                 },
                 Some(h.claim.slots),
@@ -212,6 +254,7 @@ impl Job<'_> {
                 enforced,
                 h.enforced_reason,
                 kept,
+                grace.map(|_| (true, ending.killed)),
             ),
             None => {
                 eprintln!(

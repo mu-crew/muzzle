@@ -138,6 +138,14 @@ export interface Report {
   exit: number;
   enforced: boolean;
   kept?: boolean;
+  /** H4.4: set on grace runs; false means the run ended inside the grace window. */
+  promoted?: boolean;
+  killed?: unknown;
+}
+
+/** H4.4: a grace run that exited unpromoted and unkilled leaves no footer. */
+export function silent(r: Report): boolean {
+  return r.promoted === false && r.killed == null;
 }
 
 /** D26, the same text `muzzle run` prints when `--report` is unset. */
@@ -148,7 +156,7 @@ export function resultLine(r: Report): string {
 }
 
 function wrap(bin: string, command: string, cwd: string, timeout?: number): Promise<string | null> {
-  const args = ["wrap", "--json", "--cwd", cwd];
+  const args = ["wrap", "--json", "--with-grace", "--cwd", cwd];
   if (typeof timeout === "number") args.push("--timeout", String(timeout));
   args.push("--", command);
   return new Promise((resolve, reject) => {
@@ -292,6 +300,8 @@ export function createExtension(deps: Deps = {}) {
       } finally {
         rmSync(report, { force: true });
       }
+      pi.appendEntry("muzzle", { toolCallId: event.toolCallId, ...r });
+      if (silent(r)) return;
       const line = resultLine(r);
       const content = [...event.content];
       const last = content[content.length - 1];
@@ -300,7 +310,6 @@ export function createExtension(deps: Deps = {}) {
       } else {
         content.push({ type: "text", text: line });
       }
-      pi.appendEntry("muzzle", { toolCallId: event.toolCallId, ...r });
       // Keep structuredContent: replacing content alone would drop it.
       return { content, structuredContent: event.structuredContent };
     });
