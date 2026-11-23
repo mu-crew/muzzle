@@ -1,6 +1,6 @@
 {
   "name": "@mu-crew/muzzle-linux-x64",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "muzzle binary for Linux x64",
   "license": "MIT",
   "repository": {
@@ -15,5 +15,8 @@
   ],
   "files": [
     "bin/muzzle"
-  ]
+  ],
+  "scripts": {
+    "prepublishOnly": "node -e \"const fs=require('fs'),s=fs.statSync('bin/muzzle'); if(!s.isFile()||!s.size||!(s.mode&0o111)){console.error('bin/muzzle missing, empty, or not executable'); process.exit(1)}\""
+  }
 }

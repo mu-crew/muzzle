@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3
+
+Fixed:
+
+- Platform npm packages (`@mu-crew/muzzle-{linux-x64,linux-arm64,darwin-arm64}`)
+  now run a `prepublishOnly` check that refuses to publish unless `bin/muzzle`
+  exists, is non-empty, and is executable, blocking empty manual publishes
+  (0.3.2 shipped `darwin-arm64` without its binary).
+
 ## 0.3.2
 
 Added:
