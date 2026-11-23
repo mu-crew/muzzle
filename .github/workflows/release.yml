@@ -75,6 +75,10 @@ jobs:
             cp "artifacts/$package/muzzle" "npm/$package/bin/muzzle"
             chmod +x "npm/$package/bin/muzzle"
           done
+      # Fail before any publish if a platform package would ship without its
+      # binary (0.3.1 did).
+      - name: Check platform packages hold the binary
+        run: node scripts/check-pack.js
       # Trusted publishing (OIDC) needs npm 11.5.1+; older npm fails with a
       # misleading 404.
       - run: npm install -g npm@^11.5.1

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2
+
+Fixed:
+
+- 0.3.1 platform packages shipped without the binary. `scripts/check-pack.js`
+  now fails the release before any publish unless each platform package's
+  `npm pack` lists an executable `bin/muzzle`.
+
 ## 0.3.1
 
 Added:

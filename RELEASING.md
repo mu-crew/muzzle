@@ -19,6 +19,17 @@ through OIDC (trusted publishing).
    git push origin main v0.1.1
    ```
 
+Before any `npm publish`, by hand or in CI, fill `npm/<platform>/bin/muzzle`
+with the built binary (`chmod +x`) and run:
+
+```sh
+node scripts/check-pack.js
+```
+
+It runs `npm pack --dry-run --json` for each platform package and fails unless
+each lists a non-empty, executable `bin/muzzle`. The workflow runs it before
+the first publish. The 0.3.1 platform packages shipped with only `package.json`.
+
 The workflow checks that the tag, Cargo version and all npm package versions
 agree, publishes the three platform packages, then `@mu-crew/muzzle`, then
 `muzzle-cli`.
