@@ -21,6 +21,7 @@ Prebuilt for Linux x64, Linux arm64 and macOS arm64. Or `cargo install muzzle-cl
 ```sh
 muzzle run --rule cargo-test -- cargo test --locked   # ends with: muzzle: waited Ws for N slots, ran Rs
 muzzle status                                         # who holds the slots, who waits
+muzzle drop --dead                                    # clear orphaned claims from dead/kept holders
 muzzle report --since 7d                              # what each rule used, and a suggested weight
 ```
 
@@ -48,7 +49,14 @@ run log keeps everything: each month moves into a gzip archive (about
 has the details.
 
 **Never put `timeout` outside `muzzle run`**: it counts the queue wait. Use
-`--run-timeout S`.
+`--run-timeout 900`.
+
+**Stuck claims and self-deadlocks:** Nested runs start at once without
+claiming. If a killed or backgrounded job leaves stray processes holding
+slots, muzzle releases the claim once they go idle (or you can clear them
+with `muzzle drop --dead`), and refuses to queue a pane behind its own
+orphaned claim instead of hanging. See [docs/usage.md](docs/usage.md) for
+timeouts and details.
 
 ## Does it help?
 
@@ -103,11 +111,10 @@ measured yet.
 | Doc | For |
 | --- | --- |
 | [docs/why.md](docs/why.md) | The overload, what muzzle does about it, the trade |
-| [docs/usage.md](docs/usage.md) | Config, running, timeouts, exit codes, and the limits: process groups, `setsid`, advisory mode, containers |
+| [docs/usage.md](docs/usage.md) | Config, running, timeouts, exit codes, `muzzle drop`, orphan/deadlock guards, and the limits: process groups, `setsid`, advisory mode, containers |
 | [docs/harnesses/](docs/harnesses/README.md) | `muzzle init`, hook snippets for Claude Code, Codex, Muse Code, cursor-agent, opencode, and the `allow` warning |
 | [skills/muzzle](npm/muzzle/skills/muzzle/SKILL.md) | The agent skill, with recipes for tuning, benchmarking and harnesses |
 | [bench/](bench/README.md) | Traces, the replay benchmark and the probe |
-| [spec](docs/specs/2026-10-29-muzzle.md) | Design and its numbered decisions; [0.2 amendments](docs/specs/2026-10-30-muzzle-0.2-paths.md) for path tables, includes and the run log |
 | [CHANGELOG.md](CHANGELOG.md) | Releases |
 
 ## License

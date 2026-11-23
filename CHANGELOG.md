@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- **Different-PID deadlock & orphan-hold guards** (0.3.3 spec G1–G6):
+  - **Orphan idle release & TTL (G1):** orphaned (`kept` or dead-muzzle)
+    holders release their slot claim without killing surviving processes
+    after `orphan_idle_s` (default 120 s) below 1% of one core with no new
+    members (`killed: "orphan-idle"`), or unconditionally after
+    `orphan_ttl` (default 600 s, `killed: "orphan-ttl"`).
+  - **Same-caller overlap guard (G2):** non-nested calls from the same
+    caller (`TMUX_PANE`, else `MU_AGENT_NAME` + cwd/repo) warn at t=0 when
+    holding slots and fail fast with exit **76** (`SELF_OVERLAP`, logging
+    `killed: "self-overlap"`) when blocked by their own orphaned slots
+    (`--allow-concurrent` / `allow_concurrent` opt-out).
+  - **Status & queue visibility (G3):** `status --json` adds `ticket`,
+    `state` (`"live" | "kept" | "dead-muzzle"`), `orphan_s`, and `procs`
+    (up to 8 members for non-live holders); human `status` and `queued`
+    lines tag `[dead]`/`[kept]` holders.
+  - **`muzzle drop` (G4):** clear wedged claims (`<ticket>`, `--dead`,
+    `--agent`, `--kill` with `(pid, start)`-verified termination outside
+    the state lock, `--force` for live holders; logs `killed: "dropped"`).
+  - **Default queue timeout (G5):** `queue_timeout` in `config.toml` and
+    `MUZZLE_QUEUE_TIMEOUT` in the environment (`--no-timeout` or `none`
+    disables; `--timeout 0` keeps try-once behaviour).
+  - **Docs & skill (G6):** updated `README.md`, `docs/usage.md`, and
+    `npm/muzzle/skills/muzzle/SKILL.md`.
+
 ## 0.3.2
 
 Fixed:
