@@ -522,16 +522,25 @@ mod tests {
 
     #[test]
     fn group_cpu_and_procs_see_this_process_group() {
-        let me = std::process::id() as Pid;
-        let g = pgid(me).unwrap();
-        let cpu = group_cpu(g).expect("own group is readable");
-        let mine = cpu
+        // Isolate the child in its own process group: under a CI runner
+        // (macOS Actions), the test binary's inherited group can contain a
+        // hardened/other-uid parent whose PROC_PIDTASKINFO returns EPERM.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let g = pid_of(&child);
+        let cpu = group_cpu(g).expect("isolated child group is readable");
+        let entry = cpu
             .iter()
-            .find(|c| c.pid == me as u32)
-            .expect("self listed");
-        assert_eq!(mine.start, start_time(me).unwrap());
+            .find(|c| c.pid == g as u32)
+            .expect("child listed");
+        assert_eq!(entry.start, start_time(g).unwrap());
         let procs = group_procs(g);
-        assert!(procs.iter().any(|(p, c)| *p == me && !c.is_empty()));
+        assert!(procs.iter().any(|(p, c)| *p == g && !c.is_empty()));
+        kill(-g, libc::SIGKILL);
+        child.wait().unwrap();
     }
 
     #[test]
