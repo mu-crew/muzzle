@@ -55,8 +55,14 @@ has the details.
 claiming. If a killed or backgrounded job leaves stray processes holding
 slots, muzzle releases the claim once they go idle (or you can clear them
 with `muzzle drop --dead`), and refuses to queue a pane behind its own
-orphaned claim instead of hanging. See [docs/usage.md](docs/usage.md) for
-timeouts and details.
+orphaned claim instead of hanging.
+
+**Heredocs, scripts, and opaque heavy calls:** Rules also inspect executed
+shell heredocs, local scripts, and throwaway Python/Node scripts that spawn
+builds or tests (plain file edits stay unclaimed). Enable `grace_s` (or
+`MUZZLE_GRACE=5`) in pi to retroactively account for any other command that
+turns CPU-heavy after a few seconds. See [docs/usage.md](docs/usage.md) for
+knobs and details.
 
 ## Does it help?
 

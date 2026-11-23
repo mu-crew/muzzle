@@ -68,14 +68,16 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
   `MUZZLE_SLOTS` from the claim and overwrites any it inherits. Drop
   hand-set caps from the command; an assignment inside the command string
   still wins.
-- **Wrap a script as a whole.** muzzle can't see inside a script, so a
-  script you write that runs builds or tests (`./check.sh`, `python3
-  /tmp/x.py`, a heredoc) matches no rule and runs unclaimed. Wrap the
-  whole script under the rule of the heaviest thing it runs:
-  `muzzle run --rule cargo-test -- ./check.sh`, or
-  `muzzle run --rule cargo-test -- bash -c 'cargo build && cargo test'`.
-  Don't move a gate into a script to skip the queue: the machine still
-  pays for it, and every other agent's gate slows down.
+- **Heredocs and throwaway scripts are inspected automatically.** Executed
+  shell heredocs (`bash <<'EOF'`, `cat > /tmp/x.sh <<'EOF' … && bash
+  /tmp/x.sh`), local shell scripts (`./check.sh`), and Python/Node scripts
+  that spawn subprocesses or test harnesses match their rule (or the
+  built-in `script-heavy` fallback, default 2 slots); plain file-edit
+  scripts stay unclaimed. For opaque CPU burners that match no rule, set
+  `grace_s` in the config (or `MUZZLE_GRACE=5` in pi) so anything burning
+  CPU past the grace window retroactively claims slots as `unmatched-heavy`.
+  Hand-wrapping (`muzzle run --rule cargo-test -- ./check.sh`) is still
+  useful when you want a specific rule or weight up front.
 - **Prefer foreground `muzzle run --run-timeout 900` over `&` or `nohup`.** A
   background launch (`(gate > log 2>&1 &)`) keeps its slots: a keeper holds
   the claim while the job runs, until it exits or the orphan idle/TTL release

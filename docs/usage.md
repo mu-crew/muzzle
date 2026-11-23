@@ -354,6 +354,37 @@ verified by pid and start time, never drop's own group. For a container
 scope it stops the scope if reachable; otherwise it releases the claim and
 warns the workload could not be stopped. Drops log `killed: "dropped"`.
 
+### Heredocs, throwaway scripts, and retroactive `--grace`
+
+Command matching also inspects:
+
+- **Executed shell heredocs & here-strings:** `bash <<'EOF'`, `sh <<< '…'`
+  (fd-0 last-wins, only when the shell has no `-c` or script file), and
+  `cat`/`tee` write-then-execute chains in the same command string.
+  Non-executed heredocs (`git commit -F - <<'EOF'`, writing data files) are
+  ignored.
+- **Local shell scripts:** `bash /tmp/x.sh`, `./check.sh`, `source`, and
+  `cd sub && ./check.sh` (non-blocking, no symlinks/binaries, 16 KiB per
+  file, 8 files / 64 KiB total per call).
+- **Throwaway Python/Node scripts:** `-c`/`-e`, local `.py`/`.js`/`.mjs`
+  files, and stdin heredocs (`python3 - <<'EOF'`, `node --input-type=module
+  <<'EOF'`). Plain file edits stay unclaimed; scripts with subprocess or
+  test-harness signals match the tuned rule they invoke (within a 3-token
+  window, e.g. `subprocess.run(["cargo", "test"])` → `cargo-test`), or the
+  built-in `script-heavy` rule (`script_slots = 2` default; `0` disables).
+  In Claude's hook, body-inspected matches are wrapped but never auto-allowed.
+
+For opaque CPU-heavy commands that match no rule, `muzzle run --grace 5`
+(with optional `--grace-cpu 1.0`) starts the command at once with no upfront
+lock or queue wait. Fast or idle commands exit silently with no `state.json`
+or `runs.jsonl` entry. If the group is still running after `--grace` seconds
+and has burned at least `--grace-cpu` CPU-seconds, muzzle promotes it into
+`state.json` as a live `unmatched-heavy` holder (without `SIGSTOP`) and logs
+it on exit. Inner `muzzle run` calls are not swallowed as nested by a grace
+holder. In pi, setting `grace_s = 5.0` in `config.toml` or `MUZZLE_GRACE=5`
+enables `--grace` for non-light unmatched commands (`MUZZLE_GRACE=0`
+disables; `grace_cpu_s` defaults to `1.0`, `grace_max_slots` to `4`).
+
 ## Harnesses
 
 pi, Claude Code, Codex, Muse Code, cursor-agent, opencode and hand-wrapping:

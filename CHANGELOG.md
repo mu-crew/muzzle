@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0
+
+Added:
+
+- **Heredoc & throwaway-script inspection** (H1–H3):
+  - Executed shell heredocs and here-strings (`bash <<'EOF'`, `sh <<< …`,
+    and `cat`/`tee` write-then-execute chains) are parsed into command heads
+    and matched against configured rules. Non-executed heredocs stay
+    unclaimed.
+  - Local shell script files (`bash /tmp/x.sh`, `./check.sh`, `source`,
+    tracking `cd`) are safely read (`O_NONBLOCK | O_NOFOLLOW` + `fstat`,
+    16 KiB/file, 8 files / 64 KiB cap, `(dev, ino)` cycle guard) and matched.
+  - Throwaway `python3` / `node` scripts (`-c`/`-e`, local files, stdin
+    heredocs) with subprocess or test-harness signals match the tuned rule
+    they invoke (3-token window, e.g. `subprocess.run(["cargo", "test"])`)
+    or the built-in `script-heavy` rule (`script_slots`, default 2; `0`
+    disables). Plain file-edit scripts stay unclaimed.
+  - Claude Code's hook never auto-allows a body-inspected match.
+- **Retroactive `--grace` slot accounting** (H4):
+  - `muzzle run --grace <S> [--grace-cpu <C>]` starts unmatched commands
+    immediately with no upfront lock/write, tracks monotonic per-member CPU,
+    and promotes heavy runs into `state.json` + `runs.jsonl` as
+    `unmatched-heavy` without `SIGSTOP`. Inner `muzzle run` calls are not
+    swallowed as nested by a grace holder.
+  - Opt-in `muzzle wrap --with-grace` (with a light-command allowlist;
+    Claude/Codex/Cursor hooks untouched) and pi extension support
+    (`grace_s`, `grace_cpu_s`, `grace_max_slots`, `MUZZLE_GRACE`).
+
 ## 0.3.3
 
 Fixed:
