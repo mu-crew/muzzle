@@ -145,9 +145,31 @@ pub struct Holder {
     /// prune (ran_s_lag_followup). `None` in a state file written before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_ms: Option<u64>,
+    /// G1: when the holder was first seen orphaned (kept, or its muzzle
+    /// dead): the TTL backstop's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_since_ms: Option<u64>,
+    /// G1: last time the orphaned group showed activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_active_ms: Option<u64>,
+    /// G1: when `orphan_procs` was sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_sample_ms: Option<u64>,
+    /// G1: the previous per-member CPU snapshot (at most 64 members).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_procs: Option<Vec<ProcCpu>>,
     /// Capped to the budget at admission (D8).
     #[serde(flatten)]
     pub claim: Claim,
+}
+
+/// G1: one group member's CPU at a sample. `(pid, start)` identifies the
+/// process across a pid recycle; `cpu_ns` is user plus system time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcCpu {
+    pub pid: u32,
+    pub start: u64,
+    pub cpu_ns: u64,
 }
 
 /// D16a: how a waiter tells whether a container run's scope is populated.
@@ -217,12 +239,20 @@ pub enum EnforcedReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Killed {
     Timeout,
     Oom,
     Signal,
     Holder,
+    /// G1: an orphaned claim's group showed no activity for `orphan_idle_s`.
+    OrphanIdle,
+    /// G1: an orphaned claim outlived `orphan_ttl`.
+    OrphanTtl,
+    /// G4: `muzzle drop` removed the claim.
+    Dropped,
+    /// G2: refused at once behind the caller's own orphaned claim.
+    SelfOverlap,
 }
 
 impl State {
@@ -376,16 +406,35 @@ impl Store {
         now_ms: u64,
         f: impl FnOnce(&mut State) -> anyhow::Result<(T, Vec<RunRecord>)>,
     ) -> anyhow::Result<T> {
+        let mut out = None;
+        self.update_logged_if(now_ms, |s| {
+            let (t, records) = f(s)?;
+            out = Some(t);
+            Ok(Some(records))
+        })?;
+        Ok(out.expect("f ran and returned Some"))
+    }
+
+    /// [`Store::update_logged`] where `f` may return `None`: nothing is
+    /// written, not even `updated_ms` (G1: a keeper whose ticket is gone
+    /// must not touch `state.json`).
+    pub fn update_logged_if(
+        &self,
+        now_ms: u64,
+        f: impl FnOnce(&mut State) -> anyhow::Result<Option<Vec<RunRecord>>>,
+    ) -> anyhow::Result<bool> {
         let _lock = self.lock()?;
         let mut state = self.load()?;
         state.budget = state.live_budget(now_ms);
-        let (out, records) = f(&mut state)?;
+        let Some(records) = f(&mut state)? else {
+            return Ok(false);
+        };
         state.updated_ms = now_ms;
         self.save(&state)?;
         if let Err(e) = crate::runlog::append(&self.dir, &records, now_ms) {
             eprintln!("muzzle: {e:#}; the run line is lost, the queue goes on");
         }
-        Ok(out)
+        Ok(true)
     }
 
     fn load(&self) -> anyhow::Result<State> {
@@ -784,5 +833,69 @@ mod tests {
             (Some(7.25), Some(4))
         );
         assert_eq!(serde_json::from_value::<RunRecord>(json).unwrap(), r);
+    }
+
+    #[test]
+    fn killed_variants_serialise_kebab_case() {
+        for (k, text) in [
+            (Killed::Holder, "holder"),
+            (Killed::OrphanIdle, "orphan-idle"),
+            (Killed::OrphanTtl, "orphan-ttl"),
+            (Killed::Dropped, "dropped"),
+            (Killed::SelfOverlap, "self-overlap"),
+        ] {
+            let v = serde_json::to_value(k).unwrap();
+            assert_eq!(v, text);
+            assert_eq!(serde_json::from_value::<Killed>(v).unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn orphan_fields_are_additive_in_a_holder() {
+        let h = State::default();
+        let mut s = h;
+        s.holders.push(Holder {
+            ticket: 1,
+            pid: 2,
+            start: 3,
+            pgid: None,
+            run_start_ms: 0,
+            waited_s: 0.0,
+            enforced: false,
+            kept: false,
+            enforced_reason: None,
+            scope: None,
+            probe: None,
+            admit_load1: None,
+            admit_held: None,
+            seen_ms: None,
+            orphan_since_ms: None,
+            orphan_active_ms: None,
+            orphan_sample_ms: None,
+            orphan_procs: None,
+            claim: Claim {
+                slots: 1,
+                class: Class::Normal,
+                agent: None,
+                rule: None,
+                cwd: "/".into(),
+                repo: None,
+                cfg: None,
+                pane: None,
+            },
+        });
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("orphan"), "{text}");
+        // A state written before the fields loads with them absent.
+        let back: State = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.holders[0].orphan_procs, None);
+        s.holders[0].orphan_procs = Some(vec![ProcCpu {
+            pid: 9,
+            start: 8,
+            cpu_ns: 7,
+        }]);
+        s.holders[0].orphan_since_ms = Some(5);
+        let back: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.holders[0], s.holders[0]);
     }
 }

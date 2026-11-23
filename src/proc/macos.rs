@@ -110,6 +110,47 @@ pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     }
 }
 
+/// libc marks its `mach_timebase_info` deprecated in favour of the `mach2`
+/// crate; declared here instead of adding a dependency.
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+unsafe extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+}
+
+/// `(start, cpu_ns)` of one live process from `PROC_PIDTASKINFO`; the
+/// totals are in mach absolute-time units, so `mach_timebase_info` converts
+/// them. `Err(errno)`, EPERM for another user's process.
+pub(super) fn member_cpu(pid: Pid) -> Result<(super::StartTime, u64), i32> {
+    let start = read_stat(pid)?.start;
+    let task: libc::proc_taskinfo = pidinfo(pid, libc::PROC_PIDTASKINFO)?;
+    let mut tb = MachTimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `tb` is a valid out-pointer.
+    unsafe { mach_timebase_info(&mut tb) };
+    let (numer, denom) = if tb.denom == 0 {
+        (1, 1)
+    } else {
+        (u128::from(tb.numer), u128::from(tb.denom))
+    };
+    let ticks = u128::from(task.pti_total_user.saturating_add(task.pti_total_system));
+    Ok((
+        start,
+        u64::try_from(ticks * numer / denom).unwrap_or(u64::MAX),
+    ))
+}
+
+/// The `comm` of a live process, from `PROC_PIDT_SHORTBSDINFO`.
+pub(super) fn comm(pid: Pid) -> Option<String> {
+    let short: libc::proc_bsdshortinfo = pidinfo(pid, libc::PROC_PIDT_SHORTBSDINFO).ok()?;
+    // SAFETY: pbsi_comm is a NUL-terminated C string within its array.
+    let c = unsafe { CStr::from_ptr(short.pbsi_comm.as_ptr()) };
+    Some(c.to_string_lossy().into_owned())
+}
+
 /// No subreapers on macOS: an orphan goes to launchd.
 pub(super) fn adopt_orphans() {}
 

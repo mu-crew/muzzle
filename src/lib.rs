@@ -11,6 +11,7 @@ pub mod admit;
 pub mod bench;
 pub mod cli;
 pub mod doctor;
+pub mod drop;
 pub mod exit;
 pub mod init;
 pub mod proc;

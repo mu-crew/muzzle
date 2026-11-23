@@ -21,6 +21,8 @@ pub(super) struct Job<'a> {
     pub(super) me: u32,
     pub(super) my_start: StartTime,
     pub(super) holder: Holder,
+    /// G1: the orphan thresholds, for the keeper's own idle/TTL check.
+    pub(super) orphan: crate::admit::AdmitConfig,
     pub(super) budget: Budget,
     pub(super) leader: bool,
     /// Set once the command is spawned. From then on only [`Job::release`]
@@ -251,7 +253,14 @@ impl Job<'_> {
         probe: &Option<ScopeProbe>,
     ) -> anyhow::Result<std::io::Result<std::process::Child>> {
         let mut spawned = None;
+        let mut dropped = false;
         let recorded = self.store.update(now_ms(), |s| {
+            // G4: `muzzle drop --force` before spawn must not leave a job
+            // running with no claim.
+            if s.holder_mut(self.ticket).is_none() {
+                dropped = true;
+                return Ok(());
+            }
             let c = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
@@ -286,9 +295,16 @@ impl Job<'_> {
             // the caller's error path frees it.
             Some(Err(e)) => recorded.map(|()| Err(e)),
             // The lock or the read failed: nothing ran, nothing was written.
-            None => Err(recorded
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("spawn skipped"))),
+            None => Err(recorded.err().unwrap_or_else(|| {
+                if dropped {
+                    anyhow::anyhow!(
+                        "claim {} was dropped before the command started; not running it",
+                        self.ticket
+                    )
+                } else {
+                    anyhow::anyhow!("spawn skipped")
+                }
+            })),
         }
     }
 

@@ -8,7 +8,8 @@ use super::job::{Ending, Job};
 use super::report::Measured;
 use super::scope::{Sampler, mb, scope_outcome};
 use super::spawn::{Launches, Target};
-use super::{Heartbeat, POLL, now_ms};
+use super::{POLL, ProcLive, now_ms};
+use crate::admit;
 use crate::proc::{self, Pid};
 use crate::state::Killed;
 
@@ -66,6 +67,24 @@ impl Job<'_> {
         Ok(())
     }
 
+    /// One locked pass: `admit` prunes by G1 (and refreshes `seen_ms`) and
+    /// reports whether this ticket is still held. A missing ticket writes
+    /// nothing. A failed write counts as held; the next tick retries.
+    fn keeper_tick(&self) -> bool {
+        let mut held = true;
+        let r = self.store.update_logged_if(now_ms(), |s| {
+            if s.holder_mut(self.ticket).is_none() {
+                held = false;
+                return Ok(None);
+            }
+            let out = admit::admit_with(std::mem::take(s), now_ms(), &ProcLive, self.orphan);
+            *s = out.state;
+            held = s.holder_mut(self.ticket).is_some();
+            Ok(Some(out.records))
+        });
+        r.is_err() || held
+    }
+
     /// The keeper's body. Writes one byte to `ready` once it holds the
     /// entry, then waits for the group to empty.
     #[allow(clippy::too_many_arguments)] // all the run handed across fork
@@ -83,24 +102,33 @@ impl Job<'_> {
         let Some(kstart) = proc::start_time(kpid as Pid) else {
             return;
         };
-        let owned = self.store.update(now_ms(), |s| {
-            Ok(s.holder_mut(self.ticket).map(|h| {
-                h.pid = kpid;
-                h.start = kstart;
-                h.kept = true;
-            }))
+        let owned = self.store.update_logged_if(now_ms(), |s| {
+            let Some(h) = s.holder_mut(self.ticket) else {
+                return Ok(None);
+            };
+            h.pid = kpid;
+            h.start = kstart;
+            h.kept = true;
+            // G1: the orphan clock starts at the handoff.
+            h.orphan_since_ms = Some(now_ms());
+            Ok(Some(Vec::new()))
         });
         // SAFETY: writing one byte to a pipe this process owns.
         unsafe {
             libc::write(ready, b"k".as_ptr().cast(), 1);
             libc::close(ready);
         }
-        if !matches!(owned, Ok(Some(()))) {
+        if !matches!(owned, Ok(true)) {
             return;
         }
-        let mut beat = Heartbeat::new(self.store, self.ticket);
         loop {
-            beat.beat();
+            // G1, G4: run the G1 idle/TTL check on every POLL, so an
+            // uncontended keeper releases idle orphans promptly. A ticket
+            // pruned or dropped is already settled: leave without a write,
+            // a signal or a second `runs.jsonl` line.
+            if !self.keeper_tick() {
+                return;
+            }
             let others = target.others();
             // L1: the group is listed anyway; every POLL, so a background
             // job's short-lived processes are undercounted more than a

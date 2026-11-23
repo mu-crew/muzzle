@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::{CgroupFigures, Pid, Stat};
+use super::{CgroupFigures, Pid, StartTime, Stat};
 
 /// `ru_maxrss` is in KiB on Linux.
 pub(super) const MAXRSS_UNIT: u64 = 1024;
@@ -16,14 +16,24 @@ pub(super) fn stat(pid: Pid) -> Option<Stat> {
     if pid <= 0 {
         return None;
     }
-    parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    parse_stat(&fs::read(format!("/proc/{pid}/stat")).ok()?)
 }
 
-fn parse_stat(text: &str) -> Option<Stat> {
-    // comm (field 2) is in parentheses and may itself hold spaces and ')',
-    // so split after the last ')'.
-    let rest = &text[text.rfind(')')? + 1..];
-    let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+/// The fields after comm, split after the last ')' (comm may hold spaces and
+/// ')'). Bytes, not `str`: the kernel writes comm raw, so a non-UTF-8 comm
+/// must not hide a live process. The numeric fields are ASCII.
+fn after_comm(text: &[u8]) -> Option<(usize, Vec<&str>)> {
+    let close = text.iter().rposition(|&b| b == b')')?;
+    let fields = text[close + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|f| !f.is_empty())
+        .map(|f| std::str::from_utf8(f).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some((close, fields))
+}
+
+fn parse_stat(text: &[u8]) -> Option<Stat> {
+    let (_, fields) = after_comm(text)?;
     // fields[0] is field 3 (state), so field n is fields[n - 3].
     if matches!(*fields.first()?, "Z" | "X" | "x") {
         return None;
@@ -33,6 +43,54 @@ fn parse_stat(text: &str) -> Option<Stat> {
         pgid: fields.get(2)?.parse().ok()?,
         start: fields.get(19)?.parse().ok()?,
     })
+}
+
+/// Parse `(comm, start, cpu_ns)` from one `/proc/<pid>/stat` read. Fields 14
+/// and 15 (utime, stime) are in clock ticks, which `ns_per_tick` converts.
+/// `None` for a zombie or a malformed line.
+fn parse_cpu(text: &[u8], ns_per_tick: u64) -> Option<(String, StartTime, u64)> {
+    let (close, fields) = after_comm(text)?;
+    let open = text.iter().position(|&b| b == b'(')?;
+    // Lossy: comm is only for diagnostics.
+    let comm = String::from_utf8_lossy(text.get(open + 1..close)?).into_owned();
+    if matches!(*fields.first()?, "Z" | "X" | "x") {
+        return None;
+    }
+    // fields[0] is field 3, so field n is fields[n - 3].
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let start = fields.get(19)?.parse().ok()?;
+    Some((
+        comm,
+        start,
+        utime.saturating_add(stime).saturating_mul(ns_per_tick),
+    ))
+}
+
+fn ns_per_tick() -> u64 {
+    // SAFETY: plain sysconf call.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz > 0 {
+        1_000_000_000 / hz as u64
+    } else {
+        10_000_000
+    }
+}
+
+/// `(start, cpu_ns)` of one live process; `Err(errno)` when unreadable.
+/// A process that is gone or a zombie reads as `ESRCH`.
+pub(super) fn member_cpu(pid: Pid) -> Result<(StartTime, u64), i32> {
+    let text = fs::read(format!("/proc/{pid}/stat"))
+        .map_err(|e| e.raw_os_error().unwrap_or(libc::ESRCH))?;
+    parse_cpu(&text, ns_per_tick())
+        .map(|(_, start, cpu)| (start, cpu))
+        .ok_or(libc::ESRCH)
+}
+
+/// The `comm` of a live process.
+pub(super) fn comm(pid: Pid) -> Option<String> {
+    let text = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    parse_cpu(&text, 1).map(|(comm, _, _)| comm)
 }
 
 pub(super) fn all_pids() -> io::Result<Vec<Pid>> {
@@ -66,6 +124,18 @@ pub(super) fn reap_adopted(keep: Pid) {
     }
 }
 
+fn is_member(read: io::Result<Vec<u8>>, pgid: Pid, getpgid: impl FnOnce() -> Pid) -> bool {
+    match read {
+        Ok(text) => parse_stat(&text).is_some_and(|s| s.pgid == pgid),
+        // hidepid or similar: the stat is unreadable but the process is live.
+        // getpgid needs no /proc access; list it so group_cpu sees the EPERM
+        // and answers None instead of a partial figure.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => getpgid() == pgid,
+        // A process can exit mid-scan; its stat read just fails.
+        Err(_) => false,
+    }
+}
+
 pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     // Kernel threads sit in pgid 0 (269 on linuxpc); no real group is <= 0.
     if pgid <= 0 {
@@ -77,8 +147,10 @@ pub(super) fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
             continue;
         };
-        // A process can exit mid-scan; its stat read just fails.
-        if stat(pid).is_some_and(|s| s.pgid == pgid) {
+        let read = fs::read(format!("/proc/{pid}/stat"));
+        // SAFETY: plain syscall.
+        let is_member = is_member(read, pgid, || unsafe { libc::getpgid(pid) });
+        if is_member {
             members.push(pid);
         }
     }
@@ -194,10 +266,21 @@ mod tests {
     use std::process::Child;
 
     #[test]
+    fn parse_cpu_reads_comm_start_and_utime_plus_stime() {
+        let text = "42 (a (b) c) S 7 9 9 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 1 0 123456 1 2";
+        // utime 5 + stime 6 = 11 ticks.
+        assert_eq!(
+            parse_cpu(text.as_bytes(), 10_000_000),
+            Some(("a (b) c".to_string(), 123456, 110_000_000))
+        );
+        assert_eq!(parse_cpu(text.replace(") S", ") Z").as_bytes(), 1), None);
+    }
+
+    #[test]
     fn parse_stat_handles_odd_comm() {
         let text = "42 (a) b) c) S 7 9 9 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 1 0 123456 1 2";
         assert_eq!(
-            parse_stat(text),
+            parse_stat(text.as_bytes()),
             Some(Stat {
                 ppid: 7,
                 pgid: 9,
@@ -207,10 +290,48 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_comm_still_parses() {
+        let text = b"42 (build ) \xff) S 7 9 9 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 1 0 123456 1 2";
+        assert_eq!(
+            parse_stat(text),
+            Some(Stat {
+                ppid: 7,
+                pgid: 9,
+                start: 123456
+            })
+        );
+        let (comm, start, cpu) = parse_cpu(text, 1).unwrap();
+        assert_eq!(
+            (comm.as_str(), start, cpu),
+            ("build ) \u{fffd}", 123456, 11)
+        );
+    }
+
+    #[test]
+    fn unreadable_stat_falls_back_to_getpgid() {
+        let eperm = || Err(io::Error::from_raw_os_error(libc::EPERM));
+        assert!(is_member(eperm(), 9, || 9));
+        assert!(!is_member(eperm(), 9, || 8));
+        assert!(is_member(
+            Err(io::Error::from_raw_os_error(libc::EACCES)),
+            9,
+            || 9
+        ));
+        // Gone mid-scan: not a member, and getpgid is not consulted.
+        let gone = Err(io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(!is_member(gone, 9, || unreachable!()));
+        let ok = |pgid: i32| {
+            Ok(format!("1 (x) S 1 {pgid} 1 0 -1 0 1 2 3 4 5 6 7 8 20 0 1 0 5 1 2").into_bytes())
+        };
+        assert!(is_member(ok(9), 9, || unreachable!()));
+        assert!(!is_member(ok(8), 9, || unreachable!()));
+    }
+
+    #[test]
     fn parse_stat_treats_zombie_as_gone() {
         let text = "42 (sh) Z 7 9 9 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 1 0 123456 1 2";
-        assert_eq!(parse_stat(text), None);
-        assert_eq!(parse_stat("garbage"), None);
+        assert_eq!(parse_stat(text.as_bytes()), None);
+        assert_eq!(parse_stat(b"garbage"), None);
     }
 
     #[test]

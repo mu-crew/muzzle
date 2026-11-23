@@ -19,11 +19,13 @@ wrap by hand, or a harness hook does it.
 
 | line (stderr, or appended to a pi result) | means | do |
 | --- | --- | --- |
-| `muzzle: queued 3/5, 14/14 slots held (worker-7 gate 6, …)` | waiting; printed every 30 s. Holders read `agent rule slots` | wait. The command has not started |
+| `muzzle: queued 3/5, 14/14 slots held (worker-7 gate 6, reviewer-1 js-test 4 [dead], worker-3 gate 4)` | waiting; printed every 30 s. Holders read `agent rule slots`; `[dead]` or `[kept]` marks an orphaned claim (below) | wait. The command has not started. If the `[dead]`/`[kept]` holder is yours, `muzzle drop` it |
 | `muzzle: admitted after 312s (6 slots)` | the wait ended, the command starts now | nothing |
 | `muzzle: waited 312s for 6 slots, ran 241s` | the run finished; the exit status is the command's own | judge the command by its output, not by the wait |
 | `muzzle: nested in an outer claim, ran 4s` | it ran inside another claim and took no slots | nothing |
-| `muzzle: gave up after 60s queued (position 2/4, --timeout)` | exit 75: `--timeout` expired before admission, nothing ran | retry later, or drop `--timeout` |
+| `muzzle: gave up after 60s queued (position 2/4, --timeout)` | exit 75: `--timeout`, `MUZZLE_QUEUE_TIMEOUT` or `queue_timeout` expired before admission, nothing ran; the holders are listed | retry later, or `--no-timeout` |
+| `muzzle: warning: same pane (%12 / reviewer-2) already holds 4 slots (ticket 42, …)` | you already hold a claim from this caller (same `TMUX_PANE`; without panes, same `MU_AGENT_NAME` and cwd or repo). The warning prints for non-nested calls, even if admitted at once; it is not a refusal | don't start a second heavy command behind your own claim |
+| `muzzle: refusing to queue behind own orphaned claim (ticket 42, …)` | exit 76: on the first pass the call needs more than is free, but would fit if your own `[dead]`/`[kept]` slots were freed; nothing ran. A live claim of yours alone never causes 76 | `muzzle drop 42` (or `muzzle drop --kill 42`), then retry; `--allow-concurrent` (or `allow_concurrent = true`) skips the refusal, not the warning |
 | `muzzle: killed while queued (position 2/4, waited 120s). Put timeout inside …` | something killed muzzle while it waited: usually a harness or `timeout` counting the wait | move the timeout (below); nothing ran |
 
 A long wait is the queue working, not a failure: other gates are using the
@@ -74,10 +76,48 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
   `muzzle run --rule cargo-test -- bash -c 'cargo build && cargo test'`.
   Don't move a gate into a script to skip the queue: the machine still
   pays for it, and every other agent's gate slows down.
-- A background launch (`(gate > log 2>&1 &)`) keeps its slots: `muzzle run`
-  returns at once and a keeper holds the claim until the job exits. Polling
-  the log is fine. A poll that repeats the gate's command line would claim a
-  second time, so poll with `tail` or `muzzle status`.
+- **Prefer foreground `muzzle run --run-timeout 900` over `&` or `nohup`.** A
+  background launch (`(gate > log 2>&1 &)`) keeps its slots: a keeper holds
+  the claim while the job runs, until it exits or the orphan idle/TTL release
+  frees it. Starting a second heavy command while it
+  runs may be admitted at once if slots are free; if short, it risks waiting behind your own claim or exit 76. Poll the
+  log with `tail` or `muzzle status`; a poll that repeats the gate's command
+  line claims a second time. A second non-nested heavy call from the same caller warns (a nested run does not); it may be admitted at once, waits if slots are short, and exits 76 only when your own orphaned claim is what blocks it.
+- **Never wrap `muzzle run` in a subshell or pipe** (`(muzzle run … | tail)`):
+  muzzle then isn't the group leader, and a timeout can SIGKILL it and
+  leave the job holding slots. Put the pipe inside
+  `bash -c '… | tail'` so muzzle leads and tears the job down on timeout.
+- A queue wait can be bounded by `MUZZLE_QUEUE_TIMEOUT` (seconds, or `none`)
+  or `queue_timeout` in the config; the env var wins over the config, and
+  `MUZZLE_QUEUE_TIMEOUT=none` or `--no-timeout` waits indefinitely despite a
+  configured limit. `--timeout S` overrides both. Expiry exits 75.
+  `--timeout 0` tries once: if admission succeeds the command runs; exit 75
+  means that immediate admission failed. No limit is built in; 900 is the
+  recommended setting for managed agents.
+
+## Stuck claims
+
+`muzzle status` shows `#ticket`, and `[dead-muzzle …]` or `[kept …]` with the
+surviving processes for an orphaned claim (muzzle died, or a keeper holds a
+leaked group). Muzzle may release the claim itself, **even while the
+processes still run**: after 120 s idle (`orphan_idle_s`, readable CPU
+samples under 1% of one core and no new members) or 600 s (`orphan_ttl`,
+whatever the CPU, busy or unreadable; with unreadable CPU only the TTL applies). Both are defaults, 0 disables each,
+and they are checked when someone admits or the keeper polls. Don't wait on
+it:
+
+```sh
+muzzle drop 42            # one orphaned claim; a live one exits 2 without --force
+muzzle drop --dead        # every dead/kept claim
+muzzle drop --agent NAME  # dead/kept claims of NAME
+muzzle drop --kill 42     # also SIGTERM, up to 5 s, SIGKILL verified survivors
+```
+
+Recover with `drop`, never by editing `state.json` or skipping muzzle. Plain
+`drop` frees the slots but leaves the processes running. `--kill` signals
+only current-user group members verified by pid and start time (not drop's
+own group); for a container scope it stops the scope if reachable, otherwise
+it releases the claim and warns the workload could not be stopped.
 
 ## Escape options
 
@@ -109,8 +149,8 @@ muzzle run --rule gate --run-timeout 900 -- contrib/fast-gate
 - A job that enters a container (`distrobox enter`, `podman exec`,
   `toolbox run`, `docker exec`) is admitted but not capped or measured, and
   is logged `enforced: false`. If the caller is killed, the job may keep
-  running in the container. Its slots stay held until it exits, so find
-  and kill it there.
+  running in the container. Its slots stay held until it exits or an orphan
+  idle/TTL release (above) frees them, so find and kill it there.
 
 ## The config
 

@@ -196,6 +196,15 @@ can kill the command before it starts. Use the flags:
 | `--timeout S` | while queued | muzzle gives up, nothing runs; exit 75 |
 
 Waiting has no limit by default, and a progress line prints every 30 s.
+A default limit comes from `MUZZLE_QUEUE_TIMEOUT` (seconds, or `none`) or
+`queue_timeout` in `config.toml` (G5). Precedence: `--timeout` /
+`--no-timeout` > the env var > the config. `MUZZLE_QUEUE_TIMEOUT=none` and
+`--no-timeout` disable a configured limit and wait indefinitely.
+`--timeout 0` tries once: if admission succeeds the command runs, and exit
+75 means the immediate admission failed. On expiry the holders
+print with their `[dead]`/`[kept]` tags. Managed agents should set
+`MUZZLE_QUEUE_TIMEOUT=900`; add `queue_timeout` to a config only after
+upgrading muzzle on that host (unknown keys exit 2).
 A waiter killed by SIGTERM or SIGINT prints `muzzle: killed while queued
 (…)`, which names the usual cause: a harness or outer `timeout` counting
 the wait.
@@ -215,7 +224,8 @@ run …` survives a hangup.
 | the command's own | passed through |
 | 128 + signal | the command was killed by a signal |
 | 124 | `--run-timeout` fired |
-| 75 | `--timeout` fired while queued |
+| 75 | `--timeout`, `MUZZLE_QUEUE_TIMEOUT` or `queue_timeout` fired while queued |
+| 76 | refused to queue behind the caller's own orphaned claim (G2) |
 | 2 | bad usage or config |
 | 125 | muzzle itself failed |
 
@@ -224,6 +234,11 @@ run …` survives a hangup.
 - `muzzle status` shows the budget, the holders (agent, rule, slots, run
   time, pid) and the queue. `--json` is a stable interface: fields are only
   ever added.
+- Each holder shows `#<ticket>`. An orphaned claim adds its state and
+  surviving processes: `[dead-muzzle 910s, pgid 49602: tmux(51234)]` (muzzle
+  died, group left) or `[kept …]` (a keeper holds it). `queued` lines tag
+  them `[dead]` or `[kept]`. `--json` adds `ticket`, `state` (`live`,
+  `kept`, `dead-muzzle`), `orphan_s` and `procs` (up to 8 `{pid, comm}`).
 - `status` marks a job **slow** when it has run past the p90 of its last
   50 clean runs in the same repo and rule (it needs 10 to have one), and
   for at least 60 s. A waiter is slow after 30 s in the queue. `--json`
@@ -307,6 +322,38 @@ It is a rough figure. The load average lags by about a minute, and on
 Linux it also counts processes waiting on disk I/O, so a busy disk raises
 it without any CPU use. Read it as a trend, not a measurement.
 
+### Orphaned claims and `muzzle drop`
+
+A claim is orphaned when muzzle died or a keeper holds it (D16). G1
+releases the slots, not the processes, when the group shows no activity
+(under 1% of a core, no new process) for `orphan_idle_s` (120; 0 disables),
+and after `orphan_ttl` (600; 0 disables) whatever the CPU. Both are
+defaults, checked on admit and keeper polls. Idle needs readable samples; if
+CPU is unreadable only the TTL applies. The processes keep running: a claim
+can release while its group is alive. Runs are logged
+`killed: "orphan-idle"` or `"orphan-ttl"`. A live muzzle is never touched.
+
+A non-nested same-caller `muzzle run` (a nested run, D17, is exempt) warns at once when its caller already holds a
+claim, even if it is admitted immediately. Same caller means equal
+`TMUX_PANE`; only if neither call has a pane, the same `MU_AGENT_NAME` with
+the same cwd or repo. Panes that differ never match. A live claim alone
+never causes exit 76. On the first admission pass, if the request needs more
+than is free but would fit with the caller's orphaned slots freed, it exits
+76 (`killed: "self-overlap"`). `--allow-concurrent` or
+`allow_concurrent = true` turns off that refusal, not the warning.
+
+```sh
+muzzle drop 42            # drop tickets; a live one exits 2 without --force
+muzzle drop --dead        # all dead-muzzle and kept claims (exit 0 if none)
+muzzle drop --agent NAME  # dead/kept claims of NAME
+muzzle drop --kill 42     # SIGTERM, up to 5 s, SIGKILL verified survivors first
+```
+
+`--kill` needs a spawned job and signals only current-user group members it
+verified by pid and start time, never drop's own group. For a container
+scope it stops the scope if reachable; otherwise it releases the claim and
+warns the workload could not be stopped. Drops log `killed: "dropped"`.
+
 ## Harnesses
 
 pi, Claude Code, Codex, Muse Code, cursor-agent, opencode and hand-wrapping:
@@ -345,7 +392,8 @@ allow rules, which would approve every wrapped string.
 ### Claims follow the process group
 
 A claim belongs to the process group the job runs in, and lasts until that
-group has no members left.
+group has no members left, unless an orphaned claim is released earlier by
+the G1 idle/TTL rule (the processes keep running).
 
 - **muzzle leads its group** when it is the only, or the last, simple
   command bash execs: pi's `bash -c 'muzzle run …'` execs muzzle on
@@ -360,8 +408,8 @@ group has no members left.
   interactive shell after another command, or spawned as a child by a
   wrapper. Put the pipe inside instead:
   `muzzle run --rule gate -- bash -c 'contrib/fast-gate 2>&1 | tail -50'`. It then starts the job in a new group of its own. **Killing the
-  caller may leave the job running**, still holding its slots until it
-  exits. The job runs in the terminal's background: Ctrl-C and Ctrl-Z
+  caller may leave the job running**, holding its slots until it exits
+  or the G1 orphan idle/TTL release frees the claim (the job is not signalled). The job runs in the terminal's background: Ctrl-C and Ctrl-Z
   reach the caller, and muzzle forwards Ctrl-C to the job. A job that
   reads the terminal or changes its settings can't run like this, so
   muzzle prints `muzzle: the command stopped waiting for the terminal…`,
@@ -380,10 +428,15 @@ group has no members left.
   background group, `timeout` ignores the stop and its SIGTERM never
   lands, so the slots stay held with no end. Give the job `< /dev/null`
   there, or use muzzle's own `--run-timeout`, which also sends SIGCONT.
+- **Avoid `&` and `(muzzle run … | tail)`.** A second heavy command
+  while a backgrounded run holds slots may be admitted at once if slots are
+  free; otherwise it risks waiting behind your own claim or exit 76; use foreground `--run-timeout S`. A subshell or pipe leaves
+  muzzle a non-leader that a timeout can SIGKILL, leaking the claim; put
+  the pipe inside `bash -c`.
 - **Background children stay in the group.** `(gate > log 2>&1 &)` keeps
   its slots: `muzzle run` returns at once with the top command's status,
-  and a detached keeper holds the claim until the group is empty, then
-  writes the run line. On macOS that run's CPU and memory are `null`.
+  and a detached keeper holds the claim until the group is empty or G1
+  releases it (idle or TTL), then writes the run line. On macOS that run's CPU and memory are `null`.
 
 ### `setsid` and daemons leave the group
 
@@ -460,9 +513,11 @@ A job started through `distrobox enter`, `podman exec`, `toolbox run` or
   suggests nothing from them.
 - **Cleanup on a kill does not:** when the caller's group is killed, the
   in-container job keeps running, because the container runtime starts it
-  in its own session. muzzle keeps the slots held until the job's scope
-  has no processes left, so the leaked job waits its turn instead of
-  overloading the machine. Kill it in the container to free them.
+  in its own session. muzzle keeps the slots held while the job's scope
+  has processes, so the leaked job waits its turn instead of
+  overloading the machine, until the G1 orphan release: idle (needs readable
+  host group CPU) or TTL (the only release without it). Kill it in the
+  container to free them sooner.
 - Run muzzle on the host, around `distrobox enter …`, not inside the
   container: inside, there is usually no systemd user manager, and its
   core and RAM reading can differ from the host's. The first reading is

@@ -11,7 +11,7 @@ use super::{class_str, now_ms};
 use crate::admit::{self, Class};
 use crate::cli::RunArgs;
 use crate::repo;
-use crate::state::{EnforcedReason, RunRecord};
+use crate::state::{Claim, EnforcedReason, Killed, RunRecord};
 
 /// The timing half of a `--report`.
 pub(super) struct Times {
@@ -78,6 +78,36 @@ pub(super) fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
+/// G2: the `runs.jsonl` line of a run refused behind its caller's own
+/// orphaned claim. It never waited or ran.
+pub(super) fn overlap_record(claim: &Claim, budget: Option<u32>) -> RunRecord {
+    RunRecord {
+        v: 1,
+        end: admit::rfc3339(now_ms()),
+        rule: claim.rule.clone(),
+        slots: claim.slots,
+        class: claim.class,
+        cfg: claim.cfg.clone(),
+        agent: claim.agent.clone(),
+        cwd: claim.cwd.clone(),
+        repo: claim.repo.clone(),
+        waited_s: 0.0,
+        ran_s: 0.0,
+        exit: Some(i32::from(crate::exit::SELF_OVERLAP)),
+        killed: Some(Killed::SelfOverlap),
+        cpu_s: None,
+        mem_peak_mb: None,
+        enforced: false,
+        nested: false,
+        kept: false,
+        budget,
+        enforced_reason: None,
+        load1: None,
+        held: None,
+        procs: None,
+    }
+}
+
 impl Job<'_> {
     fn record(
         &self,
@@ -139,19 +169,19 @@ impl Job<'_> {
         m: Measured,
         kept: bool,
     ) -> anyhow::Result<u64> {
-        self.store.update_logged(now_ms(), |s| {
-            let now = now_ms();
+        let mut released = now_ms();
+        self.store.update_logged_if(released, |s| {
+            // Capture the release timestamp under the state lock so
+            // `--report`'s `released_ms` never predates unlocking.
+            released = now_ms();
             let budget = s.budget.map(|b| b.budget.max(1));
             let rec = self.record(ran_s, ending, m, kept, budget);
-            // A keeper whose entry was pruned (it was SIGSTOPped, say) has
-            // already had its line written by the pruning waiter.
-            let lines = if s.remove(self.ticket) || !kept {
-                vec![rec]
-            } else {
-                Vec::new()
-            };
-            Ok((now, lines))
-        })
+            // G4: an entry already pruned (a SIGSTOPped keeper) or dropped
+            // (`muzzle drop --force`) had its terminal line written then,
+            // and the state is left untouched.
+            Ok(s.remove(self.ticket).then(|| vec![rec]))
+        })?;
+        Ok(released)
     }
 
     /// Spec §Architecture 4.6: `--report`, or the stderr line.
@@ -214,6 +244,7 @@ mod tests {
             me: 1,
             my_start: 1,
             holder: h,
+            orphan: crate::admit::AdmitConfig::default(),
             budget: Budget {
                 budget: 8,
                 cores: 10,

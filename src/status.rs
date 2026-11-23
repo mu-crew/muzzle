@@ -64,6 +64,53 @@ pub struct HolderView {
     /// past it and past [`SLOW_HOLDER_FLOOR_S`].
     pub typical_s: Option<u64>,
     pub slow: bool,
+    /// Added fields (0.3.3 G3): the holder's ticket, whether its muzzle is
+    /// alive, seconds orphaned (null when live), and up to [`MAX_PROCS`]
+    /// surviving members (empty when live, so healthy polls read no /proc).
+    pub ticket: u64,
+    pub state: HolderState,
+    pub orphan_s: Option<u64>,
+    pub procs: Vec<GroupProc>,
+}
+
+/// G3: a holder's standing. `kept` is a `--keep` claim whose muzzle exited;
+/// `dead-muzzle` is a claim held only by its group or scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HolderState {
+    Live,
+    Kept,
+    DeadMuzzle,
+}
+
+impl HolderState {
+    fn as_str(self) -> &'static str {
+        match self {
+            HolderState::Live => "live",
+            HolderState::Kept => "kept",
+            HolderState::DeadMuzzle => "dead-muzzle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GroupProc {
+    pub pid: u32,
+    pub comm: String,
+}
+
+/// G3: most members listed per holder.
+const MAX_PROCS: usize = 8;
+
+fn cap_procs(procs: Vec<(Pid, String)>) -> Vec<GroupProc> {
+    procs
+        .into_iter()
+        .take(MAX_PROCS)
+        .map(|(pid, comm)| GroupProc {
+            pid: pid as u32,
+            comm,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -141,21 +188,48 @@ pub fn view(
     let holders: Vec<HolderView> = state
         .holders
         .iter()
-        .map(|h| HolderView {
-            slots: h.claim.slots,
-            class: h.claim.class,
-            agent: h.claim.agent.clone(),
-            rule: h.claim.rule.clone(),
-            cwd: h.claim.cwd.clone(),
-            repo: h.claim.repo.clone(),
-            run_s: secs(h.run_start_ms),
-            pid: h.pid,
-            pgid: h.pgid,
-            pane: h.claim.pane.clone(),
-            enforced: h.enforced,
-            enforced_reason: h.enforced_reason,
-            typical_s: None,
-            slow: false,
+        .map(|h| {
+            let hstate = if h.kept {
+                HolderState::Kept
+            } else if !live.alive(h.pid, h.start) {
+                HolderState::DeadMuzzle
+            } else {
+                HolderState::Live
+            };
+            let orphaned = hstate != HolderState::Live;
+            let procs = match h.pgid {
+                Some(g) if orphaned => cap_procs(proc::group_procs(g as Pid)),
+                _ => Vec::new(),
+            };
+            HolderView {
+                ticket: h.ticket,
+                state: hstate,
+                // G1 clock fallback, projected in memory (state is not written):
+                // a legacy kept holder's clock starts at now, a legacy
+                // dead-muzzle holder's at its last sighting, else now.
+                orphan_s: orphaned.then(|| {
+                    secs(if hstate == HolderState::Kept {
+                        h.orphan_since_ms.unwrap_or(now_ms)
+                    } else {
+                        h.orphan_since_ms.or(h.seen_ms).unwrap_or(now_ms)
+                    })
+                }),
+                procs,
+                slots: h.claim.slots,
+                class: h.claim.class,
+                agent: h.claim.agent.clone(),
+                rule: h.claim.rule.clone(),
+                cwd: h.claim.cwd.clone(),
+                repo: h.claim.repo.clone(),
+                run_s: secs(h.run_start_ms),
+                pid: h.pid,
+                pgid: h.pgid,
+                pane: h.claim.pane.clone(),
+                enforced: h.enforced,
+                enforced_reason: h.enforced_reason,
+                typical_s: None,
+                slow: false,
+            }
         })
         .collect();
     let waiting: Vec<WaiterView> = admit::queue(&state)
@@ -240,8 +314,25 @@ pub fn render_text(s: &Status) -> String {
             } else {
                 ""
             };
+            let orphan = if h.state == HolderState::Live {
+                String::new()
+            } else {
+                let members: Vec<String> = h
+                    .procs
+                    .iter()
+                    .map(|p| format!("{}({})", p.comm, p.pid))
+                    .collect();
+                let pgid = h.pgid.map_or(String::new(), |g| format!("pgid {g}: "));
+                format!(
+                    "  [{} {}s, {pgid}{}]",
+                    h.state.as_str(),
+                    h.orphan_s.unwrap_or(0),
+                    members.join(", ")
+                )
+            };
             out.push_str(&format!(
-                "  {:>3} slots  {:<6}  {}  {}  {}s{}  pid {}  {}{container}\n",
+                "  #{}  {:>3} slots  {:<6}  {}  {}  {}s{}  pid {}{orphan}  {}{container}\n",
+                h.ticket,
                 h.slots,
                 class_str(h.class),
                 or(&h.agent, "?"),
@@ -387,6 +478,10 @@ mod tests {
             admit_load1: None,
             admit_held: None,
             seen_ms: None,
+            orphan_since_ms: None,
+            orphan_active_ms: None,
+            orphan_sample_ms: None,
+            orphan_procs: None,
             claim: claim(slots, Class::High, agent),
         }
     }
@@ -638,5 +733,100 @@ mod tests {
         assert_eq!((s.slow_holders, s.slow_waiters), (0, 0));
         assert!(!render_text(&s).contains("slow"), "{}", render_text(&s));
         assert!(text.contains("60s (slow)"), "{text}");
+    }
+
+    #[test]
+    fn g3_states_serialize_and_orphan_s_is_set_only_when_orphaned() {
+        let mut st = state();
+        st.holders.clear();
+        // pid 20 alive: live. pid 10 dead with a live group: dead-muzzle.
+        st.holders.push(holder(5, 20, Some(77), 1, "a"));
+        let mut dead = holder(6, 10, Some(10), 1, "b");
+        dead.orphan_since_ms = Some(3_000);
+        let mut kept = holder(7, 20, Some(77), 1, "c");
+        kept.kept = true;
+        kept.orphan_since_ms = Some(13_000);
+        st.holders.extend([dead, kept]);
+        let t = Table {
+            alive: [20].into(),
+            groups: [10, 77].into(),
+        };
+        let s = view(&st, 63_000, &t, READING, None, (2, 1.5), true);
+        let v = serde_json::to_value(&s).unwrap();
+        let h = &v["holders"];
+        assert_eq!(
+            (&h[0]["state"], &h[0]["ticket"]),
+            (&"live".into(), &5.into())
+        );
+        assert!(h[0]["orphan_s"].is_null());
+        assert_eq!(h[0]["procs"], serde_json::json!([]));
+        assert_eq!(h[1]["state"], "dead-muzzle");
+        assert_eq!(h[1]["orphan_s"], 60);
+        assert_eq!(h[2]["state"], "kept");
+        assert_eq!(h[2]["orphan_s"], 50);
+    }
+
+    #[test]
+    fn g1_legacy_orphan_clock_fallback_is_projected() {
+        let mut st = state();
+        st.holders.clear();
+        // Legacy dead-muzzle: no clocks at all -> 0s, not the job age.
+        let dead = holder(6, 10, Some(10), 1, "b");
+        // Legacy kept: seen_ms set but no orphan_since_ms -> 0s, not 10s.
+        let mut kept = holder(7, 20, Some(77), 1, "c");
+        kept.kept = true;
+        kept.seen_ms = Some(53_000);
+        // Legacy dead-muzzle with seen_ms: clock starts at the sighting.
+        let mut dead_seen = holder(8, 10, Some(10), 1, "d");
+        dead_seen.seen_ms = Some(33_000);
+        st.holders.extend([dead, kept, dead_seen]);
+        let t = Table {
+            alive: [20].into(),
+            groups: [10, 77].into(),
+        };
+        let s = view(&st, 63_000, &t, READING, None, (2, 1.5), true);
+        let v = serde_json::to_value(&s).unwrap();
+        let h = &v["holders"];
+        assert_eq!(h[0]["orphan_s"], 0);
+        assert_eq!(h[1]["orphan_s"], 0);
+        assert_eq!(h[2]["orphan_s"], 30);
+    }
+
+    #[test]
+    fn g3_procs_are_capped_at_eight() {
+        let many: Vec<(Pid, String)> = (1..=20).map(|p| (p as Pid, format!("c{p}"))).collect();
+        let c = cap_procs(many);
+        assert_eq!(c.len(), 8);
+        assert_eq!(
+            c[7],
+            GroupProc {
+                pid: 8,
+                comm: "c8".into()
+            }
+        );
+    }
+
+    #[test]
+    fn g3_human_line_shows_ticket_and_orphan_tag() {
+        let t = Table {
+            alive: [10].into(),
+            groups: [10].into(),
+        };
+        let mut s = view(&state(), 63_000, &t, READING, None, (2, 1.5), true);
+        assert!(render_text(&s).contains("  #1  "), "{}", render_text(&s));
+        assert!(!render_text(&s).contains('['), "{}", render_text(&s));
+        let h = &mut s.holders[0];
+        h.state = HolderState::DeadMuzzle;
+        h.orphan_s = Some(910);
+        h.pgid = Some(49602);
+        h.procs = vec![GroupProc {
+            pid: 51234,
+            comm: "tmux".into(),
+        }];
+        let text = render_text(&s);
+        assert!(
+            text.contains("[dead-muzzle 910s, pgid 49602: tmux(51234)]"),
+            "{text}"
+        );
     }
 }

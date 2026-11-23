@@ -28,6 +28,8 @@ pub enum Command {
     /// Answer a harness shell hook (PreToolUse, or cursor-agent's
     /// beforeShellExecution): payload on stdin, reply on stdout.
     Hook(HookArgs),
+    /// Drop wedged claims from the state (G4).
+    Drop(DropArgs),
     /// Show the budget, holders and queue.
     Status(StatusArgs),
     /// Check the budget, enforcement, state, config and harness setup.
@@ -71,9 +73,35 @@ pub struct RunArgs {
     /// wait ends.
     #[arg(long, value_name = "FILE")]
     pub status: Option<PathBuf>,
+    /// Queue even behind this caller's own orphaned claim (G2).
+    #[arg(long)]
+    pub allow_concurrent: bool,
+    /// Wait indefinitely, overriding a configured queue timeout (G5).
+    /// `--timeout 0` still means try once.
+    #[arg(long, conflicts_with = "timeout")]
+    pub no_timeout: bool,
     /// The command and its arguments.
     #[arg(last = true, required = true, value_name = "CMD")]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DropArgs {
+    /// Tickets of the holders to drop.
+    #[arg(value_name = "TICKET")]
+    pub tickets: Vec<u64>,
+    /// Drop every dead-muzzle and kept holder.
+    #[arg(long, conflicts_with = "tickets")]
+    pub dead: bool,
+    /// Drop the dead and kept holders of this agent.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["tickets", "dead"])]
+    pub agent: Option<String>,
+    /// Also SIGTERM, then after 5 s SIGKILL, the surviving members.
+    #[arg(long)]
+    pub kill: bool,
+    /// Allow dropping a healthy live holder.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -259,5 +287,47 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("muzzle").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn run_takes_allow_concurrent_and_no_timeout() {
+        let Command::Run(a) = parse(&["run", "--allow-concurrent", "--no-timeout", "--", "x"])
+            .unwrap()
+            .command
+        else {
+            panic!("not run");
+        };
+        assert!(a.allow_concurrent && a.no_timeout);
+        let Command::Run(a) = parse(&["run", "--", "x"]).unwrap().command else {
+            panic!("not run");
+        };
+        assert!(!a.allow_concurrent && !a.no_timeout);
+        assert!(parse(&["run", "--no-timeout", "--timeout", "0", "--", "x"]).is_err());
+    }
+
+    #[test]
+    fn drop_takes_tickets_or_a_selector() {
+        let Command::Drop(a) = parse(&["drop", "--kill", "--force", "4", "5"])
+            .unwrap()
+            .command
+        else {
+            panic!("not drop");
+        };
+        assert_eq!(a.tickets, [4, 5]);
+        assert!(a.kill && a.force && !a.dead && a.agent.is_none());
+        let Command::Drop(a) = parse(&["drop", "--dead"]).unwrap().command else {
+            panic!("not drop");
+        };
+        assert!(a.dead && a.tickets.is_empty());
+        let Command::Drop(a) = parse(&["drop", "--agent", "w1"]).unwrap().command else {
+            panic!("not drop");
+        };
+        assert_eq!(a.agent.as_deref(), Some("w1"));
+        assert!(parse(&["drop", "--dead", "3"]).is_err());
+        assert!(parse(&["drop", "x"]).is_err());
     }
 }

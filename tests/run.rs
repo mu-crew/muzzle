@@ -110,6 +110,9 @@ impl Env {
             .env_remove("MUZZLE_CLASS")
             .env_remove("MU_MANAGED_AGENT")
             .env_remove("MU_AGENT_NAME")
+            // G2 reads the pane as caller identity; G5 reads the timeout.
+            .env_remove("TMUX_PANE")
+            .env_remove("MUZZLE_QUEUE_TIMEOUT")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

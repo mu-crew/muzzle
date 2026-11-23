@@ -139,6 +139,51 @@ impl Liveness for ProcLive {
     fn scope_alive(&self, unit: &str, probe: Option<&ScopeProbe>) -> bool {
         scope_populated(unit, probe)
     }
+    fn group_cpu(&self, pgid: u32) -> Option<Vec<crate::state::ProcCpu>> {
+        proc::group_cpu(pgid as Pid)
+    }
+}
+
+/// G2: the holder and the new run come from the same caller: the same tmux
+/// pane, or, when neither has a pane, the same named agent in the same
+/// directory or repo. Anonymous callers (no pane, no agent) never match.
+/// Agent names alone can collide across workstreams, hence the pane first.
+fn same_caller(a: &Claim, b: &Claim) -> bool {
+    match (&a.pane, &b.pane) {
+        (Some(p), Some(q)) => p == q,
+        (None, None) => {
+            a.agent.is_some()
+                && a.agent == b.agent
+                && (a.cwd == b.cwd || (a.repo.is_some() && a.repo == b.repo))
+        }
+        _ => false,
+    }
+}
+
+/// G5: `--no-timeout`, then `--timeout`, then `MUZZLE_QUEUE_TIMEOUT`
+/// (`none` or `off` disables), then `queue_timeout` from the config, then
+/// wait indefinitely. `--timeout 0` stays "try once".
+fn queue_timeout(
+    args: &RunArgs,
+    env: Option<&str>,
+    config: Option<f64>,
+) -> Result<Option<Duration>, String> {
+    if args.no_timeout {
+        return Ok(None);
+    }
+    if args.timeout.is_some() {
+        return seconds("--timeout", args.timeout);
+    }
+    match env.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") => Ok(None),
+        Some(v) => {
+            let secs = v
+                .parse::<f64>()
+                .map_err(|_| format!("MUZZLE_QUEUE_TIMEOUT={v:?}: use seconds, none or off"))?;
+            seconds("MUZZLE_QUEUE_TIMEOUT", Some(secs))
+        }
+        None => seconds("queue_timeout", config),
+    }
 }
 
 /// D16a: the scope unit still has processes, answered as `probe` (written
@@ -346,7 +391,11 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         Err(m) => return bad_usage(m),
     };
     let (queue_timeout, run_timeout) = match (
-        seconds("--timeout", args.timeout),
+        queue_timeout(
+            args,
+            std::env::var("MUZZLE_QUEUE_TIMEOUT").ok().as_deref(),
+            config.queue_timeout,
+        ),
         seconds("--run-timeout", args.run_timeout),
     ) {
         (Ok(q), Ok(r)) => (q, r),
@@ -393,6 +442,7 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         cfg: Some(config.hash()),
         pane: std::env::var("TMUX_PANE").ok().filter(|s| !s.is_empty()),
     };
+    let report_claim = claim.clone();
     let enqueued = Instant::now();
     let ticket = store.update(now_ms(), |s| {
         s.resolve_budget(reading, config.slots);
@@ -403,11 +453,45 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         ticket,
         reading,
         config_slots: config.slots,
+        cfg: admit::AdmitConfig {
+            orphan_idle_s: config.orphan_idle_s,
+            orphan_ttl: config.orphan_ttl,
+        },
+        claim: report_claim.clone(),
+        allow_concurrent: args.allow_concurrent || config.allow_concurrent,
         status: std::cell::RefCell::new(osc::Sink::open(args.status.as_deref())),
     };
     let (holder, budget) = match q.wait(enqueued, queue_timeout)? {
         Turn::Admitted(h, b) => (*h, b),
-        Turn::Gave(code) => return Ok(ExitCode::from(code)),
+        Turn::Gave(code) => {
+            if code == exit::SELF_OVERLAP {
+                // So a harness renders a `muzzle:` line, not "No report".
+                if let Some(path) = &args.report {
+                    let t = report::Times {
+                        waited_s: 0.0,
+                        ran_s: 0.0,
+                        admitted_ms: None,
+                        released_ms: None,
+                    };
+                    let c = &report_claim;
+                    if let Err(e) = report::write_report(
+                        path,
+                        &t,
+                        Some(c.slots),
+                        Some(c.class),
+                        c.rule.as_deref(),
+                        c.repo.as_deref(),
+                        code,
+                        false,
+                        None,
+                        false,
+                    ) {
+                        eprintln!("muzzle: {e:#}");
+                    }
+                }
+            }
+            return Ok(ExitCode::from(code));
+        }
     };
 
     let mut job = Job {
@@ -416,6 +500,10 @@ pub fn main(args: &RunArgs) -> anyhow::Result<ExitCode> {
         me,
         my_start,
         holder,
+        orphan: admit::AdmitConfig {
+            orphan_idle_s: config.orphan_idle_s,
+            orphan_ttl: config.orphan_ttl,
+        },
         budget,
         leader,
         spawned: false,
@@ -483,6 +571,10 @@ mod tests {
             admit_load1: None,
             admit_held: None,
             seen_ms: None,
+            orphan_since_ms: None,
+            orphan_active_ms: None,
+            orphan_sample_ms: None,
+            orphan_procs: None,
             claim: Claim {
                 slots: 2,
                 class: Class::Normal,
@@ -638,6 +730,60 @@ mod tests {
         for bad in [1e30, f64::MAX, f64::INFINITY, f64::NAN, -1.0] {
             assert!(seconds("--run-timeout", Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    fn claim(pane: Option<&str>, agent: Option<&str>, cwd: &str, repo: Option<&str>) -> Claim {
+        let mut c = holder(1, 1, 1, None).claim;
+        c.pane = pane.map(String::from);
+        c.agent = agent.map(String::from);
+        c.cwd = cwd.into();
+        c.repo = repo.map(String::from);
+        c
+    }
+
+    #[test]
+    fn same_caller_rules() {
+        let a = claim(Some("%1"), Some("x"), "/a", None);
+        assert!(same_caller(&a, &claim(Some("%1"), Some("y"), "/b", None)));
+        // Different panes never match, even with the same agent name.
+        assert!(!same_caller(&a, &claim(Some("%2"), Some("x"), "/a", None)));
+        // A pane on one side only is not the same caller.
+        assert!(!same_caller(&a, &claim(None, Some("x"), "/a", None)));
+        let n = claim(None, Some("x"), "/a", Some("/r"));
+        assert!(same_caller(&n, &claim(None, Some("x"), "/a", None)));
+        assert!(same_caller(&n, &claim(None, Some("x"), "/b", Some("/r"))));
+        assert!(!same_caller(&n, &claim(None, Some("x"), "/b", None)));
+        assert!(!same_caller(&n, &claim(None, Some("z"), "/a", None)));
+        let anon = claim(None, None, "/a", None);
+        assert!(!same_caller(&anon, &anon));
+    }
+
+    #[test]
+    fn queue_timeout_precedence() {
+        use clap::Parser;
+        let parse = |a: &[&str]| {
+            let mut v = vec!["muzzle", "run"];
+            v.extend(a);
+            v.extend(["--", "x"]);
+            match cli::Cli::parse_from(v).command {
+                cli::Command::Run(r) => r,
+                _ => unreachable!(),
+            }
+        };
+        let secs = |s: u64| Ok(Some(Duration::from_secs(s)));
+        let none = parse(&[]);
+        assert_eq!(queue_timeout(&none, None, None), Ok(None));
+        assert_eq!(queue_timeout(&none, None, Some(30.0)), secs(30));
+        assert_eq!(queue_timeout(&none, Some("20"), Some(30.0)), secs(20));
+        assert_eq!(queue_timeout(&none, Some("none"), Some(30.0)), Ok(None));
+        assert_eq!(queue_timeout(&none, Some("OFF"), Some(30.0)), Ok(None));
+        assert!(queue_timeout(&none, Some("soon"), None).is_err());
+        let flag = parse(&["--timeout", "5"]);
+        assert_eq!(queue_timeout(&flag, Some("20"), Some(30.0)), secs(5));
+        let zero = parse(&["--timeout", "0"]);
+        assert_eq!(queue_timeout(&zero, Some("20"), None), secs(0));
+        let no = parse(&["--no-timeout"]);
+        assert_eq!(queue_timeout(&no, Some("20"), Some(30.0)), Ok(None));
     }
 
     #[test]

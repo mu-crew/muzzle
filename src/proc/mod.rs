@@ -87,6 +87,35 @@ pub fn group_members(pgid: Pid) -> io::Result<Vec<Pid>> {
     imp::group_members(pgid)
 }
 
+/// Per-member CPU (user + system, ns) of the live members of `pgid`, for
+/// the orphan idle check (G1). `None` when any member can't be read for
+/// lack of permission: a partial figure would read as idle.
+pub fn group_cpu(pgid: Pid) -> Option<Vec<crate::state::ProcCpu>> {
+    let mut out = Vec::new();
+    for pid in group_members(pgid).ok()? {
+        match imp::member_cpu(pid) {
+            Ok((start, cpu_ns)) => out.push(crate::state::ProcCpu {
+                pid: pid as u32,
+                start,
+                cpu_ns,
+            }),
+            Err(libc::EPERM | libc::EACCES) => return None,
+            // Exited between the listing and the read.
+            Err(_) => {}
+        }
+    }
+    Some(out)
+}
+
+/// `(pid, comm)` of the live members of `pgid`, for diagnostics (G2, G3).
+pub fn group_procs(pgid: Pid) -> Vec<(Pid, String)> {
+    group_members(pgid)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| imp::comm(p).map(|c| (p, c)))
+        .collect()
+}
+
 /// The parent chain of `pid`, nearest first, excluding `pid` itself and
 /// stopping after pid 1 or when a parent can't be read (D17). Ancestry stops
 /// at a container boundary; that's what `MUZZLE_HOLD` is for.
@@ -489,6 +518,51 @@ mod tests {
         kill(sh, libc::SIGKILL);
         child.wait().unwrap();
         assert!(eventually(|| ancestors(sleep).is_empty()));
+    }
+
+    #[test]
+    fn group_cpu_and_procs_see_this_process_group() {
+        let me = std::process::id() as Pid;
+        let g = pgid(me).unwrap();
+        let cpu = group_cpu(g).expect("own group is readable");
+        let mine = cpu
+            .iter()
+            .find(|c| c.pid == me as u32)
+            .expect("self listed");
+        assert_eq!(mine.start, start_time(me).unwrap());
+        let procs = group_procs(g);
+        assert!(procs.iter().any(|(p, c)| *p == me && !c.is_empty()));
+    }
+
+    #[test]
+    fn group_cpu_counts_cpu_time_of_a_busy_member() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done; sleep 30",
+            ])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let g = pid_of(&child);
+        assert!(eventually(|| {
+            group_cpu(g)
+                .and_then(|v| v.iter().find(|c| c.pid == g as u32).map(|c| c.cpu_ns))
+                .is_some_and(|ns| ns > 0)
+        }));
+        assert!(group_procs(g).iter().any(|(p, _)| *p == g));
+        kill(-g, libc::SIGKILL);
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn group_cpu_and_procs_of_an_empty_group_are_empty() {
+        let mut child = spawn("exit 0");
+        let pid = pid_of(&child);
+        child.wait().unwrap();
+        assert_eq!(group_cpu(pid), Some(vec![]));
+        assert!(group_procs(pid).is_empty());
+        assert_eq!(group_cpu(0), Some(vec![]));
     }
 
     #[test]

@@ -31,6 +31,13 @@ pub const DEFAULT_RESERVE: u32 = 2;
 /// to 23% (docs/eval/2026-11-muzzle-v1.md §2b, §2c). The default gives 22
 /// on 16 cores, between the two.
 pub const DEFAULT_OVERCOMMIT: f64 = 1.5;
+
+/// G1: seconds an orphaned group may show no activity before its claim is
+/// released; 0 disables.
+pub const DEFAULT_ORPHAN_IDLE_S: u64 = 120;
+/// G1: seconds after which an orphaned claim is released regardless; 0
+/// disables.
+pub const DEFAULT_ORPHAN_TTL: u64 = 600;
 /// D7a: `overcommit` must lie in this range.
 pub const OVERCOMMIT_RANGE: std::ops::RangeInclusive<f64> = 1.0..=4.0;
 
@@ -115,6 +122,14 @@ pub struct Config {
     pub overcommit: f64,
     /// An explicit budget, overriding `reserve` and `overcommit` (D7, D17a).
     pub slots: Option<u32>,
+    /// G1 (default 120, 0 disables).
+    pub orphan_idle_s: u64,
+    /// G1 (default 600, 0 disables).
+    pub orphan_ttl: u64,
+    /// G5: default queue wait in seconds; `None` waits indefinitely.
+    pub queue_timeout: Option<f64>,
+    /// G2: queue behind an own orphaned claim instead of exiting 76.
+    pub allow_concurrent: bool,
     /// The global list, root then includes merged in (P5).
     pub global: Vec<Entry>,
     /// Sorted by canonical key, so an ancestor comes before its
@@ -189,6 +204,10 @@ impl Config {
             reserve: DEFAULT_RESERVE,
             overcommit: DEFAULT_OVERCOMMIT,
             slots: None,
+            orphan_idle_s: DEFAULT_ORPHAN_IDLE_S,
+            orphan_ttl: DEFAULT_ORPHAN_TTL,
+            queue_timeout: None,
+            allow_concurrent: false,
             global: Vec::new(),
             tables: Vec::new(),
             includes: Vec::new(),
@@ -231,6 +250,18 @@ impl Config {
         }
         if layer.slots.is_some() {
             self.slots = layer.slots;
+        }
+        if let Some(v) = layer.orphan_idle_s {
+            self.orphan_idle_s = v;
+        }
+        if let Some(v) = layer.orphan_ttl {
+            self.orphan_ttl = v;
+        }
+        if layer.queue_timeout.is_some() {
+            self.queue_timeout = layer.queue_timeout;
+        }
+        if let Some(v) = layer.allow_concurrent {
+            self.allow_concurrent = v;
         }
         for e in layer.global {
             // B2: a global entry with no matcher reweights a rule an
@@ -358,6 +389,49 @@ pub(super) mod tests {
             invalid(&format!("overcommit = {bad}"), "overcommit");
         }
         assert!(parse("overcommit = 4.0").is_ok());
+    }
+
+    #[test]
+    fn guard_keys_default_when_absent() {
+        let c = parse("").unwrap();
+        assert_eq!(c.orphan_idle_s, 120);
+        assert_eq!(c.orphan_ttl, 600);
+        assert_eq!(c.queue_timeout, None);
+        assert!(!c.allow_concurrent);
+    }
+
+    #[test]
+    fn guard_keys_parse() {
+        let c = parse(
+            "orphan_idle_s = 0\norphan_ttl = 30\nqueue_timeout = 900\nallow_concurrent = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.orphan_idle_s, 0);
+        assert_eq!(c.orphan_ttl, 30);
+        assert_eq!(c.queue_timeout, Some(900.0));
+        assert!(c.allow_concurrent);
+        assert_eq!(
+            parse("queue_timeout = 0\n").unwrap().queue_timeout,
+            Some(0.0)
+        );
+        assert_eq!(
+            parse("queue_timeout = 1.5\n").unwrap().queue_timeout,
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn guard_keys_reject_a_bad_queue_timeout() {
+        invalid("queue_timeout = -1\n", "queue_timeout");
+        invalid("queue_timeout = inf\n", "queue_timeout");
+        invalid("queue_timeout = nan\n", "queue_timeout");
+    }
+
+    #[test]
+    fn guard_keys_do_not_change_the_hash() {
+        let base = "reserve = 2\n";
+        let with = "reserve = 2\norphan_idle_s = 5\norphan_ttl = 6\nqueue_timeout = 7\nallow_concurrent = true\n";
+        assert_eq!(parse(base).unwrap().hash(), parse(with).unwrap().hash());
     }
 
     #[test]

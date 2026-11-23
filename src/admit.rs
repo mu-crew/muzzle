@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{Holder, Killed, RunRecord, ScopeProbe, State, Waiter};
+use crate::state::{Holder, Killed, ProcCpu, RunRecord, ScopeProbe, State, Waiter};
 
 /// D10. Declaration order is queue order: `High` sorts first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -29,6 +29,11 @@ pub trait Liveness {
     /// `probe` (recorded at spawn) says to look. Unanswerable is `true`:
     /// freeing slots a live container job uses is the worse error (D16a).
     fn scope_alive(&self, unit: &str, probe: Option<&ScopeProbe>) -> bool;
+    /// G1: per-member CPU of the group, `None` when unreadable (EPERM).
+    /// The default reads nothing, so only the TTL applies.
+    fn group_cpu(&self, _pgid: u32) -> Option<Vec<crate::state::ProcCpu>> {
+        None
+    }
 }
 
 /// The holder's claim is still in use: its muzzle (or keeper) lives, its
@@ -41,6 +46,90 @@ pub fn holds(h: &Holder, live: &impl Liveness) -> bool {
         || h.scope
             .as_deref()
             .is_some_and(|u| live.scope_alive(u, h.probe.as_ref()))
+}
+
+/// G1: the orphan thresholds, in seconds; `0` disables each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmitConfig {
+    pub orphan_idle_s: u64,
+    pub orphan_ttl: u64,
+}
+
+impl Default for AdmitConfig {
+    fn default() -> Self {
+        Self {
+            orphan_idle_s: 120,
+            orphan_ttl: 600,
+        }
+    }
+}
+
+/// G1: a keeper holds the entry, or muzzle itself died and only its
+/// group or scope remains. A healthy foreground holder is never orphaned.
+pub fn is_orphaned(h: &Holder, live: &impl Liveness) -> bool {
+    h.kept || !live.alive(h.pid, h.start)
+}
+
+/// Most members one snapshot keeps, so `state.json` stays small.
+const MAX_ORPHAN_PROCS: usize = 64;
+
+/// G1 for one orphaned holder: advances its clocks and snapshot, and says
+/// whether to prune it. Frees the claim only; nothing is signalled.
+fn orphan_check(
+    h: &mut Holder,
+    now_ms: u64,
+    live: &impl Liveness,
+    cfg: AdmitConfig,
+) -> Option<Killed> {
+    let since = *h.orphan_since_ms.get_or_insert(if h.kept {
+        now_ms
+    } else {
+        h.seen_ms.unwrap_or(now_ms).min(now_ms)
+    });
+    if cfg.orphan_ttl > 0 && now_ms.saturating_sub(since) >= cfg.orphan_ttl.saturating_mul(1000) {
+        return Some(Killed::OrphanTtl);
+    }
+    // No pgid or unreadable CPU: idle release can't fire, only the TTL.
+    // An empty sample means no host member (a scope-only claim, D16a): the
+    // container's CPU is invisible, so it counts as unreadable, not idle.
+    let cur = h
+        .pgid
+        .and_then(|g| live.group_cpu(g))
+        .filter(|c| !c.is_empty())?;
+    let first = |h: &mut Holder, cur: Vec<ProcCpu>| {
+        h.orphan_active_ms = Some(now_ms);
+        h.orphan_sample_ms = Some(now_ms);
+        h.orphan_procs = Some(cur.into_iter().take(MAX_ORPHAN_PROCS).collect());
+    };
+    match (h.orphan_sample_ms, h.orphan_procs.as_ref()) {
+        (Some(prev_ms), Some(prev)) if cur.len() <= MAX_ORPHAN_PROCS => {
+            let dt_ms = now_ms.saturating_sub(prev_ms);
+            if dt_ms > 0 {
+                // Per-member deltas, so a busy member exiting between polls
+                // can't make a busy survivor look idle.
+                let mut spawned = false;
+                let mut dcpu = 0u64;
+                for c in &cur {
+                    match prev.iter().find(|p| (p.pid, p.start) == (c.pid, c.start)) {
+                        Some(p) => dcpu = dcpu.saturating_add(c.cpu_ns.saturating_sub(p.cpu_ns)),
+                        None => spawned = true,
+                    }
+                }
+                // At least 1% of one core over the interval.
+                let active = spawned || dcpu.saturating_mul(100) >= dt_ms.saturating_mul(1_000_000);
+                if active {
+                    h.orphan_active_ms = Some(now_ms);
+                }
+                h.orphan_sample_ms = Some(now_ms);
+                h.orphan_procs = Some(cur);
+            }
+        }
+        _ => first(h, cur),
+    }
+    let active = h.orphan_active_ms.unwrap_or(now_ms);
+    (cfg.orphan_idle_s > 0
+        && now_ms.saturating_sub(active) >= cfg.orphan_idle_s.saturating_mul(1000))
+    .then_some(Killed::OrphanIdle)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +159,17 @@ pub fn queue(state: &State) -> Vec<&Waiter> {
 /// Prunes dead entries, then admits from the head of the queue while it
 /// fits. Uses the budget stored in the state (D17a); with none stored yet it
 /// prunes but admits nothing, since the caller resolves the budget first.
-pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
+pub fn admit(state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
+    admit_with(state, now_ms, live, AdmitConfig::default())
+}
+
+/// `admit` with explicit G1 thresholds.
+pub fn admit_with(
+    mut state: State,
+    now_ms: u64,
+    live: &impl Liveness,
+    cfg: AdmitConfig,
+) -> Outcome {
     // Pruning: a waiter whose process is gone, recycled pid included.
     state.waiters.retain(|w| live.alive(w.pid, w.start));
 
@@ -82,9 +181,22 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
     // 1-core host or a small container with a big reserve (D17a). Floor it once here so `cap` and `free` agree and a
     // job still runs alone (D8) instead of every waiter blocking forever.
     let budget = state.budget.map(|b| b.budget.max(1));
-    let (kept, dead): (Vec<Holder>, Vec<Holder>) = std::mem::take(&mut state.holders)
-        .into_iter()
-        .partition(|h| holds(h, live));
+    // G1 runs before the `seen_ms` refresh below: a dead muzzle's orphan
+    // clock starts at its last sighting.
+    let mut kept = Vec::new();
+    let mut dead: Vec<(Holder, Killed)> = Vec::new();
+    for mut h in std::mem::take(&mut state.holders) {
+        if !holds(&h, live) {
+            dead.push((h, Killed::Holder));
+        } else if let Some(k) = is_orphaned(&h, live)
+            .then(|| orphan_check(&mut h, now_ms, live, cfg))
+            .flatten()
+        {
+            dead.push((h, k));
+        } else {
+            kept.push(h);
+        }
+    }
     state.holders = kept;
     // ran_s_lag_followup: a holder still in use now is seen now, so the
     // record of a later prune ends here rather than at that prune.
@@ -93,7 +205,7 @@ pub fn admit(mut state: State, now_ms: u64, live: &impl Liveness) -> Outcome {
     }
     let records = dead
         .into_iter()
-        .map(|h| holder_record(h, now_ms, budget))
+        .map(|(h, k)| holder_record(h, now_ms, budget, k))
         .collect();
 
     let mut admitted = Vec::new();
@@ -143,6 +255,10 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
         admit_load1: None,
         admit_held: None,
         seen_ms: Some(now_ms),
+        orphan_since_ms: None,
+        orphan_active_ms: None,
+        orphan_sample_ms: None,
+        orphan_procs: None,
         claim,
     }
 }
@@ -160,10 +276,12 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
 /// `seen_ms` ends at the prune, as before. These lines carry `killed:
 /// "holder"`, so `report` never counts them as clean (D30): they feed the
 /// machine figures (D41) but not run p50/p90 or suggestions.
-fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
+fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>, killed: Killed) -> RunRecord {
+    // max then min, not clamp: a wall clock that went back leaves now_ms
+    // below run_start_ms, and clamp panics on inverted bounds.
     let end_ms = h
         .seen_ms
-        .map_or(now_ms, |s| s.clamp(h.run_start_ms, now_ms));
+        .map_or(now_ms, |s| s.max(h.run_start_ms).min(now_ms));
     RunRecord {
         v: 1,
         end: rfc3339(end_ms),
@@ -177,7 +295,7 @@ fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>) -> RunRecord {
         waited_s: h.waited_s,
         ran_s: end_ms.saturating_sub(h.run_start_ms) as f64 / 1000.0,
         exit: None,
-        killed: Some(Killed::Holder),
+        killed: Some(killed),
         cpu_s: None,
         mem_peak_mb: None,
         enforced: h.enforced,
@@ -213,6 +331,7 @@ mod tests {
         procs: HashSet<(u32, u64)>,
         groups: HashSet<u32>,
         scopes: HashSet<String>,
+        cpu: std::collections::HashMap<u32, Vec<ProcCpu>>,
     }
 
     impl Liveness for Table {
@@ -224,6 +343,9 @@ mod tests {
         }
         fn scope_alive(&self, unit: &str, _probe: Option<&ScopeProbe>) -> bool {
             self.scopes.contains(unit)
+        }
+        fn group_cpu(&self, pgid: u32) -> Option<Vec<ProcCpu>> {
+            self.cpu.get(&pgid).cloned()
         }
     }
 
@@ -717,5 +839,169 @@ mod tests {
         }
         assert_eq!(done + s.holders.len() as u64, 60);
         assert!(s.waiters.is_empty());
+    }
+
+    fn pc(pid: u32, cpu_ns: u64) -> ProcCpu {
+        ProcCpu {
+            pid,
+            start: 1,
+            cpu_ns,
+        }
+    }
+
+    /// One admitted holder (ticket pgid 101) with its muzzle dead and a
+    /// live group reporting `cpu`; returns the state and the table.
+    fn orphan(cpu: Vec<ProcCpu>) -> (State, Table) {
+        let mut s = state(2);
+        push(&mut s, 2, Class::Normal, 0);
+        let s = run(s, 0).state;
+        let mut live = all_alive(&s);
+        live.procs.clear();
+        live.cpu.insert(s.holders[0].pgid.unwrap(), cpu);
+        (s, live)
+    }
+
+    fn set_cpu(live: &mut Table, s: &State, cpu: Vec<ProcCpu>) {
+        live.cpu.insert(s.holders[0].pgid.unwrap(), cpu);
+    }
+
+    #[test]
+    fn g1_live_muzzle_with_zero_cpu_is_never_pruned() {
+        let mut s = state(2);
+        push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 0).state;
+        let mut live = all_alive(&s);
+        live.cpu.insert(s.holders[0].pgid.unwrap(), vec![pc(7, 0)]);
+        for now in [1_000, 200_000, 10_000_000] {
+            s = admit(s, now, &live).state;
+        }
+        assert_eq!(s.holders.len(), 1);
+        assert_eq!(s.holders[0].orphan_since_ms, None);
+    }
+
+    #[test]
+    fn g1_orphan_with_no_cpu_is_pruned_as_orphan_idle() {
+        let (s, live) = orphan(vec![pc(7, 5)]);
+        let s = admit(s, 1_000, &live).state;
+        assert_eq!(s.holders[0].orphan_active_ms, Some(1_000));
+        let s = admit(s, 60_000, &live).state;
+        assert_eq!(s.holders.len(), 1, "within the grace");
+        let out = admit(s, 121_000, &live);
+        assert!(out.state.holders.is_empty());
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanIdle));
+        // A kept holder is orphaned too.
+        let (mut s, mut live) = orphan(vec![pc(7, 5)]);
+        s.holders[0].kept = true;
+        s.holders[0].pid = 9_999;
+        live.procs.insert((9_999, s.holders[0].start));
+        let s = admit(s, 1_000, &live).state;
+        assert_eq!(s.holders[0].orphan_since_ms, Some(1_000));
+        let out = admit(s, 121_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanIdle));
+    }
+
+    #[test]
+    fn g1_member_exit_with_busy_survivor_is_active() {
+        // 41 s total -> 31 s total, but the survivor burned 100% of a core.
+        let (s, mut live) = orphan(vec![pc(7, 30_000_000_000), pc(8, 11_000_000_000)]);
+        let s = admit(s, 0, &live).state;
+        set_cpu(&mut live, &s, vec![pc(7, 31_000_000_000)]);
+        // One second later the survivor used 1 s of CPU: active. Aggregate
+        // deltas (31 - 41 < 0) would call it idle and prune at a 1 s limit.
+        let cfg = AdmitConfig {
+            orphan_idle_s: 1,
+            orphan_ttl: 0,
+        };
+        let s = admit_with(s, 1_000, &live, cfg).state;
+        assert_eq!(s.holders.len(), 1);
+        assert_eq!(s.holders[0].orphan_active_ms, Some(1_000));
+        // Over 100 s the survivor burned 100 s: a full core.
+        set_cpu(&mut live, &s, vec![pc(7, 130_000_000_000)]);
+        let s = admit(s, 100_000, &live).state;
+        let set = vec![pc(7, 230_000_000_000)];
+        set_cpu(&mut live, &s, set);
+        let s = admit(s, 200_000, &live).state;
+        assert_eq!(s.holders.len(), 1);
+        assert_eq!(s.holders[0].orphan_active_ms, Some(200_000));
+    }
+
+    #[test]
+    fn g1_same_millisecond_poll_does_not_advance_activity() {
+        let (s, mut live) = orphan(vec![pc(7, 0)]);
+        let s = admit(s, 1_000, &live).state;
+        set_cpu(&mut live, &s, vec![pc(7, 999_000_000_000), pc(9, 1)]);
+        let s = admit(s, 1_000, &live).state;
+        assert_eq!(s.holders[0].orphan_active_ms, Some(1_000));
+        assert_eq!(s.holders[0].orphan_procs, Some(vec![pc(7, 0)]));
+        // The idle clock still runs from the first activity.
+        set_cpu(&mut live, &s, vec![pc(7, 0)]);
+        let out = admit(s, 121_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanIdle));
+    }
+
+    #[test]
+    fn g1_busy_orphan_survives_idle_but_not_ttl() {
+        let (mut s, mut live) = orphan(vec![pc(7, 0)]);
+        let mut cpu = 0u64;
+        let mut now = 0;
+        s = admit(s, now, &live).state;
+        while now < 590_000 {
+            now += 10_000;
+            cpu += 5_000_000_000; // 50% of a core
+            set_cpu(&mut live, &s, vec![pc(7, cpu)]);
+            s = admit(s, now, &live).state;
+            assert_eq!(s.holders.len(), 1, "at {now}");
+        }
+        cpu += 5_000_000_000;
+        set_cpu(&mut live, &s, vec![pc(7, cpu)]);
+        let out = admit(s, 600_000, &live);
+        assert!(out.state.holders.is_empty());
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
+    }
+
+    #[test]
+    fn g1_unreadable_cpu_still_starts_the_clock_and_hits_ttl() {
+        let mut s = state(2);
+        push(&mut s, 2, Class::Normal, 0);
+        let mut s = run(s, 1_000).state;
+        s.holders[0].seen_ms = Some(100_000);
+        let live = Table {
+            groups: s.holders.iter().filter_map(|h| h.pgid).collect(),
+            ..Table::default()
+        };
+        let s = admit(s, 200_000, &live).state;
+        assert_eq!(s.holders[0].orphan_since_ms, Some(100_000));
+        assert_eq!(s.holders[0].orphan_active_ms, None);
+        // Idle release never fires without CPU; TTL does, 600 s after since.
+        let s = admit(s, 699_000, &live).state;
+        assert_eq!(s.holders.len(), 1);
+        let out = admit(s, 700_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
+    }
+
+    #[test]
+    fn g1_empty_group_sample_with_live_scope_uses_only_ttl() {
+        let (mut s, mut live) = orphan(vec![]);
+        s.holders[0].scope = Some("u.scope".into());
+        live.groups.clear();
+        live.scopes.insert("u.scope".into());
+        let s = admit(s, 1_000, &live).state;
+        let s = admit(s, 200_000, &live).state;
+        assert_eq!(s.holders.len(), 1);
+        assert_eq!(s.holders[0].orphan_active_ms, None);
+        let out = admit(s, 601_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
+    }
+
+    #[test]
+    fn g1_ttl_prune_with_clock_before_run_start_does_not_panic() {
+        let (mut s, live) = orphan(vec![pc(7, 5)]);
+        s.holders[0].run_start_ms = 1_000_000;
+        s.holders[0].seen_ms = Some(1_000_000);
+        let s = admit(s, 1_000, &live).state;
+        assert_eq!(s.holders[0].orphan_since_ms, Some(1_000));
+        let out = admit(s, 601_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
+        assert_eq!(out.records[0].ran_s, 0.0);
     }
 }

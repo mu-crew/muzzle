@@ -5,19 +5,25 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 
 use super::osc::{Sink, queued_msg};
-use super::report::round3;
+use super::report::{overlap_record, round3};
 use super::scope::{reset_failed, scope_loaded, stop_unit, unit_name};
-use super::{POLL, PROGRESS, ProcLive, TICK, now_ms, scope_known_empty, take_signal};
-use crate::admit;
+use super::{POLL, PROGRESS, ProcLive, TICK, now_ms, same_caller, scope_known_empty, take_signal};
+use crate::admit::{self, AdmitConfig, Liveness};
 use crate::exit;
-use crate::proc;
-use crate::state::{Budget, Holder, State, Store};
+use crate::proc::{self, Pid};
+use crate::state::{Budget, Claim, Holder, State, Store};
 
 pub(super) struct Queue<'a> {
     pub(super) store: &'a Store,
     pub(super) ticket: u64,
     pub(super) reading: Budget,
     pub(super) config_slots: Option<u32>,
+    /// G1: the orphan thresholds handed to `admit_with`.
+    pub(super) cfg: AdmitConfig,
+    /// This run's own claim, for G2's same-caller test and its run record.
+    pub(super) claim: Claim,
+    /// G2 opt-out: `--allow-concurrent` or `allow_concurrent = true`.
+    pub(super) allow_concurrent: bool,
     /// Program status while queued (OSC 7501), cleared when the wait ends.
     pub(super) status: std::cell::RefCell<Sink>,
 }
@@ -37,13 +43,20 @@ pub(super) enum Poll {
         /// The program status message, from the same locked read.
         msg: String,
     },
+    /// G2: blocked by the caller's own orphaned claim; the waiter is gone.
+    Refused,
 }
 
 impl Queue<'_> {
     /// One locked `admit` pass: prune, admit, append any `killed: "holder"`
     /// lines, and report where this ticket stands.
-    fn poll(&self) -> anyhow::Result<Poll> {
+    ///
+    /// `first` is the t=0 pass, where G2 warns about and may refuse on the
+    /// caller's own claims.
+    fn poll(&self, first: bool) -> anyhow::Result<Poll> {
         let mut pruned = Vec::new();
+        let mut notes = Vec::new();
+        let mut refused = None;
         // f-append-wedge, f-dup-prune-line: the pruned holders' lines are
         // appended after the save, and a failed append only warns.
         let poll = self.store.update_logged(now_ms(), |s| {
@@ -61,14 +74,25 @@ impl Queue<'_> {
                 .filter(|h| !h.kept && proc::systemd_user_reachable())
                 .map(|h| (h.ticket, unit_name(h.pid, h.start, h.ticket)))
                 .collect();
-            let out = admit::admit(std::mem::take(s), now, &ProcLive);
+            let out = admit::admit_with(std::mem::take(s), now, &ProcLive, self.cfg);
             *s = out.state;
             pruned = scopes
                 .into_iter()
                 .filter(|(t, _)| !s.holders.iter().any(|h| h.ticket == *t))
                 .map(|(_, unit)| format!("{unit}.scope"))
                 .collect();
-            let records = out.records;
+            let mut records = out.records;
+            let b = budget.budget.max(1);
+            if first {
+                let (warning, refusal) = self.same_caller_check(s, now, b);
+                notes.extend(warning);
+                if let Some(msg) = refusal {
+                    s.remove(self.ticket);
+                    records.push(overlap_record(&self.claim, Some(b)));
+                    refused = Some(msg);
+                    return Ok((Poll::Refused, records));
+                }
+            }
             if let Some(h) = stamp_admission(s, self.ticket, || proc::loadavg().map(|l| l[0])) {
                 return Ok((Poll::Admitted(Box::new(h.clone()), budget), records));
             }
@@ -78,11 +102,10 @@ impl Queue<'_> {
                 // one is running; a hand-edited state file is the only way.
                 bail!("ticket {} vanished from the queue", self.ticket);
             };
-            let b = budget.budget.max(1);
             let waiting = Poll::Waiting {
                 position: at + 1,
                 of: queue.len(),
-                line: progress_line(s, at + 1, queue.len()),
+                line: progress_line(s, at + 1, queue.len(), &ProcLive),
                 msg: queued_msg(
                     at + 1,
                     queue.len(),
@@ -101,6 +124,13 @@ impl Queue<'_> {
         // notification ever comes (3-4/10 on linuxpc, systemd 259; 75 such
         // units had piled up). Stop it, but only if empty: a populated scope
         // holds a job that outlived its group.
+        for note in &notes {
+            eprintln!("{note}");
+        }
+        if let Some(msg) = &refused {
+            self.status.borrow_mut().clear();
+            eprintln!("{msg}");
+        }
         for unit in &pruned {
             if scope_loaded(unit) && scope_known_empty(unit) {
                 stop_unit(unit);
@@ -122,7 +152,7 @@ impl Queue<'_> {
         let mut last_msg = String::new();
         loop {
             polls += 1;
-            let (position, of) = match self.poll()? {
+            let (position, of) = match self.poll(polls == 1)? {
                 Poll::Admitted(h, budget) => {
                     self.status.borrow_mut().clear();
                     if polls > 1 {
@@ -134,6 +164,7 @@ impl Queue<'_> {
                     }
                     return Ok(Turn::Admitted(h, budget));
                 }
+                Poll::Refused => return Ok(Turn::Gave(exit::SELF_OVERLAP)),
                 Poll::Waiting {
                     position,
                     of,
@@ -159,16 +190,97 @@ impl Queue<'_> {
                     return Ok(Turn::Gave(128u8.saturating_add(sig as u8)));
                 }
                 if timeout.is_some_and(|t| enqueued.elapsed() >= t) {
+                    // G5: say who holds the slots, read before the ticket goes.
+                    let holders = self
+                        .store
+                        .read()
+                        .ok()
+                        .map(|s| holder_list(&s, usize::MAX, &ProcLive));
                     self.leave()?;
                     eprintln!(
                         "muzzle: gave up after {:.0}s queued (position {position}/{of}, --timeout)",
                         enqueued.elapsed().as_secs_f64()
                     );
+                    if let Some(h) = holders.filter(|h| !h.is_empty()) {
+                        eprintln!("muzzle: held by {h}");
+                    }
                     return Ok(Turn::Gave(exit::QUEUE_TIMEOUT));
                 }
                 std::thread::sleep(TICK);
             }
         }
+    }
+
+    /// G2, under the lock after `admit`: the t=0 warning when the same
+    /// caller already holds claims, and the refusal text when this run was
+    /// not admitted and the caller's own orphaned claims are part of what
+    /// blocks it (`need > free && need <= free + own_orphan_held`).
+    fn same_caller_check(
+        &self,
+        s: &State,
+        now: u64,
+        budget: u32,
+    ) -> (Option<String>, Option<String>) {
+        let mine: Vec<&Holder> = s
+            .holders
+            .iter()
+            .filter(|h| h.ticket != self.ticket && same_caller(&h.claim, &self.claim))
+            .collect();
+        if mine.is_empty() {
+            return (None, None);
+        }
+        let slots: u32 = mine.iter().map(|h| h.claim.slots).sum();
+        let who = match (&self.claim.pane, &self.claim.agent) {
+            (Some(p), Some(a)) => format!("same pane ({p} / {a})"),
+            (Some(p), None) => format!("same pane ({p})"),
+            (None, a) => format!("same agent ({})", a.as_deref().unwrap_or("?")),
+        };
+        let details: Vec<String> = mine
+            .iter()
+            .map(|h| {
+                format!(
+                    "ticket {}, {} slots, {}",
+                    h.ticket,
+                    h.claim.slots,
+                    holder_state(h, now, &ProcLive)
+                )
+            })
+            .collect();
+        let warning = format!(
+            "muzzle: warning: {who} already holds {slots} slots ({})",
+            details.join("; ")
+        );
+        let admitted = s.holders.iter().any(|h| h.ticket == self.ticket);
+        let orphans: Vec<&&Holder> = mine
+            .iter()
+            .filter(|h| admit::is_orphaned(h, &ProcLive))
+            .collect();
+        let own: u32 = orphans.iter().map(|h| h.claim.slots).sum();
+        let need = admit::cap(self.claim.slots, budget);
+        let free = budget.saturating_sub(s.held());
+        if admitted || self.allow_concurrent || own == 0 || need <= free || need > free + own {
+            return (Some(warning), None);
+        }
+        let named: Vec<String> = orphans
+            .iter()
+            .map(|h| {
+                format!(
+                    "ticket {}, {} slots, {}",
+                    h.ticket,
+                    h.claim.slots,
+                    holder_state(h, now, &ProcLive)
+                )
+            })
+            .collect();
+        let tickets: Vec<String> = orphans.iter().map(|h| h.ticket.to_string()).collect();
+        let refusal = format!(
+            "muzzle: refusing to queue behind own orphaned claim ({}); run `muzzle drop {}` \
+             (or `muzzle drop --kill {}`) or pass --allow-concurrent",
+            named.join("; "),
+            tickets.join(" "),
+            tickets.join(" ")
+        );
+        (Some(warning), Some(refusal))
     }
 
     /// Drop the ticket, whether still waiting or admitted since the last
@@ -208,32 +320,70 @@ pub(super) fn killed_while_queued(position: usize, of: usize, waited: Duration) 
     )
 }
 
-/// Spec §stderr lines: `muzzle: queued 3/5, 14/14 slots held (worker-7 gate
-/// 6, orch cargo-test 2, …)`. Each holder reads `<agent> <rule> <slots>`,
-/// with `?` and `-` for a missing agent or rule.
-pub(super) fn progress_line(s: &State, position: usize, of: usize) -> String {
-    const SHOWN: usize = 4;
-    let budget = s.budget.map_or(0, |b| b.budget.max(1));
+/// G2, G3: `live`, `kept` or `dead-muzzle`, how long it has been so, and for
+/// an orphan up to 3 surviving group members as `comm(pid)`.
+fn holder_state(h: &Holder, now: u64, live: &impl Liveness) -> String {
+    let orphan = admit::is_orphaned(h, live);
+    let tag = match (h.kept, orphan) {
+        (true, _) => "kept",
+        (false, true) => "dead-muzzle",
+        (false, false) => "live",
+    };
+    let since = if orphan {
+        h.orphan_since_ms.unwrap_or(h.run_start_ms)
+    } else {
+        h.run_start_ms
+    };
+    let mut out = format!("{tag} {}s", now.saturating_sub(since) / 1000);
+    if let (true, Some(g)) = (orphan, h.pgid) {
+        let procs: Vec<String> = proc::group_procs(g as Pid)
+            .into_iter()
+            .take(3)
+            .map(|(p, c)| format!("{c}({p})"))
+            .collect();
+        out.push_str(&format!(", pgid {g}"));
+        if !procs.is_empty() {
+            out.push_str(&format!(": {}", procs.join(", ")));
+        }
+    }
+    out
+}
+
+/// `<agent> <rule> <slots>` per holder, `?` and `-` for a missing agent or
+/// rule, tagged `[kept]` or `[dead]` when orphaned (G3). Shows `shown`, then `…`.
+fn holder_list(s: &State, shown: usize, live: &impl Liveness) -> String {
     let mut held: Vec<String> = s
         .holders
         .iter()
-        .take(SHOWN)
+        .take(shown)
         .map(|h| {
+            let tag = match (h.kept, admit::is_orphaned(h, live)) {
+                (true, _) => " [kept]",
+                (false, true) => " [dead]",
+                (false, false) => "",
+            };
             format!(
-                "{} {} {}",
+                "{} {} {}{tag}",
                 h.claim.agent.as_deref().unwrap_or("?"),
                 h.claim.rule.as_deref().unwrap_or("-"),
                 h.claim.slots
             )
         })
         .collect();
-    if s.holders.len() > SHOWN {
+    if s.holders.len() > shown {
         held.push("…".into());
     }
+    held.join(", ")
+}
+
+/// Spec §stderr lines: `muzzle: queued 3/5, 14/14 slots held (worker-7 gate
+/// 6, orch cargo-test 2, …)`, with G3's `[dead]`/`[kept]` tags.
+pub(super) fn progress_line(s: &State, position: usize, of: usize, live: &impl Liveness) -> String {
+    let budget = s.budget.map_or(0, |b| b.budget.max(1));
     format!(
         "muzzle: queued {position}/{of}, {}/{budget} slots held ({})",
         s.held(),
-        held.join(", ")
+        holder_list(s, 4, live)
     )
 }
 
@@ -242,6 +392,31 @@ mod tests {
     use super::*;
     use crate::run::tests::holder;
     use crate::state::Budget;
+
+    struct Alive;
+    impl Liveness for Alive {
+        fn alive(&self, _: u32, _: u64) -> bool {
+            true
+        }
+        fn group_alive(&self, _: u32) -> bool {
+            true
+        }
+        fn scope_alive(&self, _: &str, _: Option<&crate::state::ScopeProbe>) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn progress_line_tags_orphans() {
+        let mut s = State::default();
+        let mut a = holder(1, 1, 1, None);
+        a.kept = true;
+        s.holders = vec![a, holder(2, 2, 2, None)];
+        assert_eq!(
+            progress_line(&s, 1, 1, &Alive),
+            "muzzle: queued 1/1, 4/0 slots held (worker-7 gate 2 [kept], worker-7 gate 2)"
+        );
+    }
 
     #[test]
     fn progress_line_matches_the_spec_shape() {
@@ -260,13 +435,13 @@ mod tests {
         b.claim.rule = Some("cargo-test".into());
         s.holders = vec![a, b];
         assert_eq!(
-            progress_line(&s, 3, 5),
+            progress_line(&s, 3, 5, &Alive),
             "muzzle: queued 3/5, 8/14 slots held (worker-7 gate 6, ? cargo-test 2)"
         );
         for t in 3..8 {
             s.holders.push(holder(t, t as u32, 1, None));
         }
-        assert!(progress_line(&s, 1, 1).ends_with(", …)"));
+        assert!(progress_line(&s, 1, 1, &Alive).ends_with(", …)"));
     }
 
     #[test]

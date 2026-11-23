@@ -20,6 +20,11 @@ struct RawFile {
     /// D7a. serde's f64 also takes a TOML integer, so `overcommit = 2` works.
     overcommit: Option<f64>,
     slots: Option<u32>,
+    // 0.3.3 guard keys; not part of `config::hash`.
+    orphan_idle_s: Option<u64>,
+    orphan_ttl: Option<u64>,
+    queue_timeout: Option<f64>,
+    allow_concurrent: Option<bool>,
     #[serde(default)]
     rule: Vec<RawRule>,
     // File order, so the B1 message names the spellings as written. toml
@@ -93,6 +98,10 @@ pub(super) struct Layer {
     pub(super) reserve: Option<u32>,
     pub(super) overcommit: Option<f64>,
     pub(super) slots: Option<u32>,
+    pub(super) orphan_idle_s: Option<u64>,
+    pub(super) orphan_ttl: Option<u64>,
+    pub(super) queue_timeout: Option<f64>,
+    pub(super) allow_concurrent: Option<bool>,
     pub(super) global: Vec<Entry>,
     pub(super) tables: Vec<(String, PathBuf, Vec<Entry>)>,
 }
@@ -117,6 +126,13 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
             "overcommit = {o}: must be from {} to {}",
             super::OVERCOMMIT_RANGE.start(),
             super::OVERCOMMIT_RANGE.end()
+        )));
+    }
+    if let Some(q) = raw.queue_timeout
+        && !(q.is_finite() && q >= 0.0)
+    {
+        return Err(invalid(format!(
+            "queue_timeout = {q}: must be a finite number of seconds, 0 or more"
         )));
     }
     let entries = |raw: Vec<RawRule>, scope: &str| -> Result<Vec<Entry>, ConfigError> {
@@ -220,6 +236,10 @@ pub(super) fn parse_layer(text: &str, path: &Path) -> Result<Layer, ConfigError>
         reserve: raw.reserve,
         overcommit: raw.overcommit,
         slots: raw.slots,
+        orphan_idle_s: raw.orphan_idle_s,
+        orphan_ttl: raw.orphan_ttl,
+        queue_timeout: raw.queue_timeout,
+        allow_concurrent: raw.allow_concurrent,
         global,
         tables,
     })

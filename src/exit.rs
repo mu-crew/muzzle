@@ -9,6 +9,9 @@ pub const RUN_TIMEOUT: u8 = 124;
 /// later"). Not 3: mu 4.2.0 reads exit 3 from a host template as a hand-back
 /// to the human, and mule uses 3 for "no control master".
 pub const QUEUE_TIMEOUT: u8 = 75;
+/// G2: refused to queue behind the caller's own orphaned claim: 76,
+/// sysexits' EX_PROTOCOL.
+pub const SELF_OVERLAP: u8 = 76;
 /// Bad usage or config. clap exits 2 for bad usage on its own.
 pub const USAGE: u8 = 2;
 /// muzzle itself failed.
