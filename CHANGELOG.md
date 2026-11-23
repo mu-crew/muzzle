@@ -1,10 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 Added:
 
-- **Different-PID deadlock & orphan-hold guards** (0.3.3 spec G1–G6):
+- **Different-PID deadlock & orphan-hold guards** (G1–G6):
   - **Orphan idle release & TTL (G1):** orphaned (`kept` or dead-muzzle)
     holders release their slot claim without killing surviving processes
     after `orphan_idle_s` (default 120 s) below 1% of one core with no new
@@ -27,8 +27,6 @@ Added:
     disables; `--timeout 0` keeps try-once behaviour).
   - **Docs & skill (G6):** updated `README.md`, `docs/usage.md`, and
     `npm/muzzle/skills/muzzle/SKILL.md`.
-
-## 0.3.2
 
 Fixed:
 
