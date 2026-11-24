@@ -264,25 +264,35 @@ fn into_holder(w: Waiter, now_ms: u64, budget: u32) -> Holder {
     }
 }
 
-/// The muzzle or keeper was killed and a waiter pruned the entry: no exit
+/// The muzzle or keeper was killed and a waiter pruned the entry, or G1
+/// released a still-held orphan (`OrphanIdle` / `OrphanTtl`): no exit
 /// status and no CPU figures, since nobody was left to collect them.
 ///
-/// The run ends when the claim was last seen in use (`seen_ms`), never
-/// after this prune (ran_s_lag_followup: smoke_final recorded 75 s for a
-/// 20 s job when the end was the prune). The true end lies between the two,
-/// so ran_s is short by at most the gap between sightings: one poll (250
-/// ms) while anyone waits, else the owner's heartbeat (`run::HEARTBEAT`).
-/// A muzzle SIGKILLed with its job left running has no heartbeat, so with
-/// no waiter either the gap runs to the prune. A state file from before
-/// `seen_ms` ends at the prune, as before. These lines carry `killed:
-/// "holder"`, so `report` never counts them as clean (D30): they feed the
-/// machine figures (D41) but not run p50/p90 or suggestions.
+/// For `Killed::Holder`, the run ends when the claim was last seen in use
+/// (`seen_ms`), never after this prune (ran_s_lag_followup: smoke_final
+/// recorded 75 s for a 20 s job when the end was the prune). The true end
+/// lies between the two, so ran_s is short by at most the gap between
+/// sightings: one poll (250 ms) while anyone waits, else the owner's
+/// heartbeat (`run::HEARTBEAT`). A muzzle SIGKILLed with its job left
+/// running has no heartbeat, so with no waiter either the gap runs to the
+/// prune. A state file from before `seen_ms` ends at the prune, as before.
+///
+/// For `Killed::OrphanIdle` and `Killed::OrphanTtl`, the claim is still
+/// held at the moment G1 prunes it, so the run ends at `now_ms` even if no
+/// `admit` refreshed `seen_ms` in the interim (for example across sleep).
+///
+/// These lines carry `killed: Some(...)`, so `report` never counts them as
+/// clean (D30): they feed the machine figures (D41) but not run p50/p90 or
+/// suggestions.
 fn holder_record(h: Holder, now_ms: u64, budget: Option<u32>, killed: Killed) -> RunRecord {
     // max then min, not clamp: a wall clock that went back leaves now_ms
     // below run_start_ms, and clamp panics on inverted bounds.
-    let end_ms = h
-        .seen_ms
-        .map_or(now_ms, |s| s.max(h.run_start_ms).min(now_ms));
+    let end_ms = match killed {
+        Killed::OrphanIdle | Killed::OrphanTtl => now_ms,
+        _ => h
+            .seen_ms
+            .map_or(now_ms, |s| s.max(h.run_start_ms).min(now_ms)),
+    };
     RunRecord {
         v: 1,
         end: rfc3339(end_ms),
@@ -1004,5 +1014,33 @@ mod tests {
         let out = admit(s, 601_000, &live);
         assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
         assert_eq!(out.records[0].ran_s, 0.0);
+    }
+
+    #[test]
+    fn g1_orphan_prunes_end_at_now_not_stale_seen_ms() {
+        // OrphanTtl: claim started at 1s, last seen at 35s, no polls until TTL
+        // fires at 635s (e.g. across sleep). The claim was held until 635s, so
+        // end and ran_s reflect 635s rather than the stale 35s sighting.
+        let (mut s, live) = orphan(vec![pc(7, 5)]);
+        s.holders[0].run_start_ms = 1_000;
+        s.holders[0].seen_ms = Some(35_000);
+        s.holders[0].orphan_since_ms = Some(35_000);
+        let out = admit(s, 635_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanTtl));
+        assert_eq!(out.records[0].ran_s, 634.0);
+        assert_eq!(out.records[0].end, rfc3339(635_000));
+
+        // OrphanIdle: same when idle release fires after a gap in sightings.
+        let (mut s, live) = orphan(vec![pc(7, 5)]);
+        s.holders[0].run_start_ms = 1_000;
+        s.holders[0].seen_ms = Some(10_000);
+        s.holders[0].orphan_since_ms = Some(10_000);
+        s.holders[0].orphan_active_ms = Some(10_000);
+        s.holders[0].orphan_sample_ms = Some(10_000);
+        s.holders[0].orphan_procs = Some(vec![pc(7, 5)]);
+        let out = admit(s, 130_000, &live);
+        assert_eq!(out.records[0].killed, Some(Killed::OrphanIdle));
+        assert_eq!(out.records[0].ran_s, 129.0);
+        assert_eq!(out.records[0].end, rfc3339(130_000));
     }
 }
