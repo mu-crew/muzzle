@@ -28,6 +28,10 @@ muzzle report --since 7d                              # what each rule used, and
 Rules in `~/.config/muzzle/config.toml` map commands to slots; the first
 run writes a template. In pi the extension wraps matching bash calls for
 you; Claude Code, Codex, Muse Code and cursor-agent use a hook.
+`MUZZLE_PI=0` turns the pi extension off. It also stands aside while another
+extension runs pi's bash tool on a remote host (mule's `--mule`): that
+extension sets `globalThis[Symbol.for("@mu-crew/remote-bash")]` to its name
+and wraps with the remote host's muzzle.
 
 ```toml
 include = ["machine.toml"]     # per-machine file, merged after this one if it exists

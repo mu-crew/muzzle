@@ -12,8 +12,9 @@ many. A command that matches no rule runs at once, unclaimed. There is no
 daemon: every waiting muzzle re-checks the queue itself. `muzzle <cmd> --help`
 is the reference for flags; this skill covers what the help can't tell you.
 
-In pi, the muzzle extension wraps matching bash calls for you. Elsewhere you
-wrap by hand, or a harness hook does it.
+In pi, the muzzle extension wraps matching bash calls for you (not in a
+`pi --mule` workspace, where mule wraps with the remote muzzle; `MUZZLE_PI=0`
+turns it off). Elsewhere you wrap by hand, or a harness hook does it.
 
 ## Reading muzzle's lines
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Fixed:
+
+- **pi extension under mule.** In a `pi --mule` workspace the extension no
+  longer wraps bash with the local binary, which made every remote call exit
+  127. mule sets the `Symbol.for("@mu-crew/remote-bash")` marker on
+  `globalThis` and wraps with the remote host's muzzle itself. New:
+  `MUZZLE_PI=0` turns the extension off.
+
 ## 0.4.0
 
 Added:

@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { beforeEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createExtension, findMuzzle, forCall, forwardsStatus, GUARD, reportName, resultLine } from "../extension/muzzle.ts";
+import { createExtension, findMuzzle, forCall, forwardsStatus, GUARD, REMOTE_BASH, reportName, resultLine } from "../extension/muzzle.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = process.env.MUZZLE_BIN ?? resolve(here, "../../../target/debug/muzzle");
@@ -32,8 +32,10 @@ beforeEach(() => {
   // A test run under muzzle must not read as nested.
   delete process.env.MUZZLE_HOLD;
   delete process.env.MUZZLE_CLASS;
+  delete process.env.MUZZLE_PI;
   // Each test loads a fresh copy; the process-wide claim would refuse it.
   delete (globalThis as any)[GUARD];
+  delete (globalThis as any)[REMOTE_BASH];
 });
 
 type Handler = (event: any, ctx: any) => any;
@@ -102,6 +104,34 @@ test("a non-matching call is left alone", async () => {
   const input = { command: "ls -la", timeout: 30 };
   await emit("tool_call", call("c", input));
   assert.deepEqual(input, { command: "ls -la", timeout: 30 });
+});
+
+test("a remote bash (another extension holds REMOTE_BASH) is left alone, so it can wrap on its host", async () => {
+  // The marker is read at call time: the remote extension may load after this one.
+  const { emit, status } = load();
+  (globalThis as any)[Symbol.for("@mu-crew/remote-bash")] = "mule";
+  const input = { command: "fake-gate", timeout: 30 };
+  await emit("tool_call", call("c", input));
+  assert.deepEqual(input, { command: "fake-gate", timeout: 30 });
+  assert.deepEqual(status, []);
+  // Released (the remote session ended): wrapping resumes.
+  delete (globalThis as any)[Symbol.for("@mu-crew/remote-bash")];
+  await emit("tool_call", call("d", input));
+  assert.ok((input.command as string).startsWith(`'${BIN}' run `), input.command);
+});
+
+test("MUZZLE_PI=0 turns the extension off; other values leave it on", async () => {
+  const { emit, status } = load();
+  process.env.MUZZLE_PI = "0";
+  const input = { command: "fake-gate", timeout: 30 };
+  await emit("tool_call", call("c", input));
+  assert.deepEqual(input, { command: "fake-gate", timeout: 30 });
+  assert.deepEqual(status, []);
+  process.env.MUZZLE_PI = "1";
+  delete (globalThis as any)[GUARD];
+  const on = load();
+  await on.emit("tool_call", call("d", input));
+  assert.ok((input.command as string).startsWith(`'${BIN}' run `), input.command);
 });
 
 test("other tools are left alone", async () => {

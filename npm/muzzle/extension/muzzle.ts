@@ -20,6 +20,13 @@
 // protocol, this extension forwards changes to pi's own output, under a child
 // id per call (`muzzle/<n>`) so parallel calls and pi's root record stay apart.
 //
+// Remote bash: an extension that runs the bash tool on another host (mule's
+// --mule workspace) sets REMOTE_BASH on globalThis while it does, and wraps
+// with that host's muzzle itself. A local rewrite there names a binary and a
+// report path that exist only here, so every call would fail. It is checked
+// per call: the remote extension may load after this one. MUZZLE_PI=0 turns
+// the extension off outright.
+//
 // Nothing here may block a call: a missing binary or a failing wrap leaves
 // the call as it is. A throwing tool_call handler blocks the tool in pi, so
 // every path is caught.
@@ -175,6 +182,9 @@ function wrap(bin: string, command: string, cwd: string, timeout?: number): Prom
 /** The process-wide claim; registry-global so separate module copies share it. */
 export const GUARD = Symbol.for("@mu-crew/muzzle/extension");
 
+/** Set (to the owner's name) while the bash tool runs on another host; shared with mule. */
+export const REMOTE_BASH = Symbol.for("@mu-crew/remote-bash");
+
 export interface Deps {
   findBinary?: () => string | null;
   tmpRoot?: string;
@@ -248,6 +258,7 @@ export function createExtension(deps: Deps = {}) {
     pi.on("tool_call", async (event, ctx) => {
       try {
         if (event.toolName !== "bash") return;
+        if (process.env.MUZZLE_PI === "0" || g[REMOTE_BASH] !== undefined) return;
         const input = event.input as { command?: unknown; timeout?: unknown };
         if (typeof input.command !== "string") return;
         if (bin === undefined) {
