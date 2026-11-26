@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.1
+
 Fixed:
 
 - **pi extension under mule.** In a `pi --mule` workspace the extension no
@@ -9,6 +11,9 @@ Fixed:
   127. mule sets the `Symbol.for("@mu-crew/remote-bash")` marker on
   `globalThis` and wraps with the remote host's muzzle itself. New:
   `MUZZLE_PI=0` turns the extension off.
+- **Orphan run records.** A still-held claim that admission pruned as an
+  orphan (idle or past its TTL) after a gap in polls, such as across a laptop
+  sleep, recorded a too-short `ran_s`. It now ends at the prune time.
 
 ## 0.4.0
 
