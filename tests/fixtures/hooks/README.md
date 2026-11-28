@@ -85,29 +85,30 @@ Muse Code sends Claude Code's `PreToolUse` format to `muzzle hook claude`
 
 ## cursor-agent
 
-Source: cursor-agent's own bundle (2026.10.22, re-checked on 2026.11.05) (`dist-package/`, the hook
-executor and the shell tool's `beforeShellExecution` call), and
-<https://cursor.com/docs/hooks>. The U0 logs have no
-`beforeShellExecution`, so the `cursor-*.json` payloads are **derived**:
-the common fields copy U0's logged cursor-agent payloads (`user_email`
-replaced by a placeholder), and the shell fields follow the bundle.
+Source: cursor-agent's own bundle (2026.11.22: `9622.index.js` and
+`index.js` in `dist-package/`, the hook executor and the shell tool), and
+<https://cursor.com/docs/hooks>. The U0 logs have no shell hook payloads,
+so the `cursor-*.json` payloads are **derived**: the common fields copy
+U0's logged cursor-agent payloads (`user_email` replaced by a
+placeholder), and the shell fields follow the bundle.
 
-- The payload is the common fields plus `command`, `cwd` and
-  `sandbox`, all at the top level; there is no `tool_name` or
-  `tool_input`. `cwd` is `""` when the agent set no working directory, and
-  the command then runs in the first of `workspace_roots`; a relative
-  `cwd` is under that root, and a leading `~` is the home directory.
-- `sandbox` is a boolean, true when the shell call runs sandboxed. muzzle
-  doesn't read it.
-- The reply is `{"permission": "allow" | "deny" | "ask", "user_message",
-  "agent_message"}`. It can't rewrite the command. On `deny` the shell
-  path reads only `user_message`: the call fails with "Command execution
-  was blocked by a hook: <user_message>", a pointer to cursor's hook
-  settings, and "Agent note: Do not suggest workarounds to the blocked
-  tool." So `muzzle hook cursor` denies a matched command with a reason
-  that says this is a queue and to run the `muzzle run …` rewrite, which
-  stands alone on the reason's last line, and replies `{}` to the rerun,
-  which already runs muzzle. `agent_message` carries the same text.
+- muzzle uses `preToolUse` with `matcher: "^Shell$"`. The payload is the
+  common fields plus `tool_name: "Shell"` and `tool_input: { command, cwd,
+  timeout? }`, a top-level `cwd`, and `workspace_roots`. `cwd` is `""` when
+  the agent set no working directory, and the command then runs in the
+  first of `workspace_roots`.
+- `tool_input.timeout` is in milliseconds; the shell executor uses 30 s
+  (`3e4`) when it is absent, and that timer counts the queue wait.
+- The matcher is an unanchored regex on `tool_name`, so `Shell` also
+  matches `WriteShellStdin`; hence `^Shell$`. muzzle still checks
+  `tool_name` and replies `{}` for anything but `Shell`.
+- The reply is `{"updated_input": {"command": "<muzzle run …>"}}` with no
+  `permission`. The bundle merges `command`, `cwd` and `timeout` (when the
+  types match) into the tool input, and handles only `permission: "deny"`
+  specially, so omitting it leaves Cursor's approval flow alone. The
+  rewritten command is re-parsed before the shell block check.
+- A legacy `beforeShellExecution` payload (top-level `command`, `cwd`,
+  `sandbox`, no `tool_name`) gets `{}`: fail open, the call runs.
 - Exit 2 blocks the call. Any other non-zero exit, or empty stdout, is a
   failed hook and the call runs. Stdout that isn't JSON blocks the call,
   so `muzzle hook` prints nothing when it can't answer.

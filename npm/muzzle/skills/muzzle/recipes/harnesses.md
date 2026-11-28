@@ -28,14 +28,13 @@ below are what `init` writes, for merging by hand or into a project file.
 | Claude Code | `PreToolUse` hook, `muzzle hook claude` | passed on as `--run-timeout`, but Claude's own Bash timeout still counts the wait | only for one simple command whose rule matches at the command word | yes, stored payloads |
 | Codex | `PreToolUse` hook, `muzzle hook codex` | the payload has none; Codex's shell timeout counts the wait | always, compound commands too | yes, stored payloads |
 | Muse Code | `PreToolUse` hook on `bash`, `muzzle hook claude` | `timeout_ms` passed on as `--run-timeout`, still counts the wait | as Claude Code | yes, derived payloads |
-| cursor-agent | `beforeShellExecution` hook, `muzzle hook cursor`: denies a matched call with the `muzzle run …` line to rerun | the payload has none | n/a: the rerun gets no opinion | yes, derived payloads |
+| cursor-agent | `preToolUse` hook (`matcher: "^Shell$"`), `muzzle hook cursor`: rewrites the call in place with `updated_input` | `tool_input.timeout` (ms) passed on as `--run-timeout`; Cursor's 30 s default foreground timeout still counts the wait | n/a: no `permission` field, so the prompt is unchanged | yes, derived payloads |
 | opencode | example plugin calling `muzzle wrap` | passed on, still counts the wait | n/a | **no** |
 | aider, cron, humans | wrap by hand | use `--run-timeout` | n/a | n/a |
 
-cursor-agent's `beforeShellExecution` hook can only allow or deny, so it
-can't rewrite a call. muzzle denies it with a reason that ends in the
-exact line to run instead, and passes that line, which already runs
-muzzle, when the agent reruns it.
+cursor-agent's `preToolUse` hook can rewrite a call: muzzle replies
+`{"updated_input": {"command": …}}` with the `muzzle run …` line and no
+`permission`, so Cursor's own approval flow still applies.
 
 ## pi
 
@@ -124,17 +123,29 @@ Merge into `~/.cursor/hooks.json` (or a repo's `.cursor/hooks.json`):
 {
   "version": 1,
   "hooks": {
-    "beforeShellExecution": [{ "command": "muzzle hook cursor" }]
+    "preToolUse": [
+      {
+        "matcher": "^Shell$",
+        "command": "muzzle hook cursor"
+      }
+    ]
   }
 }
 ```
 
-A matched command fails with "Command execution was blocked by a hook:
-muzzle queues this command … Run exactly this instead:" and then the
-`muzzle run --rule=… -- bash -c '…'` line, followed by cursor-agent's own
-"Do not suggest workarounds to the blocked tool." That note doesn't apply
-here: muzzle is queueing the call, not refusing it. Run the line as given;
-muzzle passes it, and it queues for its slots.
+The matcher is an unanchored regex on the tool name, so a bare `Shell`
+would also match `WriteShellStdin` (stdin typed into a running shell);
+`^Shell$` hooks only real commands.
+
+A matched command is rewritten in place to the `muzzle run --rule=… --
+bash -c '…'` line; nothing is denied or retried. The call's
+`tool_input.timeout` (ms) becomes `--run-timeout`. With no timeout set,
+Cursor's 30 s default foreground shell timeout still counts the queue
+wait, so a long queue can trip it: set a longer timeout on the call.
+
+The legacy `beforeShellExecution` hook is not used. If one is still
+configured to run `muzzle hook cursor`, muzzle answers `{}` (fail open:
+the call runs unwrapped). Re-run `muzzle init` to migrate.
 
 ## Warning: `allow` skips the harness's permission prompt
 
