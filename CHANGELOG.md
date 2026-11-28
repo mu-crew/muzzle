@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.4.2
+
+Changed:
+
+- **cursor-agent hook rewrites in place** (D23, every-harness D14).
+  `muzzle hook cursor` now answers Cursor's `preToolUse` (`tool_name == "Shell"`)
+  with `{"updated_input": {"command": "muzzle run …"}}` instead of denying calls
+  on `beforeShellExecution` and forcing an agent retry. Positive
+  `tool_input.timeout` (ms) is forwarded as `--run-timeout`, `permission` is
+  omitted so Cursor's own permission and sandbox checks still run, and legacy
+  `beforeShellExecution` payloads fail open (`{}`).
+- **`muzzle init` migrates Cursor to `preToolUse`.** `muzzle init` now
+  installs `{"matcher": "^Shell$", "command": "muzzle hook cursor"}` under
+  `hooks.preToolUse` in `~/.cursor/hooks.json` (anchored so `WriteShellStdin`
+  does not match), removes old `beforeShellExecution` entries, and flags
+  missing or wrong matchers as drift in `muzzle doctor`.
+
 ## 0.4.1
 
 Fixed:
