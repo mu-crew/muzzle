@@ -93,7 +93,7 @@ const FOREIGN: [(&str, &str); 4] = [
     ),
     (
         "home/.cursor/hooks.json",
-        r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"./guard.sh"}],"stop":[{"command":"murmur hook cursor-agent"}]}}"#,
+        r#"{"version":1,"hooks":{"preToolUse":[{"command":"./guard.sh"}],"stop":[{"command":"murmur hook cursor-agent"}]}}"#,
     ),
     (
         "home/.config/muse/settings.json",
@@ -385,4 +385,18 @@ fn doctor_warns_when_muse_hooks_read_another_config() {
         .unwrap();
     let text = home.ok(&["doctor"]);
     assert!(text.contains("hook entries") && !moved(&text), "{text}");
+}
+
+#[test]
+fn init_migrates_cursor_before_shell_execution_to_pre_tool_use() {
+    let home = Home::new();
+    home.write(
+        "home/.cursor/hooks.json",
+        r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"muzzle hook cursor"}],"preToolUse":[{"matcher":"Shell","command":"muzzle hook cursor"}]}}"#,
+    );
+    home.ok(&["init", "--hooks", "cursor-agent"]);
+    assert_eq!(
+        json(&home.read("home/.cursor/hooks.json")),
+        json(&std::fs::read_to_string("docs/harnesses/cursor.hooks.json").unwrap())
+    );
 }

@@ -24,7 +24,9 @@ pub struct Target {
     pub harness: &'static str,
     pub shape: Shape,
     pub event: &'static str,
-    /// The group's matcher (grouped shape only): the shell tool's name.
+    /// The shell tool's name, as a matcher: the group's (grouped shape) or
+    /// the handler's own (flat shape). cursor-agent's is an unanchored
+    /// regex, so `^Shell$` keeps `WriteShellStdin` out.
     pub matcher: Option<&'static str>,
     pub command: &'static str,
     /// Fields a new handler gets beside `type` and `command`. Cosmetic, so
@@ -54,8 +56,8 @@ pub const TARGETS: [Target; 4] = [
     Target {
         harness: "cursor-agent",
         shape: Shape::Flat,
-        event: "beforeShellExecution",
-        matcher: None,
+        event: "preToolUse",
+        matcher: Some("^Shell$"),
         command: "muzzle hook cursor",
         extra: &[],
     },
@@ -101,7 +103,7 @@ pub fn is_muzzle_hook(command: &str) -> bool {
 
 /// Remove from `list` every muzzle handler but the one `init` would keep,
 /// and fix that one in place. `matcher` is the group's (grouped shape);
-/// `None` for the flat shape.
+/// `None` for the flat shape, where each handler carries its own.
 fn sweep(
     t: &Target,
     event: &str,
@@ -130,10 +132,15 @@ fn sweep(
             None => true,
             Some(t) => t.as_str() == Some("command"),
         };
+        let own = handler.get("matcher").and_then(Json::as_str);
+        let matched = match matcher {
+            Some(m) => m == t.matcher,
+            None => own == t.matcher,
+        };
         let usable = event == t.event
             && !*kept
             && command == t.command
-            && matcher.is_none_or(|m| m == t.matcher)
+            && matched
             && (t.shape == Shape::Flat || typed);
         if !usable {
             plan.removed.push(format!("{event}: {command}"));
@@ -161,7 +168,14 @@ fn sweep(
 /// The handler (and, grouped, the group) `init` appends.
 fn new_entry(t: &Target) -> Json {
     match t.shape {
-        Shape::Flat => Json::Object(Object::from_pairs(vec![("command", Json::str(t.command))])),
+        Shape::Flat => {
+            let mut handler = Object::new();
+            if let Some(m) = t.matcher {
+                handler.insert("matcher", Json::str(m));
+            }
+            handler.insert("command", Json::str(t.command));
+            Json::Object(handler)
+        }
         Shape::Grouped => {
             let mut handler = Object::from_pairs(vec![
                 ("type", Json::str("command")),
@@ -355,7 +369,7 @@ mod tests {
         let (_, out) = settle("cursor-agent", "{}");
         assert_eq!(
             out,
-            r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"muzzle hook cursor"}]}}"#
+            r#"{"version":1,"hooks":{"preToolUse":[{"matcher":"^Shell$","command":"muzzle hook cursor"}]}}"#
         );
         let (_, out) = settle("muse", r#"{"model":"m"}"#);
         assert_eq!(
@@ -435,14 +449,14 @@ mod tests {
 
     #[test]
     fn cursor_keeps_its_version_and_other_events() {
-        let before = r#"{"version":2,"hooks":{"stop":[{"command":"murmur hook cursor-agent"}],"beforeShellExecution":[{"command":"./guard.sh"}]}}"#;
+        let before = r#"{"version":2,"hooks":{"stop":[{"command":"murmur hook cursor-agent"}],"preToolUse":[{"command":"./guard.sh"}]}}"#;
         let (p, out) = settle("cursor-agent", before);
-        assert_eq!(p.added, ["beforeShellExecution"]);
+        assert_eq!(p.added, ["preToolUse"]);
         assert_eq!(
             out,
             before.replace(
                 r#"{"command":"./guard.sh"}"#,
-                r#"{"command":"./guard.sh"},{"command":"muzzle hook cursor"}"#
+                r#"{"command":"./guard.sh"},{"matcher":"^Shell$","command":"muzzle hook cursor"}"#
             )
         );
         // An emptied event goes; the version stays.
@@ -453,8 +467,42 @@ mod tests {
         assert_eq!(p.removed, ["stop: muzzle hook cursor"]);
         assert_eq!(
             out,
-            r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"muzzle hook cursor"}]}}"#
+            r#"{"version":1,"hooks":{"preToolUse":[{"matcher":"^Shell$","command":"muzzle hook cursor"}]}}"#
         );
+    }
+
+    #[test]
+    fn cursor_migrates_from_before_shell_execution() {
+        let (p, out) = settle(
+            "cursor-agent",
+            r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"muzzle hook cursor"}]}}"#,
+        );
+        assert_eq!(p.removed, ["beforeShellExecution: muzzle hook cursor"]);
+        assert_eq!(p.added, ["preToolUse"]);
+        assert_eq!(
+            out,
+            r#"{"version":1,"hooks":{"preToolUse":[{"matcher":"^Shell$","command":"muzzle hook cursor"}]}}"#
+        );
+    }
+
+    #[test]
+    fn cursor_replaces_a_missing_or_wrong_matcher() {
+        for handler in [
+            r#"{"command":"muzzle hook cursor"}"#,
+            r#"{"matcher":"Shell","command":"muzzle hook cursor"}"#,
+            r#"{"matcher":"Read","command":"muzzle hook cursor"}"#,
+        ] {
+            let before = format!(
+                r#"{{"version":3,"hooks":{{"preToolUse":[{{"command":"./guard.sh"}},{handler}]}}}}"#
+            );
+            let (p, out) = settle("cursor-agent", &before);
+            assert_eq!(p.removed, ["preToolUse: muzzle hook cursor"], "{handler}");
+            assert_eq!(p.added, ["preToolUse"], "{handler}");
+            assert_eq!(
+                out,
+                r#"{"version":3,"hooks":{"preToolUse":[{"command":"./guard.sh"},{"matcher":"^Shell$","command":"muzzle hook cursor"}]}}"#
+            );
+        }
     }
 
     #[test]

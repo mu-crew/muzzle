@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(c.state, CheckState::Drift);
         assert_eq!(
             c.drift(),
-            "missing beforeShellExecution; stray stop: muzzle hook cursor"
+            "missing preToolUse; stray stop: muzzle hook cursor"
         );
     }
 

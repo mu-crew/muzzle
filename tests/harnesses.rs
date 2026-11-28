@@ -33,15 +33,16 @@ fn snippet(file: &str) -> (String, String) {
     )
 }
 
-/// The one `beforeShellExecution` hook in cursor-agent's snippet: its
-/// `command`.
+/// The one `preToolUse` hook in cursor-agent's snippet: its `command`,
+/// after checking its anchored `Shell` matcher.
 fn cursor_snippet() -> String {
     let v: Value = serde_json::from_str(&read("docs/harnesses/cursor.hooks.json")).unwrap();
     assert_eq!(v["version"], 1);
     let hooks = v["hooks"].as_object().unwrap();
-    assert_eq!(hooks.len(), 1, "only beforeShellExecution");
-    let entries = hooks["beforeShellExecution"].as_array().unwrap();
+    assert_eq!(hooks.len(), 1, "only preToolUse");
+    let entries = hooks["preToolUse"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["matcher"], "^Shell$");
     entries[0]["command"].as_str().unwrap().to_string()
 }
 
@@ -219,28 +220,20 @@ fn muse_snippet_replies_to_stored_payloads() {
     }
 }
 
-/// A cursor-agent deny whose reason tells the agent to run `line`, which
-/// stands exact and alone on the reason's last line, so the agent's rerun
-/// is that string (every-harness D14, amended 2026-11-05).
-fn assert_denied_with(v: &Value, line: &str) {
-    assert_eq!(v["permission"], "deny", "{v}");
-    assert_eq!(v["agent_message"], v["user_message"], "{v}");
-    let msg = v["user_message"].as_str().unwrap();
-    assert!(msg.contains("Run exactly this instead:"), "{msg}");
-    assert_eq!(msg.lines().last(), Some(line), "{msg}");
-}
-
-/// every-harness D14: a matched command is denied with the exact line,
-/// the rerun of that line passes, and an unmatched command passes.
+/// every-harness D14 (amended 2026-11-28): a matched Shell call is
+/// rewritten in place, the rewrite passes, and an unmatched one passes.
 #[test]
-fn cursor_snippet_denies_with_the_line_and_passes_the_rerun() {
+fn cursor_snippet_rewrites_in_place_and_passes_the_rewrite() {
     let cmd = cursor_snippet();
     assert_eq!(cmd, "muzzle hook cursor");
     let line = "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'";
-    assert_denied_with(&reply(&cmd, "cursor-shell-match.json"), line);
+    assert_eq!(
+        reply(&cmd, "cursor-shell-match.json"),
+        json!({"updated_input": {"command": line}})
+    );
     let mut rerun: Value =
         serde_json::from_str(&read("tests/fixtures/hooks/cursor-shell-match.json")).unwrap();
-    rerun["command"] = json!(line);
+    rerun["tool_input"]["command"] = json!(line);
     let home = tempfile::tempdir().unwrap();
     let out = run_hook(&cmd, home.path(), &rerun.to_string());
     assert!(out.status.success(), "{out:?}");

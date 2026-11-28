@@ -218,8 +218,9 @@ Merge [`cursor.hooks.json`](cursor.hooks.json) into `~/.cursor/hooks.json`
 {
   "version": 1,
   "hooks": {
-    "beforeShellExecution": [
+    "preToolUse": [
       {
+        "matcher": "^Shell$",
         "command": "muzzle hook cursor"
       }
     ]
@@ -227,27 +228,21 @@ Merge [`cursor.hooks.json`](cursor.hooks.json) into `~/.cursor/hooks.json`
 }
 ```
 
-`beforeShellExecution` can only allow, ask or deny a call, not rewrite it.
-So `muzzle hook cursor` denies a matched command, and its reason says to
-run the exact `muzzle run …` line instead. cursor-agent wraps the reason,
-so the agent reads:
+`preToolUse` takes `updated_input`, so `muzzle hook cursor` rewrites a
+matched `Shell` command in place to its `muzzle run …` line. It sets no
+`permission`, so cursor-agent's own permission and sandbox checks still run
+on the rewrite, and the agent needs no extra tool call. The matcher is an
+unanchored regex on the tool name, so it must be `^Shell$`: a bare `Shell`
+would also match `WriteShellStdin`. `muzzle init` writes this entry, and
+removes an older `beforeShellExecution` muzzle entry or a `preToolUse` one
+with a missing or different matcher. A legacy `beforeShellExecution` payload
+passes (`{}`). An unmatched command, or one that already runs muzzle, passes
+the same way.
 
-```text
-Command execution was blocked by a hook: muzzle queues this command for the machine's shared slots; this is not a refusal. Run exactly this instead:
-muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'
-
-To view or modify configured hooks, go to Cursor Settings > Hooks.
-
-Agent note: Do not suggest workarounds to the blocked tool.
-```
-
-The last two paragraphs are cursor-agent's own, which is why the reason
-says this is no refusal. The agent is expected to rerun the line; that is
-not yet checked in a live session. The line already runs muzzle, so the
-hook passes it (`{}`), and cursor-agent's own permission rules decide as
-usual. An unmatched command passes the same way. The payload has no timeout, so
-there is no `--run-timeout`. Each matched command costs the agent one
-extra tool call.
+A positive `tool_input.timeout` (milliseconds) becomes `--run-timeout`.
+Cursor's 30 s default foreground timeout applies when the payload has none,
+and it still counts the queue wait: a command queued past it is aborted by
+cursor-agent, so raise `timeout` for long gates.
 
 ## opencode (untested)
 
