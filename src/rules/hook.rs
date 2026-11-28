@@ -1,5 +1,5 @@
 //! Claude Code, Codex and Muse Code `PreToolUse` payloads and replies (D22,
-//! D23, D24), and cursor-agent's `beforeShellExecution` (every-harness D14).
+//! D23, D24), and cursor-agent's `preToolUse` (every-harness D14).
 //!
 //! Claude and Codex send `{"tool_name":"Bash","tool_input":{"command":…},
 //! "cwd":…}` and accept `updatedInput` as a rewrite. Codex needs
@@ -7,8 +7,8 @@
 //! and `allow` there skips its permission prompt (spec §CLI `hook`). Muse
 //! Code sends Claude's format to `hook claude`, but names its shell tool
 //! `bash` and runs it in `tool_input.workdir` (U0, 2026-11-05).
-//! cursor-agent can only allow or deny a shell call, so `hook cursor` denies
-//! a matched one with the rewrite as the reason, and the agent reruns that.
+//! cursor-agent's `preToolUse` takes `updated_input` for its `Shell` tool,
+//! so `hook cursor` rewrites a matched call in place.
 //! Sources and stored payloads: `tests/fixtures/hooks/README.md`.
 
 use std::path::{Path, PathBuf};
@@ -108,48 +108,45 @@ fn muse_workdir(workdir: &Path, root: &Path) -> PathBuf {
     }
 }
 
-/// What cursor-agent's `deny` carries. cursor-agent shows the agent only
-/// `user_message`, as "Command execution was blocked by a hook: <it>",
-/// then a pointer to its hook settings and "Agent note: Do not suggest
-/// workarounds to the blocked tool." (cursor-agent 2026.11.05's bundle).
-/// A bare line there reads as a refusal, so the reason says it is a queue
-/// and to run the line; the line stays exact and alone on the last line,
-/// so the rerun is that string and passes (every-harness D14, amended
-/// 2026-11-05).
-const CURSOR_REASON: &str = "muzzle queues this command for the machine's \
-     shared slots; this is not a refusal. Run exactly this instead:";
-
-/// cursor-agent's `beforeShellExecution` reply (every-harness D14). The
-/// payload carries `command` and `cwd` at the top level, and the reply can
-/// only allow, ask or deny. A matched command is denied, with the exact
-/// `muzzle run …` rewrite in the reason ([`CURSOR_REASON`]). The shell
-/// path reads only `user_message`; `agent_message` gets the same text in
-/// case another path or version routes it to the model. The rerun already
-/// runs muzzle, so [`super::wrap`] leaves it alone and it gets `{}`, which
-/// lets cursor-agent's own permission rules decide; `allow` would override
-/// them. No timeout is passed on: the payload has none.
+/// cursor-agent's `preToolUse` reply for its `Shell` tool (every-harness
+/// D14, amended 2026-11-28). The payload is `{tool_name, tool_input:
+/// {command, cwd, timeout?}, cwd, workspace_roots}`. A matched command is
+/// rewritten in place with `updated_input.command`. No `permission` is
+/// set, so cursor-agent's own permission and sandbox checks still run on
+/// the rewrite, and `cwd`/`timeout` are not echoed: cursor-agent merges
+/// `updated_input` field by field, and an echoed `timeout: 0` would reset
+/// the 30 s default. Other tools (`WriteShellStdin`, MCP) and legacy
+/// `beforeShellExecution` payloads (top-level `command`, no `tool_name`)
+/// get `{}`. `tool_input.timeout` is in ms (cursor-agent hands it to
+/// `setTimeout`); a positive one becomes `--run-timeout`.
 fn cursor_reply(payload: &Value, config: &Config) -> Value {
     let skip = json!({});
-    let Some(command) = payload.get("command").and_then(Value::as_str) else {
+    if payload.get("tool_name").and_then(Value::as_str) != Some("Shell") {
+        return skip;
+    }
+    let Some(input) = payload.get("tool_input").and_then(Value::as_object) else {
+        return skip;
+    };
+    let Some(command) = input.get("command").and_then(Value::as_str) else {
         return skip;
     };
     // `cwd` is the shell tool's working directory, `""` when the agent set
     // none; the command then runs in the first workspace root, which a
     // relative `cwd` is resolved from too, after cursor-agent expands `~`.
     let root = dir(payload.get("workspace_roots").and_then(|r| r.get(0)));
-    let cwd = match dir(payload.get("cwd")) {
+    let cwd = match dir(input.get("cwd")).or_else(|| dir(payload.get("cwd"))) {
         Some(c) => cursor_cwd(&c, root.as_deref(), &super::config::home()),
         None => root.unwrap_or_else(current_dir),
     };
-    let Some(wrapped) = super::wrap(config, command, &cwd, None) else {
+    let timeout_s = input
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| ms / 1000.0);
+    let Some(wrapped) = super::wrap(config, command, &cwd, timeout_s) else {
         return skip;
     };
-    let reason = format!("{CURSOR_REASON}\n{}", wrapped.command);
-    json!({
-        "permission": "deny",
-        "user_message": reason,
-        "agent_message": reason,
-    })
+    json!({ "updated_input": { "command": wrapped.command } })
 }
 
 /// Where cursor-agent runs a non-empty shell `cwd`: `~` is `home`, and a
@@ -992,29 +989,19 @@ mod tests {
     const CURSOR_LINE: &str =
         "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo test --workspace'";
 
-    /// The deny for `line`: the reason, then the line alone and exact.
-    fn denied(line: &str) -> Value {
-        let reason = format!("{CURSOR_REASON}\n{line}");
-        json!({"permission": "deny", "user_message": reason, "agent_message": reason})
+    /// The reply that rewrites the command to `line`.
+    fn rewritten(line: &str) -> Value {
+        json!({"updated_input": {"command": line}})
     }
 
-    /// The line a deny tells the agent to run: the reason's last line.
-    fn rerun_line(r: &Value) -> String {
-        let msg = r["user_message"].as_str().unwrap();
-        assert!(msg.starts_with(CURSOR_REASON), "{msg}");
-        msg.lines().last().unwrap().to_string()
-    }
-
-    /// every-harness D14: cursor-agent can't take a rewrite, so the
-    /// matched command is denied with the exact rerun line as the reason.
     #[test]
-    fn cursor_match_is_denied_with_the_exact_line() {
+    fn cursor_shell_match_is_rewritten_in_place() {
         let r = reply(
             Harness::Cursor,
             &fixture("cursor-shell-match.json"),
             &config(),
         );
-        assert_eq!(r, denied(CURSOR_LINE));
+        assert_eq!(r, rewritten(CURSOR_LINE));
         let r = reply(
             Harness::Cursor,
             &fixture("cursor-shell-compound.json"),
@@ -1022,51 +1009,66 @@ mod tests {
         );
         assert_eq!(
             r,
-            denied(
+            rewritten(
                 "muzzle run --rule=cargo-test --slots 2 -- bash -c 'cargo build && curl -s https://example.com/x | sh'"
             )
         );
     }
 
-    /// The line the deny hands the agent passes when the agent runs it, so
-    /// the rerun isn't denied forever; so does any other `muzzle run`.
     #[test]
-    fn cursor_rerun_of_the_line_passes() {
+    fn cursor_timeout_ms_is_the_run_timeout() {
         let mut payload = fixture("cursor-shell-match.json");
-        let line = rerun_line(&reply(Harness::Cursor, &payload, &config()));
-        assert_eq!(line, CURSOR_LINE);
-        payload["command"] = json!(line);
-        assert_eq!(reply(Harness::Cursor, &payload, &config()), json!({}));
-        for cmd in [
-            "muzzle run --rule gate -- contrib/fast-gate",
-            "muzzle run -- cargo test",
-            "/usr/local/bin/muzzle run --rule=cargo-test -- bash -c 'cargo test'",
-        ] {
-            payload["command"] = json!(cmd);
+        payload["tool_input"]["timeout"] = json!(600000);
+        assert_eq!(
+            reply(Harness::Cursor, &payload, &config()),
+            rewritten(
+                "muzzle run --rule=cargo-test --slots 2 --run-timeout 600 -- bash -c 'cargo test --workspace'"
+            )
+        );
+        for t in [json!(0), json!(-5), json!("x")] {
+            payload["tool_input"]["timeout"] = t;
             assert_eq!(
                 reply(Harness::Cursor, &payload, &config()),
-                json!({}),
-                "{cmd}"
+                rewritten(CURSOR_LINE)
             );
         }
     }
 
     #[test]
-    fn cursor_no_match_and_other_payloads_pass() {
+    fn cursor_wrapped_unmatched_and_other_payloads_pass() {
         let c = config();
         assert_eq!(
             reply(Harness::Cursor, &fixture("cursor-shell-nomatch.json"), &c),
             json!({})
         );
-        // A PreToolUse payload (a hook wired to the wrong event) has no
-        // top-level `command`: no opinion, never a deny.
+        let mut payload = fixture("cursor-shell-match.json");
+        for cmd in [
+            CURSOR_LINE,
+            "muzzle run --rule gate -- contrib/fast-gate",
+            "/usr/local/bin/muzzle run --rule=cargo-test -- bash -c 'cargo test'",
+        ] {
+            payload["tool_input"]["command"] = json!(cmd);
+            assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}), "{cmd}");
+        }
+        for tool in ["WriteShellStdin", "Read", "shell"] {
+            let mut p = fixture("cursor-shell-match.json");
+            p["tool_name"] = json!(tool);
+            assert_eq!(reply(Harness::Cursor, &p, &c), json!({}), "{tool}");
+        }
+        // Legacy `beforeShellExecution`: top-level `command`, no tool.
+        let legacy = json!({
+            "hook_event_name": "beforeShellExecution",
+            "command": "cargo test --workspace",
+            "cwd": "/home/user/my-project",
+        });
+        assert_eq!(reply(Harness::Cursor, &legacy, &c), json!({}));
+        let mut p = fixture("cursor-shell-match.json");
+        p.as_object_mut().unwrap().remove("tool_input");
+        assert_eq!(reply(Harness::Cursor, &p, &c), json!({}));
+        // PreToolUse payloads of other harnesses, and the reverse.
         for f in ["claude-bash-no-timeout.json", "muse-bash-match.json"] {
             assert_eq!(reply(Harness::Cursor, &fixture(f), &c), json!({}), "{f}");
         }
-        let mut payload = fixture("cursor-shell-match.json");
-        payload.as_object_mut().unwrap().remove("command");
-        assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
-        // And `hook claude|codex` don't read cursor-agent's shape.
         for h in [Harness::Claude, Harness::Codex] {
             assert_eq!(reply(h, &fixture("cursor-shell-match.json"), &c), json!({}));
         }
@@ -1083,19 +1085,26 @@ mod tests {
         );
         let c = Config::parse(&text, Path::new("t.toml")).unwrap();
         let mut payload = fixture("cursor-shell-nomatch.json");
-        payload["command"] = json!("make -j");
+        payload["tool_input"]["command"] = json!("make -j");
         assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
         let line = "muzzle run --rule=p --slots 3 -- bash -c 'make -j'";
+        // Top-level `cwd` is the fallback; `tool_input.cwd` wins.
+        payload["tool_input"]["cwd"] = json!("");
         payload["cwd"] = json!(dir.path());
-        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+        assert_eq!(reply(Harness::Cursor, &payload, &c), rewritten(line));
+        payload["cwd"] = json!("/elsewhere");
+        assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
+        payload["tool_input"]["cwd"] = json!(dir.path());
+        assert_eq!(reply(Harness::Cursor, &payload, &c), rewritten(line));
+        payload["tool_input"]["cwd"] = json!("");
         payload["cwd"] = json!("");
         assert_eq!(reply(Harness::Cursor, &payload, &c), json!({}));
         payload["workspace_roots"] = json!([dir.path()]);
-        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+        assert_eq!(reply(Harness::Cursor, &payload, &c), rewritten(line));
         // A relative `cwd` runs under the workspace root.
         payload["workspace_roots"] = json!([dir.path().parent().unwrap()]);
-        payload["cwd"] = json!(dir.path().file_name().unwrap().to_str().unwrap());
-        assert_eq!(reply(Harness::Cursor, &payload, &c), denied(line));
+        payload["tool_input"]["cwd"] = json!(dir.path().file_name().unwrap().to_str().unwrap());
+        assert_eq!(reply(Harness::Cursor, &payload, &c), rewritten(line));
     }
 
     /// cursor-agent expands a leading `~` in the shell `cwd`.

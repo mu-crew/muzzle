@@ -25,8 +25,8 @@ pub enum Command {
     Match(MatchArgs),
     /// Print the `muzzle run …` rewrite of a shell string, as JSON.
     Wrap(WrapArgs),
-    /// Answer a harness shell hook (PreToolUse, or cursor-agent's
-    /// beforeShellExecution): payload on stdin, reply on stdout.
+    /// Answer a harness shell hook (PreToolUse, including cursor-agent's
+    /// `Shell` preToolUse): payload on stdin, reply on stdout.
     Hook(HookArgs),
     /// Drop wedged claims from the state (G4).
     Drop(DropArgs),
@@ -160,8 +160,8 @@ pub enum Harness {
     /// format covers once its `bash` tool is mapped (every-harness D14).
     Claude,
     Codex,
-    /// cursor-agent's `beforeShellExecution`: deny with the rewrite as the
-    /// reason, since it can't rewrite (every-harness D14).
+    /// cursor-agent's `preToolUse` for `Shell`: rewrite in place with
+    /// `updated_input` (every-harness D14, amended 2026-11-28).
     Cursor,
 }
 

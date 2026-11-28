@@ -407,7 +407,7 @@ fn hook_replies_to_stored_payloads() {
 }
 
 /// every-harness D14 through the binary: Muse Code's `bash` under
-/// `hook claude`, and cursor-agent's deny with the exact rerun line.
+/// `hook claude`, and cursor-agent's `preToolUse` `updated_input` rewrite.
 #[test]
 fn hook_serves_muse_and_cursor() {
     let home = tempfile::tempdir().unwrap();
@@ -424,15 +424,11 @@ fn hook_serves_muse_and_cursor() {
         &["hook", "cursor"],
         Some(&fixture("cursor-shell-match.json")),
     ));
-    // The reason tells the agent to run the line, which stands exact and
-    // alone on its last line (every-harness D14, amended 2026-11-05).
-    assert_eq!(v["permission"], "deny");
-    assert_eq!(v["agent_message"], v["user_message"]);
-    let msg = v["user_message"].as_str().unwrap();
-    assert!(msg.contains("Run exactly this instead:"), "{msg}");
-    assert_eq!(msg.lines().last(), Some(line), "{msg}");
+    // In-place rewrite, no permission decision (every-harness D14,
+    // amended 2026-11-28).
+    assert_eq!(v, json!({"updated_input": {"command": line}}));
     let mut rerun: Value = serde_json::from_str(&fixture("cursor-shell-match.json")).unwrap();
-    rerun["command"] = json!(line);
+    rerun["tool_input"]["command"] = json!(line);
     let v = json_out(&muzzle(
         home.path(),
         &["hook", "cursor"],
